@@ -9,8 +9,10 @@
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
 //! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
+//! * [`clients_met`]: `clients.met`, credits and metadata of other clients.
 
 pub mod canceled_met;
 pub mod emfriends_met;
+pub mod clients_met;
 pub mod known_met;
 pub mod server_met;

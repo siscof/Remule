@@ -79,6 +79,7 @@ macro_rules! wire_enum {
     };
 }
 
+pub mod aich;
 pub mod ed2k;
 pub mod hash;
 pub mod kad;
@@ -86,6 +87,7 @@ pub mod protocol;
 pub mod tags;
 pub mod uint128;
 
+pub use aich::AichHash;
 pub use hash::Md4Hash;
 pub use protocol::Protocol;
 pub use uint128::UInt128;

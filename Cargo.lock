@@ -1095,6 +1095,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed2k-hash"
+version = "0.1.0"
+dependencies = [
+ "ed2k-types",
+ "md4",
+ "sha1",
+]
+
+[[package]]
 name = "ed2k-types"
 version = "0.1.0"
 
@@ -3128,6 +3137,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ed2k-formats",
+ "ed2k-hash",
  "ed2k-types",
 ]
 

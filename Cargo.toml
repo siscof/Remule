@@ -2,6 +2,7 @@
 members = [
 	'ed2k-codec',
 	'ed2k-formats',
+	'ed2k-hash',
 	'ed2k-types',
 	'remule-cli',
 	'remule-ec',
@@ -28,4 +29,8 @@ opt-level = 3
 [profile.dev.package.num-bigint]
 opt-level = 3
 [profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.md4]
+opt-level = 3
+[profile.dev.package.sha1]
 opt-level = 3

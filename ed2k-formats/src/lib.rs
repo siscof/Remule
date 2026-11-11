@@ -31,6 +31,9 @@ pub mod ipfilter;
 //!   `staticservers.dat` (servers marked static).
 
 pub mod addresses_dat;
+//! * [`amule_conf`]: `amule.conf`, the preferences (a wxFileConfig INI file).
+
+pub mod amule_conf;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod part_met;

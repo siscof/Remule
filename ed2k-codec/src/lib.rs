@@ -4,9 +4,14 @@
 //! * [`io`]: little-endian values and strings over byte buffers, the port of
 //!   `SafeFile.{h,cpp}` (step 1.3).
 //!
-//! Tags (`Tag.cpp`, step 1.4) and packets (`Packet.cpp`, step 1.5) build on
-//! it. Sans-IO: everything works on in-memory buffers.
+//! * [`tag`]: tags in their eD2k and Kad encodings, the port of `Tag.{h,cpp}`
+//!   (step 1.4).
+//!
+//! Packets (`Packet.cpp`, step 1.5) build on these. Sans-IO: everything
+//! works on in-memory buffers.
 
 pub mod io;
+pub mod tag;
 
 pub use io::{Error, LenField, Reader, SeekFrom, StrEncoding, Writer};
+pub use tag::{Tag, TagError, TagName, TagValue};

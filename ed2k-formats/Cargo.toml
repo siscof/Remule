@@ -1,0 +1,10 @@
+[package]
+name = "ed2k-formats"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "aMule/eMule on-disk formats: server.met, known.met, part.met, nodes.dat, ..."
+
+[dependencies]
+ed2k-types = { path = "../ed2k-types" }
+ed2k-codec = { path = "../ed2k-codec" }

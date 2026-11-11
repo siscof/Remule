@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`cryptkey_dat`]: `cryptkey.dat`, our RSA key for secure identification.
 
+pub mod cryptkey_dat;
 pub mod known_met;
 pub mod server_met;

@@ -9,3 +9,5 @@ description = "aMule/eMule on-disk formats: server.met, known.met, part.met, nod
 ed2k-types = { path = "../ed2k-types" }
 ed2k-codec = { path = "../ed2k-codec" }
 md4 = "0.10"
+rsa = "0.9"
+rand = "0.8"

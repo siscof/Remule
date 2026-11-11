@@ -26,6 +26,10 @@ pub mod cryptkey_dat;
 //! * [`ipfilter`]: `ipfilter.dat` / `ipfilter_static.dat` IP filter lists.
 
 pub mod ipfilter;
+//! * [`addresses_dat`]: `addresses.dat` (server.met update URLs) and
+//!   `staticservers.dat` (servers marked static).
+
+pub mod addresses_dat;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod server_met;

@@ -6,5 +6,7 @@
 //! typed view aMule builds from it.
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
+//! * [`known_met`]: `known.met`, the hashed files and their statistics.
 
+pub mod known_met;
 pub mod server_met;

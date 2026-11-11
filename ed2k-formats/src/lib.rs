@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
 
+pub mod canceled_met;
 pub mod known_met;
 pub mod server_met;

@@ -10,9 +10,11 @@
 //! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
 //! * [`clients_met`]: `clients.met`, credits and metadata of other clients.
+//! * [`known2_met`]: `known2_64.met`, the stored AICH hash sets.
 
 pub mod canceled_met;
 pub mod emfriends_met;
 pub mod clients_met;
+pub mod known2_met;
 pub mod known_met;
 pub mod server_met;

@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`clients_met`]: `clients.met`, credits and metadata of other clients.
 
+pub mod clients_met;
 pub mod known_met;
 pub mod server_met;

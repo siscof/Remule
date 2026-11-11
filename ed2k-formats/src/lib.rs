@@ -13,12 +13,14 @@
 //! * [`known2_met`]: `known2_64.met`, the stored AICH hash sets.
 //! * [`cryptkey_dat`]: `cryptkey.dat`, our RSA key for secure identification.
 //! * [`nodes_dat`]: `nodes.dat`, saved Kad contacts (v0-v3 and bootstrap lists).
+//! * [`ipfilter`]: `ipfilter.dat` / `ipfilter_static.dat` IP filter lists.
 
 pub mod canceled_met;
 pub mod emfriends_met;
 pub mod clients_met;
 pub mod known2_met;
 pub mod cryptkey_dat;
+pub mod ipfilter;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod server_met;

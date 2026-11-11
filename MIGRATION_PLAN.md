@@ -36,6 +36,8 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 
 | Crate | Contents |
 |---|---|
+| `ed2k-types` | eD2k/Kad protocol constants: opcodes, tag ids, flags, limits (step 1.1); `Md4Hash` and the Kad id `UInt128` (step 1.2) |
+| `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags and packets next |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
 
@@ -194,12 +196,12 @@ Update this table as steps land.
 
 | # | Step | C++ source | Rust module | Status |
 |---|---|---|---|---|
-| 0.1 | Workspace builds + tests on Windows | — | workspace | todo |
-| 0.3 | CI | — | — | todo |
+| 0.1 | Workspace builds + tests on Windows | — | workspace | done (CI runs Windows and Linux) |
+| 0.3 | CI | — | `.github/workflows/ci.yml` | done: fmt, clippy -D warnings, tests, docs on Linux + Windows |
 | 0.4 | GPLv2+ license, Cargo-only build | — | workspace | done |
-| 1.1 | Protocol constants | `include/protocol/**`, `include/tags/**` | `ed2k-types` | todo |
-| 1.2 | `Md4Hash`, `UInt128` | `MD4Hash.h`, `UInt128.*` | `ed2k-types` | todo |
-| 1.3 | Byte reader/writer | `SafeFile.*` | `ed2k-codec` | todo |
+| 1.1 | Protocol constants | `include/protocol/**`, `include/tags/**` | `ed2k-types` | done (369 values cross-checked against the headers) |
+| 1.2 | `Md4Hash`, `UInt128` | `MD4Hash.h`, `UInt128.*` | `ed2k-types` | done (CUInt128Test cases ported) |
+| 1.3 | Byte reader/writer | `SafeFile.*` | `ed2k-codec` | done (FileDataIOTest cases ported; u32 string lengths read in full, unlike the C++) |
 | 1.4 | Tags | `Tag.*` | `ed2k-codec` | todo |
 | 1.5 | Packets | `Packet.*` | `ed2k-codec` | todo |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |

@@ -1,0 +1,8 @@
+[package]
+name = "ed2k-types"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "eD2k and Kad protocol constants: opcodes, tag ids, flags and limits (aMule include/protocol, include/tags)"
+
+[dependencies]

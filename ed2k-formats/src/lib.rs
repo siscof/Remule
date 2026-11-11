@@ -9,6 +9,7 @@
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
 //! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
 //! * [`nodes_dat`]: `nodes.dat`, saved Kad contacts (v0-v3 and bootstrap lists).
+//! * [`part_met`]: `.part.met`, the state of each download.
 
 pub mod canceled_met;
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
@@ -32,4 +33,5 @@ pub mod ipfilter;
 pub mod addresses_dat;
 pub mod known_met;
 pub mod nodes_dat;
+pub mod part_met;
 pub mod server_met;

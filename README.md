@@ -15,7 +15,7 @@ To try it without a daemon, run the scripted stand-in, which speaks the real EC 
     cargo run -p remule-ec --features fake-daemon --example fake_amuled -- 4712 secret
     cargo run -p remule-gui -- -h 127.0.0.1 -p 4712 -P secret
 
-Crates: `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-formats` (on-disk formats: `server.met`, `known.met`), `remule-ec` (EC protocol client) and `remule-gui` (the GUI). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
+Crates: `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol client) and `remule-gui` (the GUI). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
 
 ## License
 

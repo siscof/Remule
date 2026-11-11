@@ -16,5 +16,8 @@ pub mod emfriends_met;
 //! * [`clients_met`]: `clients.met`, credits and metadata of other clients.
 
 pub mod clients_met;
+//! * [`known2_met`]: `known2_64.met`, the stored AICH hash sets.
+
+pub mod known2_met;
 pub mod known_met;
 pub mod server_met;

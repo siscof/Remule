@@ -8,6 +8,7 @@
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
 //! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
+//! * [`nodes_dat`]: `nodes.dat`, saved Kad contacts (v0-v3 and bootstrap lists).
 
 pub mod canceled_met;
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
@@ -23,4 +24,5 @@ pub mod known2_met;
 
 pub mod cryptkey_dat;
 pub mod known_met;
+pub mod nodes_dat;
 pub mod server_met;

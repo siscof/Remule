@@ -262,6 +262,37 @@ pub fn decode_string(raw: &[u8], opt_utf8: bool) -> String {
     latin1(raw)
 }
 
+/// A string's bytes as [`Writer::string`] writes them, without BOM or length
+/// field: Latin-1 (empty if not representable) or UTF-8, cut at the first NUL.
+fn encode_string_body(s: &str, enc: StrEncoding) -> Vec<u8> {
+    let mut encoded: Vec<u8> = match enc {
+        StrEncoding::Latin1 => {
+            if s.chars().all(|c| u32::from(c) <= 0xFF) {
+                s.chars().map(|c| u32::from(c) as u8).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        StrEncoding::Utf8 | StrEncoding::Utf8Bom => s.as_bytes().to_vec(),
+    };
+    let n = until_nul(&encoded).len();
+    encoded.truncate(n);
+    encoded
+}
+
+/// How many bytes [`Writer::string`] writes for `s` without a length field,
+/// BOM included (`GetRawSize`, but measured in the encoding actually written:
+/// the C++ measures Latin-1 strings in the locale's charset, which can
+/// disagree with the bytes it then writes).
+pub fn encoded_len(s: &str, enc: StrEncoding) -> usize {
+    let bom = if enc == StrEncoding::Utf8Bom {
+        UTF8_BOM.len()
+    } else {
+        0
+    };
+    bom + encode_string_body(s, enc).len()
+}
+
 /// Writes values to a growing buffer (`CFileDataIO`'s write side, over a
 /// `CMemFile`).
 #[derive(Clone, Debug, Default)]
@@ -349,17 +380,8 @@ impl Writer {
     /// are capped at 0xFFFF; this can cut a UTF-8 character in half, as in
     /// aMule, so that a peer cannot make us emit an inconsistent length.
     pub fn string(&mut self, s: &str, enc: StrEncoding, len: LenField) -> &mut Self {
-        let encoded: Vec<u8> = match enc {
-            StrEncoding::Latin1 => {
-                if s.chars().all(|c| u32::from(c) <= 0xFF) {
-                    s.chars().map(|c| u32::from(c) as u8).collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            StrEncoding::Utf8 | StrEncoding::Utf8Bom => s.as_bytes().to_vec(),
-        };
-        let mut body = until_nul(&encoded);
+        let encoded = encode_string_body(s, enc);
+        let mut body = &encoded[..];
         let bom = if enc == StrEncoding::Utf8Bom {
             UTF8_BOM.len()
         } else {

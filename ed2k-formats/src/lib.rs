@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`ipfilter`]: `ipfilter.dat` / `ipfilter_static.dat` IP filter lists.
 
+pub mod ipfilter;
 pub mod known_met;
 pub mod server_met;

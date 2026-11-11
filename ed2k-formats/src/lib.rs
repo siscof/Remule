@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`known2_met`]: `known2_64.met`, the stored AICH hash sets.
 
+pub mod known2_met;
 pub mod known_met;
 pub mod server_met;

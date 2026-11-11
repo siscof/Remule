@@ -16,6 +16,7 @@
 //! * [`ipfilter`]: `ipfilter.dat` / `ipfilter_static.dat` IP filter lists.
 //! * [`addresses_dat`]: `addresses.dat` (server.met update URLs) and
 //!   `staticservers.dat` (servers marked static).
+//! * [`part_met`]: `.part.met`, the state of each download.
 
 pub mod canceled_met;
 pub mod emfriends_met;
@@ -26,4 +27,5 @@ pub mod ipfilter;
 pub mod addresses_dat;
 pub mod known_met;
 pub mod nodes_dat;
+pub mod part_met;
 pub mod server_met;

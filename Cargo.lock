@@ -956,6 +956,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed2k-codec"
+version = "0.1.0"
+dependencies = [
+ "ed2k-types",
+]
+
+[[package]]
 name = "ed2k-types"
 version = "0.1.0"
 

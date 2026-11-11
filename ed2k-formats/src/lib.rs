@@ -13,5 +13,8 @@ pub mod canceled_met;
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
 
 pub mod emfriends_met;
+//! * [`clients_met`]: `clients.met`, credits and metadata of other clients.
+
+pub mod clients_met;
 pub mod known_met;
 pub mod server_met;

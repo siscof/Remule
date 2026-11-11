@@ -37,7 +37,7 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | Crate | Contents |
 |---|---|
 | `ed2k-types` | eD2k/Kad protocol constants: opcodes, tag ids, flags, limits (step 1.1); `Md4Hash` and the Kad id `UInt128` (step 1.2) |
-| `ed2k-formats` | On-disk formats (phase 2): `server.met`, `known.met` so far |
+| `ed2k-formats` | On-disk formats (phase 2): `server.met`, `known.met`, `.part.met`, `known2_64.met`, `clients.met`, `cryptkey.dat`, `nodes.dat`, IP filter, `addresses.dat`/`staticservers.dat`, `canceled.met`, `emfriends.met`, `amule.conf` |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -207,6 +207,16 @@ Update this table as steps land.
 | 1.5 | Packets | `Packet.*` | `ed2k-codec` | done (PacketTest.cpp ported; split packets left to phase 5). Phase 1 milestone: every tag type round-trips; byte-identical re-encoding verified on aMule's test packets, not yet on live captures |
 | 2.1 | `server.met` | `ServerMet.*`, `ServerList.cpp` (load/save), `CServer::AddTagFromFile` | `ed2k-formats::server_met` | done (ServerMetTest.cpp ported; a public server.met from emule-security.org reads and writes back byte for byte) |
 | 2.2 | `known.met` | `KnownFileList.cpp` (Init/Save), `CKnownFile::LoadFromFile`/`WriteToFile` | `ed2k-formats::known_met` | done (rules-based tests; aMule has no unit test for it; FT_FILESIZE_HI combined, unlike aMule) |
+| 2.3 | `.part.met` | `CPartFile::LoadPartFile`/`SavePartFile`, `PartMetWriter` (format parts) | `ed2k-formats::part_met` | done (PartMetWriterTest format cases ported; eDonkey import layouts read) |
+| 2.4 | `clients.met` | `ClientCreditsList.cpp`, `ClientCredits.*`, `ClientMetaTrailer.*` | `ed2k-formats::clients_met` | done (ClientMetaTrailerTest ported; credit ratio as aMule computes it) |
+| 2.5 | `nodes.dat` | `CRoutingZone::ReadFile`/`WriteFile`, `CKadUDPKey` | `ed2k-formats::nodes_dat` | done (v0-v3 + bootstrap; a public nodes.dat round-trips byte for byte) |
+| 2.6 | `cryptkey.dat` | `CClientCreditsList::CreateKeyPair`/`InitalizeCrypting` | `ed2k-formats::cryptkey_dat` | done (Crypto++ base64 of PKCS#8; not yet checked against an aMule-made key) |
+| 2.7 | IP filter | `IPFilterScanner.l`, `IPFilter.cpp`, `CIPFilterIPv6Ranges` | `ed2k-formats::ipfilter` | done (IPFilterIPv6Test ported; zip lists and 6to4/Teredo check left out) |
+| 2.8 | `addresses.dat`, `staticservers.dat` | `ServerListSources.h`, `CServerList::Load/SaveStaticServers` | `ed2k-formats::addresses_dat` | done (ServerListSourcesTest ported) |
+| 2.9 | `amule.conf` | `Preferences.cpp`, `ECSRPConfig.cpp`, wxFileConfig rules | `ed2k-formats::amule_conf` | done (lossless INI + typed core subset) |
+| 2.10 | `known2_64.met` | `SHAHashSet.cpp`, `CAICHSyncTask`, `ConvertToKnown2ToKnown264` | `ed2k-formats::known2_met` | done (root verification waits for phase 3 AICH) |
+| 2.11 | `canceled.met`, `knownhistory.met` | `HashListFile.*` | `ed2k-formats::canceled_met` | done |
+| 2.12 | `emfriends.met` | `FriendList.cpp`, `Friend.cpp` | `ed2k-formats::emfriends_met` | done |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

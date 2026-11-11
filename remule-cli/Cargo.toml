@@ -1,0 +1,15 @@
+[package]
+name = "remule-cli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The remule command-line tool: inspect an aMule config directory, and more to come"
+
+[[bin]]
+name = "remule"
+path = "src/main.rs"
+
+[dependencies]
+ed2k-formats = { path = "../ed2k-formats" }
+ed2k-types = { path = "../ed2k-types" }
+clap = { version = "4", features = ["derive"] }

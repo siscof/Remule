@@ -17,6 +17,7 @@
 //! * [`addresses_dat`]: `addresses.dat` (server.met update URLs) and
 //!   `staticservers.dat` (servers marked static).
 //! * [`part_met`]: `.part.met`, the state of each download.
+//! * [`amule_conf`]: `amule.conf`, the preferences (a wxFileConfig INI file).
 
 pub mod canceled_met;
 pub mod emfriends_met;
@@ -25,6 +26,7 @@ pub mod known2_met;
 pub mod cryptkey_dat;
 pub mod ipfilter;
 pub mod addresses_dat;
+pub mod amule_conf;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod part_met;

@@ -1,6 +1,9 @@
 # .github/workflows/anthropic-wif-test.yml
 name: anthropic-wif-test
-on: push
+on:
+  push:
+  # Run it by hand from the Actions tab, or with `gh workflow run anthropic-wif-test`.
+  workflow_dispatch:
 permissions:
   id-token: write
   contents: read
@@ -15,6 +18,17 @@ jobs:
             const token = await core.getIDToken('https://api.anthropic.com');
             core.setSecret(token);
             core.exportVariable('JWT', token);
+            // The claims the federation rule is matched against. They are not
+            // secret (the signed token above stays masked); printing them shows
+            // exactly what the rule has to accept.
+            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+            const shown = ['iss', 'aud', 'sub', 'repository', 'repository_id', 'repository_owner',
+              'repository_owner_id', 'ref', 'ref_type', 'environment', 'event_name',
+              'workflow_ref', 'job_workflow_ref', 'repository_visibility'];
+            core.info('OIDC token claims:');
+            for (const k of shown) {
+              if (claims[k] !== undefined) core.info(`  ${k}: ${JSON.stringify(claims[k])}`);
+            }
       - name: Exchange for an Anthropic access token
         # An explicit `shell: bash` runs with -o pipefail, so a failed curl
         # fails the step even though its output is piped into jq. Without it

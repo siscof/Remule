@@ -7,11 +7,15 @@
 //! * [`tag`]: tags in their eD2k and Kad encodings, the port of `Tag.{h,cpp}`
 //!   (step 1.4).
 //!
-//! Packets (`Packet.cpp`, step 1.5) build on these. Sans-IO: everything
-//! works on in-memory buffers.
+//! * [`packet`]: TCP/UDP framing and zlib packing, the port of
+//!   `Packet.{h,cpp}` (step 1.5).
+//!
+//! Sans-IO: everything works on in-memory buffers.
 
 pub mod io;
+pub mod packet;
 pub mod tag;
 
 pub use io::{Error, LenField, Reader, SeekFrom, StrEncoding, Writer};
+pub use packet::{Header, Packet, PacketError};
 pub use tag::{Tag, TagError, TagName, TagValue};

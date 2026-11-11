@@ -19,5 +19,8 @@ pub mod clients_met;
 //! * [`known2_met`]: `known2_64.met`, the stored AICH hash sets.
 
 pub mod known2_met;
+//! * [`cryptkey_dat`]: `cryptkey.dat`, our RSA key for secure identification.
+
+pub mod cryptkey_dat;
 pub mod known_met;
 pub mod server_met;

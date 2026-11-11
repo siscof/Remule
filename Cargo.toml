@@ -3,6 +3,7 @@ members = [
 	'ed2k-codec',
 	'ed2k-formats',
 	'ed2k-types',
+	'remule-cli',
 	'remule-ec',
 	'remule-gui',
 ]

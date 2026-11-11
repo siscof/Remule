@@ -11,10 +11,12 @@
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
 //! * [`clients_met`]: `clients.met`, credits and metadata of other clients.
 //! * [`known2_met`]: `known2_64.met`, the stored AICH hash sets.
+//! * [`cryptkey_dat`]: `cryptkey.dat`, our RSA key for secure identification.
 
 pub mod canceled_met;
 pub mod emfriends_met;
 pub mod clients_met;
 pub mod known2_met;
+pub mod cryptkey_dat;
 pub mod known_met;
 pub mod server_met;

@@ -14,6 +14,8 @@
 //! * [`cryptkey_dat`]: `cryptkey.dat`, our RSA key for secure identification.
 //! * [`nodes_dat`]: `nodes.dat`, saved Kad contacts (v0-v3 and bootstrap lists).
 //! * [`ipfilter`]: `ipfilter.dat` / `ipfilter_static.dat` IP filter lists.
+//! * [`addresses_dat`]: `addresses.dat` (server.met update URLs) and
+//!   `staticservers.dat` (servers marked static).
 
 pub mod canceled_met;
 pub mod emfriends_met;
@@ -21,6 +23,7 @@ pub mod clients_met;
 pub mod known2_met;
 pub mod cryptkey_dat;
 pub mod ipfilter;
+pub mod addresses_dat;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod server_met;

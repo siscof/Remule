@@ -10,5 +10,8 @@
 //! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
 
 pub mod canceled_met;
+//! * [`emfriends_met`]: `emfriends.met`, the friends list.
+
+pub mod emfriends_met;
 pub mod known_met;
 pub mod server_met;

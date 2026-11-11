@@ -23,6 +23,9 @@ pub mod known2_met;
 //! * [`cryptkey_dat`]: `cryptkey.dat`, our RSA key for secure identification.
 
 pub mod cryptkey_dat;
+//! * [`ipfilter`]: `ipfilter.dat` / `ipfilter_static.dat` IP filter lists.
+
+pub mod ipfilter;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod server_met;

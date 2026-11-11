@@ -195,8 +195,8 @@ Update this table as steps land.
 
 | # | Step | C++ source | Rust module | Status |
 |---|---|---|---|---|
-| 0.1 | Workspace builds + tests on Windows | — | workspace | todo |
-| 0.3 | CI | — | — | todo |
+| 0.1 | Workspace builds + tests on Windows | — | workspace | done (CI runs Windows and Linux) |
+| 0.3 | CI | — | `.github/workflows/ci.yml` | done: fmt, clippy -D warnings, tests, docs on Linux + Windows |
 | 0.4 | GPLv2+ license, Cargo-only build | — | workspace | done |
 | 1.1 | Protocol constants | `include/protocol/**`, `include/tags/**` | `ed2k-types` | done (369 values cross-checked against the headers) |
 | 1.2 | `Md4Hash`, `UInt128` | `MD4Hash.h`, `UInt128.*` | `ed2k-types` | done (CUInt128Test cases ported) |

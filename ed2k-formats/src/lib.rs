@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`part_met`]: `.part.met`, the state of each download.
 
 pub mod known_met;
+pub mod part_met;
 pub mod server_met;

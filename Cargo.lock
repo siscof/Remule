@@ -960,6 +960,7 @@ name = "ed2k-codec"
 version = "0.1.0"
 dependencies = [
  "ed2k-types",
+ "flate2",
 ]
 
 [[package]]

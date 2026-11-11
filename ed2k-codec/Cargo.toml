@@ -3,7 +3,8 @@ name = "ed2k-codec"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "eD2k byte codec: little-endian reader/writer and strings (SafeFile), tags and packets"
+description = "eD2k byte codec: little-endian reader/writer and strings (SafeFile), tags (Tag), packets (Packet)"
 
 [dependencies]
 ed2k-types = { path = "../ed2k-types" }
+flate2 = "1"

@@ -37,6 +37,7 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | Crate | Contents |
 |---|---|
 | `ed2k-types` | eD2k/Kad protocol constants: opcodes, tag ids, flags, limits (step 1.1); `Md4Hash` and the Kad id `UInt128` (step 1.2) |
+| `ed2k-formats` | On-disk formats (phase 2): `server.met` so far |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -204,6 +205,7 @@ Update this table as steps land.
 | 1.3 | Byte reader/writer | `SafeFile.*` | `ed2k-codec` | done (FileDataIOTest cases ported; u32 string lengths read in full, unlike the C++) |
 | 1.4 | Tags | `Tag.*` | `ed2k-codec` | done (CTagTest.cpp packets ported; unwritable tags are errors, not corrupt output) |
 | 1.5 | Packets | `Packet.*` | `ed2k-codec` | done (PacketTest.cpp ported; split packets left to phase 5). Phase 1 milestone: every tag type round-trips; byte-identical re-encoding verified on aMule's test packets, not yet on live captures |
+| 2.1 | `server.met` | `ServerMet.*`, `ServerList.cpp` (load/save), `CServer::AddTagFromFile` | `ed2k-formats::server_met` | done (ServerMetTest.cpp ported; a public server.met from emule-security.org reads and writes back byte for byte) |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

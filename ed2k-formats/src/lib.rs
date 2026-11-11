@@ -7,6 +7,9 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`addresses_dat`]: `addresses.dat` (server.met update URLs) and
+//!   `staticservers.dat` (servers marked static).
 
+pub mod addresses_dat;
 pub mod known_met;
 pub mod server_met;

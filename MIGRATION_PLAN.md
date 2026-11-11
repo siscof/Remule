@@ -37,8 +37,9 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | Crate | Contents |
 |---|---|
 | `ed2k-types` | eD2k/Kad protocol constants: opcodes, tag ids, flags, limits (step 1.1); `Md4Hash` and the Kad id `UInt128` (step 1.2) |
-| `remule-cli` | The `remule` command-line tool: `remule inspect` so far |
+| `remule-cli` | The `remule` command-line tool: `remule inspect`, `remule hash` |
 | `ed2k-formats` | On-disk formats (phase 2): `server.met`, `known.met`, `.part.met`, `known2_64.met`, `clients.met`, `cryptkey.dat`, `nodes.dat`, IP filter, `addresses.dat`/`staticservers.dat`, `canceled.met`, `emfriends.met`, `amule.conf` |
+| `ed2k-hash` | eD2k MD4 and AICH hashing, streaming (phase 3) |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -219,6 +220,9 @@ Update this table as steps land.
 | 2.11 | `canceled.met`, `knownhistory.met` | `HashListFile.*` | `ed2k-formats::canceled_met` | done |
 | 2.12 | `emfriends.met` | `FriendList.cpp`, `Friend.cpp` | `ed2k-formats::emfriends_met` | done |
 | 2.M | Phase 2 milestone: `remule inspect <aMule config dir>` | — | `remule-cli` | done: summarises every file and checks the byte-for-byte rewrite (`--write OUT` saves the copies); a public server.met and nodes.dat pass |
+| 3.1 | eD2k hash: MD4 parts, file hash, empty extra part | `ThreadTasks.cpp` (`CreateNextPartHash`), `KnownFile.cpp` | `ed2k-hash` | done (independent Python reference; one part of zeros gives the published FC21D9AF828F92A8DF64BEAC3357425D) |
+| 3.2 | AICH tree (SHA-1, 184,320-byte blocks) | `SHAHashSet.cpp` (`CAICHHashTree`) | `ed2k-hash` | done (same reference; root rebuilt from stored block hashes) |
+| 3.M | Phase 3 milestone: `remule hash <file>` | — | `remule-cli` | done (ed2k link with h=AICH as aMule writes it; ~840 MB/s release). Not yet compared with aMule on the same files |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

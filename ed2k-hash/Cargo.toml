@@ -1,0 +1,11 @@
+[package]
+name = "ed2k-hash"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "eD2k file hashing: MD4 part hashes, the ed2k file hash, and the AICH (SHA-1) tree"
+
+[dependencies]
+ed2k-types = { path = "../ed2k-types" }
+md4 = "0.10"
+sha1 = "0.10"

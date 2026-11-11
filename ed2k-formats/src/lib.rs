@@ -7,6 +7,8 @@
 //!
 //! * [`server_met`]: `server.met`, the eD2k server list.
 //! * [`known_met`]: `known.met`, the hashed files and their statistics.
+//! * [`amule_conf`]: `amule.conf`, the preferences (a wxFileConfig INI file).
 
+pub mod amule_conf;
 pub mod known_met;
 pub mod server_met;

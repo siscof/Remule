@@ -1084,6 +1084,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed2k-crypto"
+version = "0.1.0"
+dependencies = [
+ "ed2k-formats",
+ "ed2k-types",
+ "md-5",
+ "num-bigint",
+ "rand",
+ "rsa",
+ "sha1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ed2k-formats"
 version = "0.1.0"
 dependencies = [

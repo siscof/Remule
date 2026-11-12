@@ -8,6 +8,7 @@ members = [
 	'remule-cli',
 	'remule-ec',
 	'remule-gui',
+	'remule-net',
 ]
 resolver = "2"
 

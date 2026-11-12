@@ -358,6 +358,29 @@ impl StreamCrypt {
         }
     }
 
+    /// Split a connection whose handshake is over into its two directions,
+    /// for a reader and a writer that run apart. Fails while negotiating.
+    pub fn split(self) -> Result<(SendHalf, RecvHalf), StreamError> {
+        match self.state {
+            State::Plain | State::Unknown => Ok((
+                SendHalf {
+                    rc4: None,
+                    pending: Vec::new(),
+                },
+                RecvHalf { rc4: None },
+            )),
+            State::Encrypting => Ok((
+                SendHalf {
+                    rc4: self.send,
+                    pending: self.pending,
+                },
+                RecvHalf { rc4: self.recv },
+            )),
+            State::Negotiating(_) => Err(StreamError::NotReady),
+            State::Failed => Err(StreamError::Failed),
+        }
+    }
+
     /// Feed bytes read from the socket.
     pub fn receive(&mut self, mut input: &[u8]) -> Result<Received, StreamError> {
         let mut out = Received::default();
@@ -527,4 +550,44 @@ pub const fn must_refuse_plain_connection(
     is_test_connection: bool,
 ) -> bool {
     !transport_obfuscates && (strict || !is_test_connection)
+}
+
+/// The sending direction of an established connection ([`StreamCrypt::split`]).
+#[derive(Debug)]
+pub struct SendHalf {
+    rc4: Option<Rc4>,
+    pending: Vec<u8>,
+}
+
+impl SendHalf {
+    /// Whether the stream is obfuscated.
+    pub fn is_obfuscated(&self) -> bool {
+        self.rc4.is_some()
+    }
+
+    /// Held-back handshake bytes, then `data`, encrypted if the stream is.
+    pub fn seal(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.pending);
+        let start = out.len();
+        out.extend_from_slice(data);
+        if let Some(rc4) = &mut self.rc4 {
+            rc4.apply(&mut out[start..]);
+        }
+        out
+    }
+}
+
+/// The receiving direction of an established connection ([`StreamCrypt::split`]).
+#[derive(Debug)]
+pub struct RecvHalf {
+    rc4: Option<Rc4>,
+}
+
+impl RecvHalf {
+    /// Decrypt bytes read from the socket, in place.
+    pub fn open(&mut self, data: &mut [u8]) {
+        if let Some(rc4) = &mut self.rc4 {
+            rc4.apply(data);
+        }
+    }
 }

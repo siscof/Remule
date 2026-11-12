@@ -41,6 +41,7 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | `ed2k-formats` | On-disk formats (phase 2): `server.met`, `known.met`, `.part.met`, `known2_64.met`, `clients.met`, `cryptkey.dat`, `nodes.dat`, IP filter, `addresses.dat`/`staticservers.dat`, `canceled.met`, `emfriends.met`, `amule.conf` |
 | `ed2k-hash` | eD2k MD4 and AICH hashing, streaming (phase 3) |
 | `ed2k-crypto` | RC4 obfuscation (TCP, UDP), secure ident (RSA), credits, sans IO (phase 4) |
+| `remule-net` | tokio runtime: framed TCP with obfuscation, UDP, bandwidth throttling, connection limits (phase 5) |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -92,6 +93,7 @@ remule/
     kad/             Kademlia: routing, contacts, searches, publishing
     remule-core/     download queue, part files, shared files, upload queue, credits, ip filter, stats
     remule-ec/       EC protocol (server side first, then client)
+    remule-net/      tokio runtime: framed TCP, UDP, throttling, connection limits
     remuled/         daemon binary: config, runtime, wiring
     remulecmd/       CLI over EC
 ```
@@ -229,6 +231,11 @@ Update this table as steps land.
 | 4.3 | Secure ident: RSA PKCS#1 v1.5 / SHA-1 signatures, v1 and v2 (challenge IP) | `ClientCreditsList.cpp`, `SecIdentPolicy.h` | `ed2k-crypto` | done (sign/verify round trips and tampering; SecIdentTest ported). Not yet checked against an aMule-made signature |
 | 4.4 | Credit ratio and the identity gate on scoring | `ClientCredits.cpp` | `ed2k-crypto` | done (ClientCreditsTest ratio cases ported) |
 | 4.M | Phase 4 milestone: an obfuscated handshake with a real aMule | — | — | open |
+| 5.1 | Framed TCP (`tokio_util::codec`, 2 MB packet limit) with the obfuscation handshake, split into reader and writer | `EMSocket.cpp`, `EncryptedStreamSocket.cpp` | `remule-net` | done (plain, client, server and incoming handshakes over pipes) |
+| 5.2 | Bandwidth throttling: download bucket (300 ms ticks, 2-tick cap, refunds), upload (control first, fragments, debt) | `DownloadBandwidthThrottler.cpp`, `UploadBandwidthThrottler.cpp` | `remule-net` | done (paused-clock tests). Upload slots and their trickle/round-robin come with the upload queue |
+| 5.3 | Connection limits (`TooManySockets`, per-five-seconds with spike modifier), limit-aware listener | `ListenSocket.cpp`, `Preferences.cpp` | `remule-net` | done |
+| 5.4 | UDP socket, sent as control traffic | `MuleUDPSocket.cpp` | `remule-net` | done (no send queue yet) |
+| 5.M | Phase 5 milestone: N connections stay within the limits | — | `remule-net` | done (8 localhost connections, half obfuscated: 254.6 / 256.0 KiB/s against 256) |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

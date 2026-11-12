@@ -17,7 +17,7 @@ pub mod stream;
 pub mod udp;
 
 pub use rc4::Rc4;
-pub use stream::{Received, StreamCrypt, StreamError};
+pub use stream::{Received, RecvHalf, SendHalf, StreamCrypt, StreamError};
 
 #[cfg(test)]
 mod tests;

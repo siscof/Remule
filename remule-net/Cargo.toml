@@ -1,0 +1,19 @@
+[package]
+name = "remule-net"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Async networking runtime for remule: framed eD2k TCP, UDP, bandwidth throttling, connection limits"
+
+[dependencies]
+ed2k-codec = { path = "../ed2k-codec" }
+ed2k-crypto = { path = "../ed2k-crypto" }
+ed2k-types = { path = "../ed2k-types" }
+bytes = "1"
+rand = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros", "test-util"] }

@@ -554,3 +554,36 @@ async fn refused_login_reports_the_reason() {
     );
     srv.await.unwrap();
 }
+
+// ---------------------------------------------------------------- Kad keywords
+
+#[test]
+fn kad_words_and_keywords() {
+    use crate::search::{encode_kad_search, kad_words};
+    assert_eq!(kad_words("Ubuntu iso, a/b-cd ÄÖ"), ["ubuntu", "iso", "äö"]);
+    let kad = |q: &str| encode_kad_search(&SearchParams::new(q));
+    // The keyword alone: nothing more to send.
+    assert_eq!(kad("ubuntu").unwrap(), ("ubuntu".into(), vec![]));
+    // The keyword leaves the ANDed words.
+    assert_eq!(kad("ubuntu iso").unwrap(), ("ubuntu".into(), word("iso")));
+    // A longer word takes over as the keyword.
+    assert_eq!(kad("iso ubuntu").unwrap(), ("ubuntu".into(), word("iso")));
+    // The keyword is lower-cased, the terms are not: "Ubuntu" stays a term (as aMule).
+    assert_eq!(kad("Ubuntu").unwrap(), ("ubuntu".into(), word("Ubuntu")));
+    // With OR or NOT the whole expression goes along.
+    let (k, d) = kad("abc OR ubuntu").unwrap();
+    assert_eq!(k, "abc");
+    let mut want = vec![0, 1];
+    want.extend(word("abc"));
+    want.extend(word("ubuntu"));
+    assert_eq!(d, want);
+    assert_eq!(kad("ab cd"), Err(QueryError::NoKeyword));
+    // Filters alone still go out.
+    let mut p = SearchParams::new("ubuntu");
+    p.min_size = 10;
+    let (_, d) = encode_kad_search(&p).unwrap();
+    let mut want = vec![3];
+    want.extend(10u32.to_le_bytes());
+    want.extend([1, 1, 0, FileTag::Filesize.into()]);
+    assert_eq!(d, want);
+}

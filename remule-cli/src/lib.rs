@@ -3,4 +3,5 @@
 //! tested without spawning the binary.
 
 pub mod inspect;
+pub mod kad;
 pub mod server;

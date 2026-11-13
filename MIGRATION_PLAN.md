@@ -43,6 +43,7 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | `ed2k-crypto` | RC4 obfuscation (TCP, UDP), secure ident (RSA), credits, sans IO (phase 4) |
 | `remule-net` | tokio runtime: framed TCP with obfuscation, UDP, bandwidth throttling, connection limits (phase 5) |
 | `ed2k-server` | client↔server protocol: login, search, sources, server list, UDP ping; sans-IO session and async client (phase 6) |
+| `ed2k-kad` | Kademlia (Kad2): routing table (arena tree), packets, lookups, keyword and source searches; sans-IO node and tokio driver (phase 7) |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -243,6 +244,13 @@ Update this table as steps land.
 | 6.4 | Source requests (`OP_GETSOURCES`, `_OBFU`, large files) | `DownloadQueue.cpp` | `ed2k-server` | done (packet only; used with the download queue) |
 | 6.5 | UDP server ping (`OP_GLOBSERVSTATREQ/RES`) | `ServerList.cpp`, `ServerUDPSocket.cpp` | `ed2k-server` | done (real server). Obfuscated ping, UDP global search and server descriptions not yet |
 | 6.M | Phase 6 milestone: `remule search` against a real server | — | `remule-cli` | done (eMule Sunrise: 153 results for "ubuntu", plain and obfuscated) |
+| 7.1 | Contacts and the routing table: bins, zone splits and merges, IP/subnet limits, small and big timers, nodes.dat and preferencesKad.dat | `routing/*`, `kademlia/Prefs.cpp` | `ed2k-kad` | done (arena tree; rules tested; nodes.dat written back) |
+| 7.2 | Kad2 packets and their obfuscation (Kad ID and verify keys), request tracking | `net/KademliaUDPListener.cpp`, `net/PacketTracking.cpp` (tracking only) | `ed2k-kad` | done (real network) |
+| 7.3 | Lookups: node, self, keyword and source searches; keyword choice and search terms | `kademlia/Search.cpp`, `SearchManager.cpp`, `SearchList.cpp`, `SearchPacket.cpp` | `ed2k-kad`, `ed2k-server` | done (simulated network; real network: "ubuntu" 539 files, 11 sources for an ISO it listed with 10) |
+| 7.4 | Answering bootstrap, hello (with ACK), routing requests, pings | `net/KademliaUDPListener.cpp` | `ed2k-kad` | done |
+| 7.5 | Indexing and answering searches, publishing keywords/sources/notes | `kademlia/Indexed.cpp`, `Entry.cpp`, `Search.cpp` (store) | — | open (part 2) |
+| 7.6 | Firewall checks (TCP, UDP), buddies, legacy challenges, flood protection, node protection | `UDPFirewallTester.cpp`, `net/PacketTracking.cpp`, `net/SafeKad.cpp` | — | open (part 2) |
+| 7.M | Phase 7 milestone: `remule kad` bootstraps, keeps a healthy table for an hour, searches | — | `remule-cli` | searches done on the live network (no local aMule to compare with side by side; server results agree); the hour run is in progress |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

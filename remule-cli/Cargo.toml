@@ -15,5 +15,6 @@ ed2k-hash = { path = "../ed2k-hash" }
 ed2k-types = { path = "../ed2k-types" }
 clap = { version = "4", features = ["derive"] }
 ed2k-server = { path = "../ed2k-server" }
+ed2k-kad = { path = "../ed2k-kad" }
 rand = "0.8"
 tokio = { version = "1", features = ["net", "time", "rt-multi-thread", "macros"] }

@@ -5,6 +5,7 @@
 //!     remule hash FILE... [-v]
 //!     remule search TERMS --server IP:PORT [--obfuscate] [--type T] [--min-size S] ...
 //!     remule ping IP:PORT
+//!     remule kad [--nodes nodes.dat] [--search TERMS]... [--source HASH:SIZE]... [--duration S]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ed2k_types::tags::FileType;
 use remule_cli::inspect::{self, Outcome};
-use remule_cli::server;
+use remule_cli::{kad, server};
 
 #[derive(Parser)]
 #[command(
@@ -87,6 +88,42 @@ enum Command {
         /// The TCP port to tell the server (nothing listens on it: expect a LowID).
         #[arg(long, default_value_t = 4662)]
         port: u16,
+        /// Also print each result's ed2k link.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Join Kad from a nodes.dat, keep a routing table, run keyword and source searches.
+    Kad {
+        /// The nodes.dat to start from (default: DIR/nodes.dat).
+        #[arg(long)]
+        nodes: Option<PathBuf>,
+        /// Where to keep nodes.dat and preferencesKad.dat between runs.
+        #[arg(long, default_value = "remule-kad")]
+        dir: PathBuf,
+        /// The UDP port to use.
+        #[arg(long, default_value_t = 4672)]
+        port: u16,
+        /// Also bootstrap from this node (IP:PORT).
+        #[arg(long)]
+        bootstrap: Vec<std::net::SocketAddrV4>,
+        /// Search for these words (the first word of 3+ letters, or a longer one, is the keyword).
+        #[arg(long = "search")]
+        searches: Vec<String>,
+        /// Look for sources of a file: HASH:SIZE.
+        #[arg(long = "source", value_parser = kad::parse_source)]
+        sources: Vec<(ed2k_types::Md4Hash, u64)>,
+        /// Seconds to stay up (default: until the searches are done).
+        #[arg(long, default_value_t = 0)]
+        duration: u64,
+        /// Seconds between status lines.
+        #[arg(long, default_value_t = 30)]
+        status_every: u64,
+        /// Seconds after connecting before searching.
+        #[arg(long, default_value_t = 20)]
+        warmup: u64,
+        /// Print at most this many results per search.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
         /// Also print each result's ed2k link.
         #[arg(short, long)]
         verbose: bool,
@@ -195,6 +232,31 @@ fn main() -> ExitCode {
             max_size,
             extension: ext,
             more,
+            limit,
+            verbose,
+        })),
+        Command::Kad {
+            nodes,
+            dir,
+            port,
+            bootstrap,
+            searches,
+            sources,
+            duration,
+            status_every,
+            warmup,
+            limit,
+            verbose,
+        } => run_async(kad::run(kad::KadArgs {
+            nodes,
+            dir,
+            port,
+            bootstrap,
+            searches,
+            sources,
+            duration,
+            status_every: status_every.max(1),
+            warmup,
             limit,
             verbose,
         })),

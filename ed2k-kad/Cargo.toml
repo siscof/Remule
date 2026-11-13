@@ -1,0 +1,20 @@
+[package]
+name = "ed2k-kad"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Kademlia (Kad2) for remule: routing table, packets, lookups and searches; sans-IO core with a tokio driver"
+
+[dependencies]
+ed2k-codec = { path = "../ed2k-codec" }
+ed2k-crypto = { path = "../ed2k-crypto" }
+ed2k-formats = { path = "../ed2k-formats" }
+ed2k-server = { path = "../ed2k-server" }
+ed2k-types = { path = "../ed2k-types" }
+md4 = "0.10"
+rand = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros", "test-util"] }

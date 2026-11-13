@@ -24,6 +24,12 @@ Logs into a server, as a LowID since nothing listens for its callback, and runs 
 
 Pings a server over UDP (its TCP port + 4) for its user and file counts.
 
+## remule kad: Kademlia
+
+    cargo run --release -p remule-cli -- kad --nodes nodes.dat [--search "ubuntu iso"]... [--source HASH:SIZE]... [--duration SECS] [-v]
+
+Joins Kad from a nodes.dat, keeps a routing table and runs keyword and source searches. Within one search it merges the answers for the same file, then prints them. The node says it is firewalled, so other nodes keep it out of their routing tables. It keeps its Kad ID and the contacts it learned in `--dir` (default `remule-kad`) for the next run. It does not publish or store anything yet.
+
 ## remule-gui: remote GUI for amuled
 
 A native (egui) port of `amulegui`. It connects to an aMule daemon over External Connections (aMule 3.3+, SRP login over an encrypted channel), like `amulegui` does.

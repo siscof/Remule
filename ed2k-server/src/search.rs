@@ -38,6 +38,9 @@ pub enum QueryError {
     /// More than 10 operators: there is room for 11 more (one per filter).
     #[error("search expression is too complex")]
     TooComplex,
+    /// Kad needs a word of at least 3 bytes to look up.
+    #[error("no keyword for a Kad search (a word of 3 or more letters)")]
+    NoKeyword,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,33 +260,74 @@ impl Parser {
 /// `ParsedSearchExpression` for an ed2k search): when only ANDs join the
 /// words they become one string of words separated by spaces.
 pub fn parse_query(query: &str) -> Result<Vec<Term>, QueryError> {
+    Ok(parse_query_kad(query, "")?.0)
+}
+
+/// `CSearchManager::GetInvalidKeywordChars`
+pub const INVALID_KEYWORD_CHARS: &str = r#" ()[]{}<>,._-!?:;\/""#;
+
+/// `CSearchManager::GetWords`: the words of `s` that make Kad keywords,
+/// lower-cased: split at [`INVALID_KEYWORD_CHARS`], at least 3 bytes of UTF-8.
+pub fn kad_words(s: &str) -> Vec<String> {
+    s.split(|c| INVALID_KEYWORD_CHARS.contains(c))
+        .filter(|w| w.len() >= 3)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// [`parse_query`] for a Kad search whose keyword is `keyword`
+/// (`ParsedSearchExpression` with `s_strCurKadKeyword`): in a query of
+/// ANDed words a longer word takes over as the keyword, and the keyword
+/// itself is left out of the terms, the target already standing for it.
+/// Returns the terms and the keyword, maybe replaced.
+pub fn parse_query_kad(query: &str, keyword: &str) -> Result<(Vec<Term>, String), QueryError> {
+    let mut keyword = keyword.to_owned();
     let tokens = lex(query)?;
-    if let [Token::Ed2kLink(link)] = tokens.as_slice() {
-        return Ok(vec![Term::Word(link.clone())]);
-    }
-    let mut p = Parser { tokens, pos: 0 };
-    let e = p.expr(0)?;
-    if let Some(t) = p.peek() {
-        return Err(QueryError::Unexpected(format!("{t:?}")));
-    }
-    let mut terms = Vec::new();
-    e.flatten(&mut terms);
+    let terms = if let [Token::Ed2kLink(link)] = tokens.as_slice() {
+        vec![Term::Word(link.clone())]
+    } else {
+        let mut p = Parser { tokens, pos: 0 };
+        let e = p.expr(0)?;
+        if let Some(t) = p.peek() {
+            return Err(QueryError::Unexpected(format!("{t:?}")));
+        }
+        let mut terms = Vec::new();
+        e.flatten(&mut terms);
+        terms
+    };
     let count = |want: &Term| terms.iter().filter(|t| *t == want).count();
     let (and, or, not) = (count(&Term::And), count(&Term::Or), count(&Term::Not));
     if and + or + not > 10 {
         return Err(QueryError::TooComplex);
     }
+    let words = || {
+        terms.iter().filter_map(|t| match t {
+            Term::Word(w) => Some(w.as_str()),
+            _ => None,
+        })
+    };
     if and > 0 && or == 0 && not == 0 {
-        let words: Vec<&str> = terms
-            .iter()
-            .filter_map(|t| match t {
-                Term::Word(w) => Some(w.as_str()),
-                _ => None,
-            })
-            .collect();
-        return Ok(vec![Term::Word(words.join(" "))]);
+        if !keyword.is_empty() {
+            // The longest word (by characters) that could be a keyword.
+            for w in words() {
+                if w != keyword
+                    && !w.contains(|c| INVALID_KEYWORD_CHARS.contains(c))
+                    && !w.starts_with('"')
+                    && w.chars().count() >= 3
+                    && keyword.chars().count() < w.chars().count()
+                {
+                    keyword = w.to_owned();
+                }
+            }
+        }
+        let rest: Vec<&str> = words().filter(|w| *w != keyword).collect();
+        return Ok((vec![Term::Word(rest.join(" "))], keyword));
     }
-    Ok(terms)
+    // A lone word that is the keyword says nothing more.
+    if terms.len() == 1 && terms[0] == Term::Word(keyword.clone()) {
+        return Ok((Vec::new(), keyword));
+    }
+    Ok((terms, keyword))
 }
 
 /// `CSearchList::CSearchParams`, the parts a server search uses.
@@ -324,6 +368,23 @@ pub fn encode_search(
     supports_64bit: bool,
 ) -> Result<(Vec<u8>, bool), QueryError> {
     let expr = parse_query(&params.query)?;
+    Ok(write_search(params, &expr, supports_64bit))
+}
+
+/// What a Kad keyword search needs: its keyword (the first of
+/// [`kad_words`], maybe replaced by a longer word of the query) and the
+/// search terms (`CreateSearchData(KadSearch)`; empty when the keyword says
+/// it all). Kad always takes 64-bit sizes.
+pub fn encode_kad_search(params: &SearchParams) -> Result<(String, Vec<u8>), QueryError> {
+    let Some(first) = kad_words(&params.query).into_iter().next() else {
+        return Err(QueryError::NoKeyword);
+    };
+    let (expr, keyword) = parse_query_kad(&params.query, &first)?;
+    Ok((keyword, write_search(params, &expr, true).0))
+}
+
+/// `WriteSearchPacket`
+fn write_search(params: &SearchParams, expr: &[Term], supports_64bit: bool) -> (Vec<u8>, bool) {
     let mut w = Writer::new();
     let mut using_64bit = false;
 
@@ -415,7 +476,7 @@ pub fn encode_search(
         }
     };
     let write_expr = |w: &mut Writer| {
-        for t in &expr {
+        for t in expr {
             match t {
                 Term::And => op(w, 0),
                 Term::Or => op(w, 1),
@@ -428,18 +489,24 @@ pub fn encode_search(
         }
     };
 
-    let n = 1 + extras.len();
+    let has_expr = !expr.is_empty();
+    let n = usize::from(has_expr) + extras.len();
     if expr.len() <= 1 {
-        // AND t0 AND t1 ... tn: each AND in front of all but the last term.
-        if n > 1 {
-            op(&mut w, 0);
+        // AND t0 AND t1 ... tn: an AND in front of every term but the last.
+        let mut i = 0;
+        if has_expr {
+            if i + 1 < n {
+                op(&mut w, 0);
+            }
+            write_expr(&mut w);
+            i += 1;
         }
-        write_expr(&mut w);
-        for (i, e) in extras.iter().enumerate() {
-            if i + 2 < n {
+        for e in &extras {
+            if i + 1 < n {
                 op(&mut w, 0);
             }
             write_extra(&mut w, e);
+            i += 1;
         }
     } else {
         for _ in 1..n {
@@ -450,7 +517,7 @@ pub fn encode_search(
             write_extra(&mut w, e);
         }
     }
-    Ok((w.into_bytes(), using_64bit))
+    (w.into_bytes(), using_64bit)
 }
 
 /// One file of a search answer (`CSearchFile`).

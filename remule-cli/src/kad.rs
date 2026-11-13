@@ -36,7 +36,13 @@ pub struct KadArgs {
     pub limit: usize,
     /// Print ed2k links.
     pub verbose: bool,
+    /// Say we take unsolicited UDP: others then publish to us and we
+    /// store and serve it (the port must be reachable from outside).
+    pub reachable: bool,
 }
+
+/// The index files in the state directory.
+const INDEX_FILES: [&str; 3] = ["load_index.dat", "key_index.dat", "src_index.dat"];
 
 /// `HASH:SIZE` for `--source`.
 pub fn parse_source(s: &str) -> Result<(Md4Hash, u64), String> {
@@ -51,8 +57,22 @@ pub fn parse_source(s: &str) -> Result<(Md4Hash, u64), String> {
 }
 
 fn status(t: Duration, s: &Snapshot) -> String {
+    let mut extra = String::new();
+    let i = &s.index;
+    if i.keywords + i.sources + i.notes > 0 || s.stats.publishes_stored > 0 {
+        extra += &format!(
+            ", index {} keywords / {} sources / {} notes ({} publishes, {} searches answered)",
+            i.keywords, i.sources, i.notes, s.stats.publishes_stored, s.stats.searches_answered
+        );
+    }
+    if s.stats.flood_drops + s.stats.bans > 0 {
+        extra += &format!(
+            ", {} flood drops, {} bans",
+            s.stats.flood_drops, s.stats.bans
+        );
+    }
     format!(
-        "[{:>5}s] {} contacts ({} verified; by type {:?}), depth {}, ~{} users, in {} / out {} packets{}{}",
+        "[{:>5}s] {} contacts ({} verified; by type {:?}), depth {}, ~{} users, in {} / out {} packets{}{}{extra}",
         t.as_secs(),
         s.contacts,
         s.verified,
@@ -167,11 +187,32 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
         user_hash: ed2k_server::packets::new_user_hash(&mut rng),
         tcp_port: a.port,
         tcp_firewalled: true,
-        udp_firewalled: true,
+        udp_firewalled: !a.reachable,
     };
-    let mut kad = Kad::new(cfg, 1_000);
+    let now = driver::unix_now();
+    let mut kad = Kad::new(cfg, now);
+    for (i, name) in INDEX_FILES.iter().enumerate() {
+        let Ok(b) = std::fs::read(a.dir.join(name)) else {
+            continue;
+        };
+        let r = match i {
+            0 => kad.index.read_load_file(&b, now),
+            1 => kad.index.read_keyword_file(&b, now),
+            _ => kad.index.read_source_file(&b, now),
+        };
+        if let Err(e) = r {
+            println!("{name}: {e} (ignored)");
+        }
+    }
+    let st = kad.index.stats();
+    if st.keywords + st.sources + st.loads > 0 {
+        println!(
+            "index: {} keyword entries, {} sources, {} loads",
+            st.keywords, st.sources, st.loads
+        );
+    }
     if let Some(n) = &nodes {
-        let taken = kad.load_nodes(n, 1_000);
+        let taken = kad.load_nodes(n, now);
         println!(
             "{}: {} contacts, {} taken into the routing table",
             nodes_path.display(),
@@ -290,6 +331,12 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
             println!("wrote {} ({} contacts)", path.display(), n.contacts.len());
         }
         None => println!("fewer than 25 contacts: nodes.dat not written"),
+    }
+    if let Some(f) = h.index_files().await {
+        for (name, bytes) in INDEX_FILES.iter().zip([f.load, f.keywords, f.sources]) {
+            let path = a.dir.join(name);
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
     }
     let path = a.dir.join(prefs::FILE_NAME);
     std::fs::write(&path, prefs.write()).map_err(|e| format!("{}: {e}", path.display()))?;

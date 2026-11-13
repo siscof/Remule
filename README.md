@@ -28,7 +28,7 @@ Pings a server over UDP (its TCP port + 4) for its user and file counts.
 
     cargo run --release -p remule-cli -- kad --nodes nodes.dat [--search "ubuntu iso"]... [--source HASH:SIZE]... [--duration SECS] [-v]
 
-Joins Kad from a nodes.dat, keeps a routing table and runs keyword and source searches. Within one search it merges the answers for the same file, then prints them. The node says it is firewalled, so other nodes keep it out of their routing tables. It keeps its Kad ID and the contacts it learned in `--dir` (default `remule-kad`) for the next run. It does not publish or store anything yet.
+Joins Kad from a nodes.dat, keeps a routing table and runs keyword and source searches. Within one search it merges the answers for the same file, then prints them. The node says it is firewalled, so other nodes keep it out of their routing tables. It keeps its Kad ID, the contacts it learned and its index in `--dir` (default `remule-kad`) for the next run. With `--reachable` (when its UDP port can be reached from outside) it stores what others publish to it and answers their searches, as aMule does. It does not publish anything of its own yet.
 
 ## remule-gui: remote GUI for amuled
 

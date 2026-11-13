@@ -293,15 +293,46 @@ fn big_timer_looks_up_inside_the_zone() {
     let me = UInt128::new(0xFF << 120);
     let mut t = RoutingTable::new(me, 0);
     add_n(&mut t, 60, |i| (i as u128 + 1) << 100, 0);
-    let target = t.big_timer(100, rand::random()).unwrap();
+    let target = t.big_timer(100, rand::random(), false).unwrap();
     // Some zone wanted a lookup, and not again for an hour.
     let mut more = 0;
-    while t.big_timer(100, rand::random()).is_some() {
+    while t.big_timer(100, rand::random(), false).is_some() {
         more += 1;
     }
     assert!(more > 0);
-    assert!(t.big_timer(200, 0).is_none());
+    assert!(t.big_timer(200, 0, false).is_none());
     assert_ne!(target, me);
+    // Heard nothing for a while: a lookup at every call (every 10 s in the
+    // node) until something answers, the zones' hours notwithstanding.
+    for _ in 0..5 {
+        assert!(t.big_timer(300, rand::random(), true).is_some());
+    }
+    assert!(t.big_timer(300, 0, false).is_none());
+}
+
+#[test]
+fn small_timer_skips_the_hello_for_old_contacts() {
+    let mut t = RoutingTable::new(UInt128::new(7), 0);
+    let mut v = true;
+    t.add(
+        UInt128::new(1 << 125),
+        ip(20, 0, 0, 1),
+        4672,
+        4662,
+        5,
+        UdpKey::default(),
+        &mut v,
+        false,
+        false,
+        0,
+    );
+    t.small_timer(100);
+    assert!(t.small_timer(160).is_empty());
+    assert_eq!(
+        t.contacts().next().unwrap().kind,
+        4,
+        "aged out all the same"
+    );
 }
 
 #[test]

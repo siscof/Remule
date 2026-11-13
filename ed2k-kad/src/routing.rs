@@ -674,7 +674,8 @@ impl RoutingTable {
             }
             let c = &mut self.bin_mut(z)[0];
             c.checking_type(now);
-            if c.version >= 2 {
+            // Older contacts are aged out without a hello, as in aMule.
+            if c.version >= 6 {
                 hello.push(c.clone());
             }
         }
@@ -684,10 +685,15 @@ impl RoutingTable {
     /// The big timer (every 10 s): the first due leaf that wants it gets a
     /// random lookup in its range (`OnBigTimer` / `RandomLookup`).
     /// `random` supplies the bits below the zone's prefix.
-    pub fn big_timer(&mut self, now: u64, random: u128) -> Option<LookupTarget> {
+    ///
+    /// With `stale` (nothing heard for most of the disconnect delay), every
+    /// leaf is due, not only those whose hour is up: `CKademlia::Process`
+    /// keeps a node that nobody contacts, such as one behind a NAT, talking
+    /// this way.
+    pub fn big_timer(&mut self, now: u64, random: u128, stale: bool) -> Option<LookupTarget> {
         for z in self.leaves() {
             let zone = self.zone(z);
-            if zone.next_big_timer > now {
+            if zone.next_big_timer > now && !stale {
                 continue;
             }
             let wants = zone.index < UInt128::new(KK)

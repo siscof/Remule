@@ -53,6 +53,45 @@ pub struct SearchAnswer {
     pub tags: Vec<Tag>,
 }
 
+/// A tag of a publish request and the bytes it took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizedTag {
+    pub tag: Tag,
+    pub bytes: u32,
+}
+
+impl SizedTag {
+    pub fn new(tag: Tag) -> Self {
+        let mut w = Writer::new();
+        let _ = tag.write_kad(&mut w);
+        SizedTag {
+            tag,
+            bytes: w.len() as u32,
+        }
+    }
+}
+
+fn read_sized_tags(r: &mut Reader<'_>) -> Result<Vec<SizedTag>, String> {
+    let n = r.u8().map_err(|e| e.to_string())?;
+    let mut v = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let start = r.position();
+        let tag = Tag::read_kad(r, true).map_err(|e| e.to_string())?;
+        v.push(SizedTag {
+            tag,
+            bytes: (r.position() - start) as u32,
+        });
+    }
+    Ok(v)
+}
+
+fn write_sized_tags(w: &mut Writer, tags: &[SizedTag]) {
+    w.u8(tags.len().min(255) as u8);
+    for t in tags.iter().take(255) {
+        let _ = t.tag.write_kad(w);
+    }
+}
+
 /// The Kad2 packets this crate speaks.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KadPacket {
@@ -97,6 +136,35 @@ pub enum KadPacket {
         target: UInt128,
         results: Vec<SearchAnswer>,
     },
+    /// `<target 16><file size 8>`
+    SearchNotesReq {
+        target: UInt128,
+        size: u64,
+    },
+    /// `<keyword 16><count 2>(<file 16><tags>)*`
+    PublishKeyReq {
+        key: UInt128,
+        files: Vec<(UInt128, Vec<SizedTag>)>,
+    },
+    /// `<file 16><source 16><tags>`
+    PublishSourceReq {
+        file: UInt128,
+        source: UInt128,
+        tags: Vec<SizedTag>,
+    },
+    /// `<file 16><source 16><tags>`
+    PublishNotesReq {
+        file: UInt128,
+        source: UInt128,
+        tags: Vec<SizedTag>,
+    },
+    /// `<target 16><load 1>[<options 1>]`
+    PublishRes {
+        target: UInt128,
+        load: u8,
+        options: Option<u8>,
+    },
+    PublishResAck,
     Ping,
     /// `<the port the pinger was seen from 2>`
     Pong {
@@ -199,6 +267,12 @@ impl KadPacket {
             KadPacket::SearchKeyReq { .. } => Opcode::SearchKeyReq,
             KadPacket::SearchSourceReq { .. } => Opcode::SearchSourceReq,
             KadPacket::SearchRes { .. } => Opcode::SearchRes,
+            KadPacket::SearchNotesReq { .. } => Opcode::SearchNotesReq,
+            KadPacket::PublishKeyReq { .. } => Opcode::PublishKeyReq,
+            KadPacket::PublishSourceReq { .. } => Opcode::PublishSourceReq,
+            KadPacket::PublishNotesReq { .. } => Opcode::PublishNotesReq,
+            KadPacket::PublishRes { .. } => Opcode::PublishRes,
+            KadPacket::PublishResAck => Opcode::PublishResAck,
             KadPacket::Ping => Opcode::Ping,
             KadPacket::Pong { .. } => Opcode::Pong,
             KadPacket::Other { opcode, .. } => return *opcode,
@@ -210,7 +284,32 @@ impl KadPacket {
     pub fn payload(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
-            KadPacket::BootstrapReq | KadPacket::Ping => {}
+            KadPacket::BootstrapReq | KadPacket::Ping | KadPacket::PublishResAck => {}
+            KadPacket::SearchNotesReq { target, size } => {
+                w.uint128(*target).u64(*size);
+            }
+            KadPacket::PublishKeyReq { key, files } => {
+                w.uint128(*key).u16(files.len() as u16);
+                for (f, tags) in files {
+                    w.uint128(*f);
+                    write_sized_tags(&mut w, tags);
+                }
+            }
+            KadPacket::PublishSourceReq { file, source, tags }
+            | KadPacket::PublishNotesReq { file, source, tags } => {
+                w.uint128(*file).uint128(*source);
+                write_sized_tags(&mut w, tags);
+            }
+            KadPacket::PublishRes {
+                target,
+                load,
+                options,
+            } => {
+                w.uint128(*target).u8(*load);
+                if let Some(o) = options {
+                    w.u8(*o);
+                }
+            }
             KadPacket::BootstrapRes {
                 id,
                 tcp_port,
@@ -393,6 +492,40 @@ impl KadPacket {
                     results,
                 }
             }
+            Opcode::SearchNotesReq => KadPacket::SearchNotesReq {
+                target: r.uint128().map_err(e)?,
+                size: r.u64().map_err(e)?,
+            },
+            Opcode::PublishKeyReq => {
+                let key = r.uint128().map_err(e)?;
+                let n = r.u16().map_err(e)? as usize;
+                // CheckTagRecords: at least 17 bytes a record.
+                if n * 17 > r.remaining() {
+                    return Err(bad(format!("{n} records")));
+                }
+                let mut files = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let f = r.uint128().map_err(e)?;
+                    files.push((f, read_sized_tags(&mut r).map_err(bad)?));
+                }
+                KadPacket::PublishKeyReq { key, files }
+            }
+            Opcode::PublishSourceReq | Opcode::PublishNotesReq => {
+                let file = r.uint128().map_err(e)?;
+                let source = r.uint128().map_err(e)?;
+                let tags = read_sized_tags(&mut r).map_err(bad)?;
+                if op == Opcode::PublishSourceReq {
+                    KadPacket::PublishSourceReq { file, source, tags }
+                } else {
+                    KadPacket::PublishNotesReq { file, source, tags }
+                }
+            }
+            Opcode::PublishRes => KadPacket::PublishRes {
+                target: r.uint128().map_err(e)?,
+                load: r.u8().map_err(e)?,
+                options: r.u8().ok(),
+            },
+            Opcode::PublishResAck => KadPacket::PublishResAck,
             Opcode::Ping => KadPacket::Ping,
             Opcode::Pong => KadPacket::Pong {
                 port: r.u16().map_err(e)?,

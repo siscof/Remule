@@ -10,8 +10,8 @@ use ed2k_server::search::SearchParams;
 use ed2k_types::Md4Hash;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
 
+use crate::index::IndexStats;
 use crate::node::{Datagram, Event, Kad, SearchError, Stats};
 
 /// A picture of the node.
@@ -27,6 +27,23 @@ pub struct Snapshot {
     pub searches: usize,
     pub external_port: Option<u16>,
     pub stats: Stats,
+    pub index: IndexStats,
+}
+
+/// The three index files (`load_index.dat`, `key_index.dat`, `src_index.dat`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFiles {
+    pub load: Vec<u8>,
+    pub keywords: Vec<u8>,
+    pub sources: Vec<u8>,
+}
+
+/// Seconds of the Unix clock (the index files keep times in it).
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 enum Command {
@@ -38,6 +55,7 @@ enum Command {
     Bootstrap(SocketAddrV4),
     Snapshot(oneshot::Sender<Snapshot>),
     Nodes(oneshot::Sender<Option<NodesDat>>),
+    Index(oneshot::Sender<IndexFiles>),
 }
 
 /// The application's side.
@@ -101,6 +119,11 @@ impl KadHandle {
         self.ask(Command::Snapshot).await
     }
 
+    /// The index files to save.
+    pub async fn index_files(&self) -> Option<IndexFiles> {
+        self.ask(Command::Index).await
+    }
+
     /// The nodes.dat to save (`None` below 25 contacts).
     pub async fn nodes(&self) -> Option<NodesDat> {
         self.ask(Command::Nodes).await.flatten()
@@ -126,6 +149,7 @@ fn snapshot(kad: &Kad, now: u64) -> Snapshot {
         searches: kad.searches().count(),
         external_port: kad.external_port,
         stats: kad.stats.clone(),
+        index: kad.index.stats(),
     }
 }
 
@@ -142,9 +166,7 @@ async fn run(
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
 ) {
-    let start = Instant::now();
-    // Seconds on a clock that starts well above 0 (0 means "never" in places).
-    let now = || 1_000 + start.elapsed().as_secs();
+    let now = unix_now;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut buf = vec![0u8; 16384];
     loop {
@@ -195,6 +217,13 @@ async fn run(
                     }
                     Command::Snapshot(tx) => { let _ = tx.send(snapshot(&kad, t)); }
                     Command::Nodes(tx) => { let _ = tx.send(kad.nodes_to_save()); }
+                    Command::Index(tx) => {
+                        let _ = tx.send(IndexFiles {
+                            load: kad.index.write_load_file(t),
+                            keywords: kad.index.write_keyword_file(t),
+                            sources: kad.index.write_source_file(t),
+                        });
+                    }
                 }
             }
         }

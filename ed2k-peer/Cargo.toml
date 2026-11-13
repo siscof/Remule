@@ -1,0 +1,14 @@
+[package]
+name = "ed2k-peer"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "eD2k client-to-client protocol: hello handshake, file requests, hash sets, block transfers"
+
+[dependencies]
+ed2k-codec = { path = "../ed2k-codec" }
+ed2k-types = { path = "../ed2k-types" }
+thiserror = "2"
+
+[dev-dependencies]
+flate2 = "1"

@@ -5,6 +5,7 @@ members = [
 	'ed2k-formats',
 	'ed2k-hash',
 	'ed2k-kad',
+	'ed2k-peer',
 	'ed2k-server',
 	'ed2k-types',
 	'remule-cli',

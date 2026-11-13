@@ -3,12 +3,18 @@
 //!
 //!     remule inspect [DIR] [-v] [--temp-dir DIR] [--write OUT]
 //!     remule hash FILE... [-v]
+//!     remule search TERMS --server IP:PORT [--obfuscate] [--type T] [--min-size S] ...
+//!     remule ping IP:PORT
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use ed2k_types::tags::FileType;
 use remule_cli::inspect::{self, Outcome};
+use remule_cli::server;
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +53,69 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Log into an eD2k server, search it and print the results.
+    Search {
+        /// What to look for: words, AND / OR / NOT, (groups), "quoted words".
+        query: String,
+        /// The server, IP:PORT (with --obfuscate, its obfuscation port if it has one).
+        #[arg(long, short)]
+        server: SocketAddr,
+        /// Use the obfuscated (DH + RC4) handshake.
+        #[arg(long)]
+        obfuscate: bool,
+        /// File type: Audio, Video, Image, Document, Program, Archive, CdImage.
+        #[arg(long = "type", value_parser = server::parse_file_type)]
+        file_type: Option<FileType>,
+        /// Smallest size: bytes, or with K, M, G.
+        #[arg(long, value_parser = server::parse_size, default_value = "0")]
+        min_size: u64,
+        /// Largest size.
+        #[arg(long, value_parser = server::parse_size, default_value = "0")]
+        max_size: u64,
+        /// File extension, without the dot.
+        #[arg(long, default_value = "")]
+        ext: String,
+        /// Ask for more results up to this many times, while the server has more.
+        #[arg(long, default_value_t = 0)]
+        more: usize,
+        /// Print at most this many results.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// The nick to log in with.
+        #[arg(long, default_value = "remule")]
+        nick: String,
+        /// The TCP port to tell the server (nothing listens on it: expect a LowID).
+        #[arg(long, default_value_t = 4662)]
+        port: u16,
+        /// Also print each result's ed2k link.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Ping an eD2k server over UDP (its TCP port + 4) for its user and file counts.
+    Ping {
+        /// The server, IP:PORT (its TCP port).
+        server: SocketAddr,
+        /// Seconds to wait for the answer.
+        #[arg(long, default_value_t = 5)]
+        wait: u64,
+    },
+}
+
+fn run_async(f: impl std::future::Future<Output = Result<(), String>>) -> ExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("remule: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match rt.block_on(f) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("remule: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn hash_files(files: &[PathBuf], verbose: bool) -> ExitCode {
@@ -102,6 +171,36 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Hash { files, verbose } => hash_files(&files, verbose),
+        Command::Search {
+            query,
+            server,
+            obfuscate,
+            file_type,
+            min_size,
+            max_size,
+            ext,
+            more,
+            limit,
+            nick,
+            port,
+            verbose,
+        } => run_async(server::search(server::SearchArgs {
+            server,
+            query,
+            obfuscate,
+            nick,
+            port,
+            file_type,
+            min_size,
+            max_size,
+            extension: ext,
+            more,
+            limit,
+            verbose,
+        })),
+        Command::Ping { server, wait } => {
+            run_async(server::ping(server, Duration::from_secs(wait)))
+        }
         Command::Inspect {
             dir,
             verbose,

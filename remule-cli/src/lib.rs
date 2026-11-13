@@ -3,3 +3,4 @@
 //! tested without spawning the binary.
 
 pub mod inspect;
+pub mod server;

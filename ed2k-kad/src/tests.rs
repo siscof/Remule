@@ -500,17 +500,17 @@ fn results() {
 
 // ---------------------------------------------------------------- a network
 
-struct Net {
-    nodes: Vec<Kad>,
-    addrs: Vec<SocketAddrV4>,
+pub(crate) struct Net {
+    pub(crate) nodes: Vec<Kad>,
+    pub(crate) addrs: Vec<SocketAddrV4>,
     queue: VecDeque<(SocketAddrV4, Datagram)>,
-    now: u64,
+    pub(crate) now: u64,
     /// Search requests seen: (receiver index, packet).
-    requests: Vec<(usize, KadPacket, SocketAddrV4)>,
+    pub(crate) requests: Vec<(usize, KadPacket, SocketAddrV4)>,
 }
 
 impl Net {
-    fn new(ids: &[UInt128], rng: &mut StdRng) -> Net {
+    pub(crate) fn new(ids: &[UInt128], rng: &mut StdRng) -> Net {
         let now = 1000;
         let mut nodes = Vec::new();
         let mut addrs = Vec::new();
@@ -542,7 +542,7 @@ impl Net {
         self.addrs.iter().position(|x| *x == a)
     }
 
-    fn post(&mut self, from: usize, ds: Vec<Datagram>) {
+    pub(crate) fn post(&mut self, from: usize, ds: Vec<Datagram>) {
         for d in ds {
             self.queue.push_back((self.addrs[from], d));
         }
@@ -571,7 +571,7 @@ impl Net {
         }
     }
 
-    fn deliver(&mut self) -> Vec<(usize, Event)> {
+    pub(crate) fn deliver(&mut self) -> Vec<(usize, Event)> {
         let mut events = Vec::new();
         while let Some((from, d)) = self.queue.pop_front() {
             let Some(to) = self.index(d.to) else { continue };
@@ -583,7 +583,7 @@ impl Net {
         events
     }
 
-    fn run(&mut self, secs: u64) -> Vec<(usize, Event)> {
+    pub(crate) fn run(&mut self, secs: u64) -> Vec<(usize, Event)> {
         let mut events = Vec::new();
         for _ in 0..secs {
             self.now += 1;

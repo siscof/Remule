@@ -127,6 +127,9 @@ enum Command {
         /// Also print each result's ed2k link.
         #[arg(short, long)]
         verbose: bool,
+        /// The UDP port is reachable from outside: store what others publish.
+        #[arg(long)]
+        reachable: bool,
     },
     /// Ping an eD2k server over UDP (its TCP port + 4) for its user and file counts.
     Ping {
@@ -247,6 +250,7 @@ fn main() -> ExitCode {
             warmup,
             limit,
             verbose,
+            reachable,
         } => run_async(kad::run(kad::KadArgs {
             nodes,
             dir,
@@ -259,6 +263,7 @@ fn main() -> ExitCode {
             warmup,
             limit,
             verbose,
+            reachable,
         })),
         Command::Ping { server, wait } => {
             run_async(server::ping(server, Duration::from_secs(wait)))

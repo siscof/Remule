@@ -7,7 +7,9 @@
 //! (hello to the oldest contact of each bin every minute), the big timer
 //! (a random lookup in a thin zone every 10 s) and a lookup of its own ID,
 //! and runs keyword and source searches. It does not store or publish
-//! anything yet.
+//! nothing yet, but it stores what others publish to it ([`crate::index`])
+//! when it is reachable, answers searches from that, and keeps flooders out
+//! ([`crate::tracking`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -20,10 +22,19 @@ use ed2k_types::{Md4Hash, Protocol, UInt128};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::contact::{is_good_ip_port, Contact, UdpKey};
-use crate::packets::{ContactRecord, Hello, KadPacket};
+use crate::contact::{is_good_ip_port, is_lan_ip, Contact, UdpKey};
+use crate::index::{size_of, Entry, Index, KeyEntry};
+use crate::packets::{ContactRecord, Hello, KadPacket, SearchAnswer, SizedTag};
 use crate::routing::{RoutingTable, CONTACT_FILE_LIMIT};
-use crate::search::{keyword_target, Action, Found, Search, SearchKind};
+use crate::search::{keyword_target, Action, Found, Search, SearchKind, SEARCH_TOLERANCE};
+use crate::tracking::{Admission, InTracker};
+use ed2k_codec::{Tag, TagName, TagValue};
+use ed2k_types::kad::{
+    KADEMLIAMAXNOTECOMMENTLEN, KADEMLIAMAXNOTENAMELEN, KADEMLIAMAXSOURCEEXTRABYTES,
+    KADEMLIAMAXSOURCESTRLEN, KADEMLIAREPUBLISHTIMEK, KADEMLIAREPUBLISHTIMEN,
+    KADEMLIAREPUBLISHTIMES,
+};
+use ed2k_types::tags::kad as tag;
 
 /// `KADEMLIA_VERSION_DEFAULT` (0.49b).
 pub const VERSION: u8 = ed2k_types::kad::version::DEFAULT;
@@ -31,6 +42,10 @@ pub const VERSION: u8 = ed2k_types::kad::version::DEFAULT;
 pub const TRACK_TIME: u64 = 180;
 /// `KADEMLIADISCONNECTDELAY`: no packet for this long and we are offline.
 pub const DISCONNECT_DELAY: u64 = 20 * 60;
+/// `CLIENTBANTIME`: how long a flooder is ignored.
+pub const BAN_TIME: u64 = 2 * 3600;
+/// Answers per `KADEMLIA2_SEARCH_RES`.
+pub const RESULTS_PER_PACKET: usize = 50;
 
 /// Who we are.
 #[derive(Debug, Clone)]
@@ -85,6 +100,13 @@ pub struct Stats {
     pub packets_out: u64,
     pub bad_packets: u64,
     pub unrequested: u64,
+    /// Requests dropped by the flood protection.
+    pub flood_drops: u64,
+    pub bans: u64,
+    /// Publish requests stored.
+    pub publishes_stored: u64,
+    /// Search requests answered with at least one result.
+    pub searches_answered: u64,
 }
 
 /// The node.
@@ -104,6 +126,10 @@ pub struct Kad {
     /// The UDP port others see us at (`KADEMLIA2_PONG`).
     pub external_port: Option<u16>,
     pub stats: Stats,
+    /// What others published to us.
+    pub index: Index,
+    tracker: InTracker,
+    banned: HashMap<u32, u64>,
     rng: StdRng,
 }
 
@@ -114,7 +140,8 @@ fn ip_of(a: &SocketAddrV4) -> u32 {
 
 impl Kad {
     pub fn new(cfg: Config, now: u64) -> Self {
-        let routing = RoutingTable::new(cfg.kad_id, now);
+        let kad_id = cfg.kad_id;
+        let routing = RoutingTable::new(kad_id, now);
         Kad {
             cfg,
             routing,
@@ -129,6 +156,9 @@ impl Kad {
             next_jump_start: now,
             external_port: None,
             stats: Stats::default(),
+            index: Index::new(kad_id),
+            tracker: InTracker::default(),
+            banned: HashMap::new(),
             rng: StdRng::from_entropy(),
         }
     }
@@ -508,6 +538,9 @@ impl Kad {
         let mut out = Output::default();
         let ip = ip_of(&from);
         let port = from.port();
+        if self.banned.get(&ip).is_some_and(|&until| until > now) {
+            return out;
+        }
         // Decrypt (DecryptReceivedClient): our Kad ID, then our verify key for the sender.
         let (plain, valid_receiver_key, sender_key) = match datagram.first() {
             Some(&b) if b == Protocol::Kademlia as u8 || b == Protocol::KademliaPacked as u8 => {
@@ -545,6 +578,28 @@ impl Kad {
             }
         };
         self.stats.packets_in += 1;
+        match self
+            .tracker
+            .admit(ip, packet.opcode(), valid_receiver_key, now * 1000)
+        {
+            Admission::Allowed => {}
+            Admission::Drop => {
+                self.stats.flood_drops += 1;
+                return out;
+            }
+            Admission::MassiveFlood => {
+                // Only keyed packets get here: the sender cannot be spoofed.
+                self.stats.bans += 1;
+                self.banned.insert(ip, now + BAN_TIME);
+                if let Some(id) = self.routing.get_by_addr(ip, port, false).map(|c| c.id) {
+                    if let Some(c) = self.routing.get_mut(id) {
+                        c.kind = 4;
+                        c.expires = 1;
+                    }
+                }
+                return out;
+            }
+        }
         if self.last_contact == 0 {
             out.events.push(Event::Connected);
         }
@@ -774,12 +829,295 @@ impl Kad {
                     self.external_port = Some(port);
                 }
             }
-            // We store nothing yet, so there is nothing to answer searches
-            // with (aMule then sends nothing either).
-            KadPacket::SearchKeyReq { .. }
-            | KadPacket::SearchSourceReq { .. }
-            | KadPacket::Other { .. } => {}
+            KadPacket::SearchKeyReq {
+                target,
+                start,
+                terms,
+            } => {
+                let terms = match terms {
+                    Some(t) => match crate::terms::parse(&t) {
+                        Some(t) => Some(t),
+                        None => return, // "Invalid search expression"
+                    },
+                    None => None,
+                };
+                let res = self
+                    .index
+                    .keyword_results(target, terms.as_ref(), start, now);
+                self.send_results(target, res, from, sender_key, now, out);
+            }
+            KadPacket::SearchSourceReq {
+                target,
+                start,
+                size,
+            } => {
+                let res = self.index.source_results(target, start, size, now);
+                self.send_results(target, res, from, sender_key, now, out);
+            }
+            KadPacket::SearchNotesReq { target, size } => {
+                let res = self.index.note_results(target, size, now);
+                self.send_results(target, res, from, sender_key, now, out);
+            }
+            KadPacket::PublishKeyReq { key, files } => {
+                if let Some(load) = self.publish_keys(key, files, ip, port, now) {
+                    self.publish_res(key, load, from, sender_key, now, out);
+                }
+            }
+            KadPacket::PublishSourceReq { file, source, tags } => {
+                if let Some(load) = self.publish_source(file, source, tags, ip, port, now) {
+                    self.publish_res(file, load, from, sender_key, now, out);
+                }
+            }
+            KadPacket::PublishNotesReq { file, source, tags } => {
+                if let Some(load) = self.publish_note(file, source, tags, ip, port, now) {
+                    self.publish_res(file, load, from, sender_key, now, out);
+                }
+            }
+            // We publish nothing yet.
+            KadPacket::PublishRes { .. } | KadPacket::PublishResAck | KadPacket::Other { .. } => {}
         }
+    }
+}
+
+fn int_tag(name: &[u8], v: u64) -> Tag {
+    Tag::new(TagName::Str(name.to_vec()), TagValue::int(v))
+}
+
+impl Kad {
+    fn publish_res(
+        &mut self,
+        target: UInt128,
+        load: u8,
+        to: SocketAddrV4,
+        key: UdpKey,
+        now: u64,
+        out: &mut Output,
+    ) {
+        let res = KadPacket::PublishRes {
+            target,
+            load,
+            options: None,
+        };
+        let d = self.packet(&res, to, 0, None, key, now);
+        out.send.push(d);
+    }
+
+    /// The answers to a search request, 50 to a packet.
+    fn send_results(
+        &mut self,
+        target: UInt128,
+        results: Vec<SearchAnswer>,
+        to: SocketAddrV4,
+        key: UdpKey,
+        now: u64,
+        out: &mut Output,
+    ) {
+        if !results.is_empty() {
+            self.stats.searches_answered += 1;
+        }
+        for chunk in results.chunks(RESULTS_PER_PACKET) {
+            let res = KadPacket::SearchRes {
+                sender: self.cfg.kad_id,
+                target,
+                results: chunk.to_vec(),
+            };
+            let d = self.packet(&res, to, 0, None, key, now);
+            out.send.push(d);
+        }
+    }
+
+    /// Whether a publish to `target` from `ip` is for us: we are reachable
+    /// and close enough to it.
+    fn takes_publish(&self, target: UInt128, ip: u32) -> bool {
+        !self.cfg.udp_firewalled
+            && ((self.cfg.kad_id ^ target).chunk(0) <= SEARCH_TOLERANCE || is_lan_ip(ip))
+    }
+
+    /// `Process2PublishKeyRequest`: the load to answer with, or `None` to stay silent.
+    fn publish_keys(
+        &mut self,
+        key: UInt128,
+        files: Vec<(UInt128, Vec<SizedTag>)>,
+        ip: u32,
+        port: u16,
+        now: u64,
+    ) -> Option<u8> {
+        if !self.takes_publish(key, ip) {
+            return None;
+        }
+        let mut load = 0;
+        for (file, tags) in files {
+            let mut e = KeyEntry::new(Entry {
+                ip,
+                udp_port: port,
+                key_id: key,
+                source_id: file,
+                lifetime: now + KADEMLIAREPUBLISHTIMEK.as_secs(),
+                ..Default::default()
+            });
+            for SizedTag { tag: t, .. } in tags {
+                if t.name.is(tag::FILENAME) {
+                    if e.entry.common_name().is_empty() {
+                        e.entry.set_name(t.as_str().unwrap_or_default());
+                    }
+                } else if t.name.is(tag::FILESIZE) {
+                    if e.entry.size == 0 {
+                        e.entry.size = size_of(&t);
+                    }
+                } else if t.name.is(tag::KADAICHHASHPUB) {
+                    if let TagValue::Bsob(b) = &t.value {
+                        if let Ok(h) = <[u8; crate::aich::HASH_SIZE]>::try_from(&b[..]) {
+                            if e.aich_count() == 0 {
+                                e.set_published_aich(&h);
+                            }
+                        }
+                    }
+                } else {
+                    e.entry.add_tag(t);
+                }
+            }
+            let (stored, l) = self.index.add_keyword(key, file, e, now);
+            load = l;
+            if stored {
+                self.stats.publishes_stored += 1;
+            }
+        }
+        Some(load)
+    }
+
+    /// `Process2PublishSourceRequest`: answered only when stored.
+    fn publish_source(
+        &mut self,
+        file: UInt128,
+        source: UInt128,
+        tags: Vec<SizedTag>,
+        ip: u32,
+        port: u16,
+        now: u64,
+    ) -> Option<u8> {
+        if !self.takes_publish(file, ip) {
+            return None;
+        }
+        let mut e = Entry {
+            ip,
+            udp_port: port,
+            key_id: file,
+            source_id: source,
+            lifetime: now + KADEMLIAREPUBLISHTIMES.as_secs(),
+            ..Default::default()
+        };
+        let mut udp_tag_pending = true;
+        let (mut extra, mut extra_full) = (0u32, false);
+        for SizedTag { tag: t, bytes } in tags {
+            let n = &t.name;
+            if n.is(tag::SOURCETYPE) {
+                if !e.is_source {
+                    e.add_tag(int_tag(tag::SOURCEIP, ip as u64));
+                    e.add_tag(t);
+                    e.is_source = true;
+                }
+            } else if n.is(tag::FILESIZE) {
+                if e.size == 0 {
+                    e.size = size_of(&t);
+                }
+            } else if n.is(tag::SOURCEPORT) {
+                if e.tcp_port == 0 {
+                    e.tcp_port = t.as_int().unwrap_or(0) as u16;
+                    e.add_tag(t);
+                }
+            } else if n.is(tag::SOURCEUPORT) {
+                if udp_tag_pending && t.as_int().is_some_and(|v| v != 0) {
+                    e.udp_port = t.as_int().unwrap_or(0) as u16;
+                    e.add_tag(t);
+                    udp_tag_pending = false;
+                }
+            } else if n.is(tag::SERVERIP) || n.is(tag::SERVERPORT) || n.is(tag::ENCRYPTION) {
+                if t.as_int().is_some() {
+                    e.add_tag(t);
+                }
+            } else if n.is(tag::BUDDYHASH) || n.is(tag::IPV6) || n.is(tag::SERVINGBUDDYIPV6) {
+                if t.as_str()
+                    .is_some_and(|s| s.chars().count() <= KADEMLIAMAXSOURCESTRLEN)
+                {
+                    e.add_tag(t);
+                }
+            } else if !extra_full
+                && extra + bytes <= KADEMLIAMAXSOURCEEXTRABYTES as u32
+                && self.index.has_room_for_extra_tags(extra + bytes)
+            {
+                extra += bytes;
+                e.add_tag(t);
+            } else {
+                extra_full = true;
+            }
+        }
+        if udp_tag_pending {
+            e.add_tag(int_tag(tag::SOURCEUPORT, e.udp_port as u64));
+        }
+        e.extra_tag_bytes = extra;
+        if !e.is_source {
+            return None;
+        }
+        let (stored, load) = self.index.add_source(file, source, e, now);
+        if stored {
+            self.stats.publishes_stored += 1;
+        }
+        stored.then_some(load)
+    }
+
+    /// `Process2PublishNotesRequest`: answered only when stored.
+    fn publish_note(
+        &mut self,
+        file: UInt128,
+        source: UInt128,
+        tags: Vec<SizedTag>,
+        ip: u32,
+        port: u16,
+        now: u64,
+    ) -> Option<u8> {
+        if !self.takes_publish(file, ip) {
+            return None;
+        }
+        let mut e = Entry {
+            ip,
+            udp_port: port,
+            key_id: file,
+            source_id: source,
+            lifetime: now + KADEMLIAREPUBLISHTIMEN.as_secs(),
+            ..Default::default()
+        };
+        let mut valid = true;
+        for SizedTag { tag: t, .. } in tags {
+            let n = &t.name;
+            if n.is(tag::FILENAME) {
+                let s = t.as_str().unwrap_or_default();
+                if s.chars().count() > KADEMLIAMAXNOTENAMELEN {
+                    valid = false;
+                } else if e.common_name().is_empty() {
+                    e.set_name(s);
+                }
+            } else if n.is(tag::FILESIZE) {
+                if e.size == 0 {
+                    e.size = t.as_int().unwrap_or(0);
+                }
+            } else if n.is(tag::DESCRIPTION) {
+                if t.as_str().unwrap_or_default().chars().count() > KADEMLIAMAXNOTECOMMENTLEN {
+                    valid = false;
+                } else {
+                    e.add_tag(t);
+                }
+            } else if n.is(tag::FILERATING) && t.as_int().is_some() {
+                e.add_tag(t);
+            }
+        }
+        if !valid {
+            return None;
+        }
+        let (stored, load) = self.index.add_note(file, source, e, now);
+        if stored {
+            self.stats.publishes_stored += 1;
+        }
+        stored.then_some(load)
     }
 }
 

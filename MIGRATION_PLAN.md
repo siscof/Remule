@@ -44,6 +44,7 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | `remule-net` | tokio runtime: framed TCP with obfuscation, UDP, bandwidth throttling, connection limits (phase 5) |
 | `ed2k-server` | client↔server protocol: login, search, sources, server list, UDP ping; sans-IO session and async client (phase 6) |
 | `ed2k-kad` | Kademlia (Kad2): routing table (arena tree), packets, lookups, keyword and source searches; sans-IO node and tokio driver (phase 7) |
+| `ed2k-peer` | client↔client protocol (phase 8): hello and eMule info handshake, file requests and multipackets, part status, hash sets, upload requests, block requests and data blocks; sans-IO packets |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -251,6 +252,12 @@ Update this table as steps land.
 | 7.5 | Indexing: storing published keywords (publishers, trust, names, AICH votes), sources and notes; answering searches (terms, trusted first); expiry; key/src/load_index.dat | `kademlia/Indexed.cpp`, `Entry.cpp`, `AICHHashList.cpp`, `net/SearchExpression.cpp`, publish handlers | `ed2k-kad` | done (unit tests; publish then search on a simulated network). Publishing our own files comes with sharing (phase 9) |
 | 7.6 | Flood protection and bans; firewall checks, buddies, legacy (pre-v7) challenges, node protection | `net/PacketTracking.cpp`, `UDPFirewallTester.cpp`, `net/SafeKad.cpp` | `ed2k-kad` | flood protection done; firewall checks and buddies need the TCP side (phase 8); legacy challenges and SafeKad open |
 | 7.M | Phase 7 milestone: `remule kad` bootstraps, keeps a healthy table for an hour, searches | — | `remule-cli` | searches done on the live network (no local aMule to compare with side by side; server results agree); the hour run is in progress |
+| 8.1 | Peer packets: hello/hello answer (capability bit fields), `OP_EMULEINFO`, file name/status requests, multipacket (+ext) and answers, part status bitmap, hash sets, upload request/accept, queue ranks, `OP_REQUESTPARTS(_I64)`, plain and compressed blocks (+I64), cancel/end, AICH file hash | `BaseClient.cpp` (hello, mule info), `ClientTCPSocket.cpp`, `DownloadClient.cpp`, `UploadClient.cpp`, `UploadPacketBuilder.cpp`, `PartStatusWriter.h` | `ed2k-peer` | done (PartStatusWriterTest vectors; hellos and blocks as aMule's Python integration peers build them). Not yet against a real peer |
+| 8.2 | Download session state machine: handshake, file request, hash set, queue, block requests, timeouts (sans-IO) | `DownloadClient.cpp`, `BaseClient.cpp` (`ConnectionEstablished`, `TryToConnect`) | `ed2k-peer` | open |
+| 8.3 | Part file storage: gaps, block reservation, buffered writes, part hash checks, completion; `.part`/`.part.met` resumable by aMule | `PartFile.cpp`, `GapList.*`, `BlockReservation*` | `remule-core` | open |
+| 8.4 | Source exchange (SX1/SX2), secure ident in the handshake, AICH recovery | `SourceExchangePacket.h`, `PartFile::CreateSrcInfoPacket`, `ClientCreditsList.cpp`, `SHAHashSet.cpp` | `ed2k-peer` | open |
+| 8.5 | Async peer connection on `remule-net` and a download queue driving sessions from server and Kad sources | `ClientTCPSocket.cpp`, `DownloadQueue.cpp`, `ClientList.cpp` | `remule-core` | open |
+| 8.M | Phase 8 milestone: download a real file; aMule resumes remule's `.part` and the other way round | — | `remule-cli` | open |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

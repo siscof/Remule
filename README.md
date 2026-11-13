@@ -14,6 +14,16 @@ Reads every aMule file in the directory (amule.conf, server.met, known.met, the 
 
 Hashes files as aMule does (MD4 per 9,728,000-byte part, the AICH tree over 184,320-byte blocks) and prints each file's ed2k link with its AICH root: `ed2k://|file|NAME|SIZE|HASH|h=AICH|/`. `-v` lists the part hashes.
 
+## remule search: search an eD2k server
+
+    cargo run --release -p remule-cli -- search "ubuntu iso NOT desktop" --server 176.123.5.89:4725 [--obfuscate] [--type Video] [--min-size 1G] [--more 2] [-v]
+
+Logs into a server, as a LowID since nothing listens for its callback, and runs a keyword search. The query is aMule's search syntax: words, `AND` / `OR` / `NOT`, parentheses, `"quoted words"`. `--obfuscate` uses the obfuscated handshake (DH + RC4). `-v` prints each result's ed2k link.
+
+    cargo run --release -p remule-cli -- ping 176.123.5.89:4725
+
+Pings a server over UDP (its TCP port + 4) for its user and file counts.
+
 ## remule-gui: remote GUI for amuled
 
 A native (egui) port of `amulegui`. It connects to an aMule daemon over External Connections (aMule 3.3+, SRP login over an encrypted channel), like `amulegui` does.

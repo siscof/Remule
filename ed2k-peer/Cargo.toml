@@ -9,6 +9,5 @@ description = "eD2k client-to-client protocol: hello handshake, file requests, h
 ed2k-codec = { path = "../ed2k-codec" }
 ed2k-types = { path = "../ed2k-types" }
 thiserror = "2"
-
-[dev-dependencies]
 flate2 = "1"
+

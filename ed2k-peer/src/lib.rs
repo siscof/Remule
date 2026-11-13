@@ -7,8 +7,11 @@
 //! * [`packets`]: file requests, hash sets, upload requests, block requests
 //!   and the data blocks themselves, built and parsed.
 //!
+//! * [`download`]: downloading a file from one peer, as a state machine.
+//!
 //! Everything here is sans-IO: bytes in, values out.
 
+pub mod download;
 pub mod hello;
 pub mod packets;
 pub mod part_status;
@@ -19,3 +22,5 @@ pub use part_status::PartStatus;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_download;

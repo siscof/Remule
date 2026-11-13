@@ -1118,6 +1118,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed2k-server"
+version = "0.1.0"
+dependencies = [
+ "ed2k-codec",
+ "ed2k-types",
+ "rand",
+ "remule-net",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "ed2k-types"
 version = "0.1.0"
 
@@ -3163,7 +3175,10 @@ dependencies = [
  "clap",
  "ed2k-formats",
  "ed2k-hash",
+ "ed2k-server",
  "ed2k-types",
+ "rand",
+ "tokio",
 ]
 
 [[package]]

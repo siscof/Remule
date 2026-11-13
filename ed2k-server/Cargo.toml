@@ -1,0 +1,17 @@
+[package]
+name = "ed2k-server"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "eD2k client-to-server protocol: login, searches, sources, server list, UDP pings"
+
+[dependencies]
+ed2k-codec = { path = "../ed2k-codec" }
+ed2k-types = { path = "../ed2k-types" }
+remule-net = { path = "../remule-net" }
+rand = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "rt-multi-thread", "macros", "test-util"] }

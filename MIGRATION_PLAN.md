@@ -42,6 +42,7 @@ A fresh Cargo-only workspace (history restarted on 2026-11-10; no code inherited
 | `ed2k-hash` | eD2k MD4 and AICH hashing, streaming (phase 3) |
 | `ed2k-crypto` | RC4 obfuscation (TCP, UDP), secure ident (RSA), credits, sans IO (phase 4) |
 | `remule-net` | tokio runtime: framed TCP with obfuscation, UDP, bandwidth throttling, connection limits (phase 5) |
+| `ed2k-server` | client↔server protocol: login, search, sources, server list, UDP ping; sans-IO session and async client (phase 6) |
 | `ed2k-codec` | Little-endian reader/writer and eD2k strings (step 1.3); tags in eD2k and Kad encodings (step 1.4); packet framing and zlib packing (step 1.5) |
 | `remule-ec` | Client side of the EC protocol: codec, SRP-6a login, X25519 + AEAD transport, blocking client, typed replies; `fake-daemon` feature for tests |
 | `remule-gui` | egui remote GUI, a port of `amulegui` (Phase 13) |
@@ -226,7 +227,7 @@ Update this table as steps land.
 | 3.1 | eD2k hash: MD4 parts, file hash, empty extra part | `ThreadTasks.cpp` (`CreateNextPartHash`), `KnownFile.cpp` | `ed2k-hash` | done (independent Python reference; one part of zeros gives the published FC21D9AF828F92A8DF64BEAC3357425D) |
 | 3.2 | AICH tree (SHA-1, 184,320-byte blocks) | `SHAHashSet.cpp` (`CAICHHashTree`) | `ed2k-hash` | done (same reference; root rebuilt from stored block hashes) |
 | 3.M | Phase 3 milestone: `remule hash <file>` | — | `remule-cli` | done (ed2k link with h=AICH as aMule writes it; ~840 MB/s release). Not yet compared with aMule on the same files |
-| 4.1 | RC4 and TCP obfuscation: client↔client, client→server (DH768), sans-IO state machine | `RC4Encrypt.cpp`, `EncryptedStreamSocket.cpp`, `EncryptionRequirement.h` | `ed2k-crypto` | done (independent Python reference; aMule RC4Test vectors). Not yet tried against a real aMule |
+| 4.1 | RC4 and TCP obfuscation: client↔client, client→server (DH768), sans-IO state machine | `RC4Encrypt.cpp`, `EncryptedStreamSocket.cpp`, `EncryptionRequirement.h` | `ed2k-crypto` | done (independent Python reference; aMule RC4Test vectors; the server handshake works against a real eD2k server). Client↔client not yet tried against a real aMule |
 | 4.2 | UDP obfuscation: eD2k, Kad ID and Kad verify-key variants, client↔server | `EncryptedDatagramSocket.cpp`, `kademlia/Prefs.cpp` (`GetUDPVerifyKey`), `UdpObfuscationPolicy.h` | `ed2k-crypto` | done (same reference) |
 | 4.3 | Secure ident: RSA PKCS#1 v1.5 / SHA-1 signatures, v1 and v2 (challenge IP) | `ClientCreditsList.cpp`, `SecIdentPolicy.h` | `ed2k-crypto` | done (sign/verify round trips and tampering; SecIdentTest ported). Not yet checked against an aMule-made signature |
 | 4.4 | Credit ratio and the identity gate on scoring | `ClientCredits.cpp` | `ed2k-crypto` | done (ClientCreditsTest ratio cases ported) |
@@ -236,6 +237,12 @@ Update this table as steps land.
 | 5.3 | Connection limits (`TooManySockets`, per-five-seconds with spike modifier), limit-aware listener | `ListenSocket.cpp`, `Preferences.cpp` | `remule-net` | done |
 | 5.4 | UDP socket, sent as control traffic | `MuleUDPSocket.cpp` | `remule-net` | done (no send queue yet) |
 | 5.M | Phase 5 milestone: N connections stay within the limits | — | `remule-net` | done (8 localhost connections, half obfuscated: 254.6 / 256.0 KiB/s against 256) |
+| 6.1 | Login (`OP_LOGINREQUEST`, capability flags), `OP_IDCHANGE`, LowID, server messages, refusal | `ServerConnect.cpp`, `ServerSocket.cpp` | `ed2k-server` | done (plain and obfuscated logins to a real server) |
+| 6.2 | Search query language and request | `Parser.y`, `Scanner.l`, `SearchPacket.cpp`, `SearchPacketWriter.h` | `ed2k-server` | done (grammar and bytes from the C++ rules; boolean query with filters against a real server) |
+| 6.3 | Search answers, found sources (incl. `_OBFU`), server list, ident, status, callbacks, packed packets | `SearchList.cpp`, `SearchFile.cpp`, `PartFile.cpp` (`AddSources`), `ServerSocket.cpp` | `ed2k-server` | done |
+| 6.4 | Source requests (`OP_GETSOURCES`, `_OBFU`, large files) | `DownloadQueue.cpp` | `ed2k-server` | done (packet only; used with the download queue) |
+| 6.5 | UDP server ping (`OP_GLOBSERVSTATREQ/RES`) | `ServerList.cpp`, `ServerUDPSocket.cpp` | `ed2k-server` | done (real server). Obfuscated ping, UDP global search and server descriptions not yet |
+| 6.M | Phase 6 milestone: `remule search` against a real server | — | `remule-cli` | done (eMule Sunrise: 153 results for "ubuntu", plain and obfuscated) |
 | 13.1 | EC client: codec, SRP-6a, AEAD transport, login | `libs/ec/cpp/{ECTag,ECPacket,ECSocket,ECCrypt,ECSRP,RemoteConnect}.*`, `ECCodes.abstract` | `remule-ec` | done (vs. aMule test vectors + fake daemon) |
 | 13.2 | Remote GUI: Networks, Searches, Transfers, Shared, Statistics | `amule-remote-gui.cpp`, `amuleDlg.cpp`, `*Wnd`/`*Ctrl` | `remule-gui` | first version; needs testing against real `amuled` |
 | … | (add rows as phases are broken down) | | | |

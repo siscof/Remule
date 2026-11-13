@@ -482,7 +482,9 @@ impl Kad {
         }
         if self.big_timer <= now {
             let random: u128 = self.rng.gen();
-            if let Some(target) = self.routing.big_timer(now, random) {
+            let stale = self.last_contact != 0
+                && now.saturating_sub(self.last_contact) > DISCONNECT_DELAY - 5 * 60;
+            if let Some(target) = self.routing.big_timer(now, random, stale) {
                 self.big_timer = now + 10;
                 if let Some((_, d)) = self.find_node(target, false, now) {
                     out.send.extend(d);

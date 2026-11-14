@@ -280,6 +280,23 @@ struct FileEntry {
     done: bool,
 }
 
+/// One file's progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileProgress {
+    pub hash: Md4Hash,
+    pub name: String,
+    pub size: u64,
+    /// Bytes present.
+    pub completed: u64,
+    pub sources: usize,
+    /// Sources whose upload queue we are in.
+    pub queued: usize,
+    /// Sources connected now, and those sending data.
+    pub connected: usize,
+    pub downloading: usize,
+    pub done: bool,
+}
+
 /// Download statistics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueueStats {
@@ -394,6 +411,48 @@ impl DownloadQueue {
             .map(|s| (s.endpoint.addr, s.origin, s.state))
             .collect();
         v.sort_by_key(|s| s.0);
+        v
+    }
+
+    /// Where each file stands.
+    pub fn progress(&self) -> Vec<FileProgress> {
+        let mut v: Vec<FileProgress> = self
+            .files
+            .values()
+            .map(|e| {
+                let hash = e.file.hash();
+                let mine = |c: &Conn| {
+                    c.source
+                        .and_then(|id| self.sources.get(&id))
+                        .is_some_and(|s| s.file == hash)
+                };
+                FileProgress {
+                    hash,
+                    name: e.file.name().to_owned(),
+                    size: e.file.size(),
+                    completed: e.file.completed(),
+                    sources: self.source_count(&hash),
+                    queued: self
+                        .sources
+                        .values()
+                        .filter(|s| s.file == hash && s.state == SourceState::OnQueue)
+                        .count(),
+                    connected: self.conns.values().filter(|c| mine(c)).count(),
+                    downloading: self
+                        .conns
+                        .values()
+                        .filter(|c| {
+                            mine(c)
+                                && c.session
+                                    .as_ref()
+                                    .is_some_and(|s| s.state() == State::Downloading)
+                        })
+                        .count(),
+                    done: e.done,
+                }
+            })
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
 
@@ -555,7 +614,27 @@ impl DownloadQueue {
             .map(|(&id, s)| (s.last_asked, id))
             .collect();
         due.sort();
-        for (_, id) in due.into_iter().take(room.min(self.config.max_new_per_tick)) {
+        // One connection per peer, as aMule has one client object per peer
+        // (asking it for several files over parallel connections confuses
+        // it): a peer that is a source of several files is asked for one at
+        // a time.
+        let mut busy: Vec<SocketAddrV4> = self
+            .sources
+            .values()
+            .filter(|s| s.conn.is_some())
+            .map(|s| s.endpoint.addr)
+            .collect();
+        let mut started = 0;
+        for (_, id) in due {
+            if started == room.min(self.config.max_new_per_tick) {
+                break;
+            }
+            let addr = self.sources[&id].endpoint.addr;
+            if busy.contains(&addr) {
+                continue;
+            }
+            busy.push(addr);
+            started += 1;
             let conn = self.id();
             let s = self.sources.get_mut(&id).unwrap();
             s.conn = Some(conn);

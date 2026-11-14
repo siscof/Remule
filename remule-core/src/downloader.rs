@@ -30,7 +30,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::download_queue::{Action, ConnId, DownloadQueue, Endpoint, Origin, Report};
+use crate::download_queue::{
+    Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report,
+};
 use crate::part_file::PartFile;
 
 /// What the application can tell a running downloader.
@@ -42,6 +44,8 @@ pub enum Command {
         sources: Vec<Endpoint>,
         origin: Origin,
     },
+    /// Where each file stands, and the bytes received so far.
+    Progress(tokio::sync::oneshot::Sender<(Vec<FileProgress>, QueueStats)>),
     /// Hang up, save the files, and return the queue.
     Shutdown,
 }
@@ -94,6 +98,10 @@ async fn conn_task(
     events: mpsc::UnboundedSender<NetEvent>,
     cfg: ConnConfig,
 ) {
+    let how_addr = match &how {
+        How::Outgoing(a, _) => Some(*a),
+        How::Incoming(s, _) => s.peer_addr().ok(),
+    };
     let (stream, handshake, outgoing) = match how {
         How::Outgoing(addr, hs) => {
             match tokio::time::timeout(CONNECTION_TIMEOUT, TcpStream::connect(addr)).await {
@@ -116,8 +124,21 @@ async fn conn_task(
     if outgoing {
         let _ = events.send(NetEvent::Connected(conn));
     }
+    let trace = std::env::var_os("REMULE_TRACE").is_some();
+    let peer = match &how_addr {
+        Some(a) => a.to_string(),
+        None => format!("conn {conn}"),
+    };
     let write = async {
         while let Some(p) = rx.recv().await {
+            if trace {
+                eprintln!(
+                    "{peer} <- {:#04x}/{:#04x} {} bytes",
+                    p.protocol,
+                    p.opcode,
+                    p.payload.len()
+                );
+            }
             if writer.send(&p, Priority::Control).await.is_err() {
                 break;
             }
@@ -125,7 +146,30 @@ async fn conn_task(
         let _ = writer.shutdown().await;
     };
     let read = async {
-        while let Ok(Some(p)) = reader.recv().await {
+        loop {
+            let p = match reader.recv().await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    if trace {
+                        eprintln!("{peer} closed");
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if trace {
+                        eprintln!("{peer} error: {e}");
+                    }
+                    break;
+                }
+            };
+            if trace {
+                eprintln!(
+                    "{peer} -> {:#04x}/{:#04x} {} bytes",
+                    p.protocol,
+                    p.opcode,
+                    p.payload.len()
+                );
+            }
             if events.send(NetEvent::Packet(conn, p)).is_err() {
                 break;
             }
@@ -199,6 +243,10 @@ pub async fn run(
                         .into_iter()
                         .flat_map(|ep| queue.add_source(file, ep, origin, now))
                         .collect(),
+                    Some(Command::Progress(reply)) => {
+                        let _ = reply.send((queue.progress(), queue.stats()));
+                        Vec::new()
+                    }
                     Some(Command::Shutdown) | None => break,
                 }
             }

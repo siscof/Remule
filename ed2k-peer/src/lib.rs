@@ -10,6 +10,7 @@
 //! * [`secident`]: secure user identification between two clients.
 //!
 //! * [`download`]: downloading a file from one peer, as a state machine.
+//! * [`upload`]: uploading to one peer, as a state machine.
 //!
 //! Everything here is sans-IO: bytes in, values out.
 
@@ -19,6 +20,7 @@ pub mod packets;
 pub mod part_status;
 pub mod secident;
 pub mod sources;
+pub mod upload;
 
 pub use hello::{Hello, MiscOptions1, MiscOptions2, MuleInfo};
 pub use packets::{BadPacket, Block, ParseContext, PeerPacket};
@@ -30,3 +32,5 @@ mod tests;
 mod tests_download;
 #[cfg(test)]
 mod tests_sx;
+#[cfg(test)]
+mod tests_upload;

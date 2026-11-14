@@ -16,7 +16,7 @@ use ed2k_types::Md4Hash;
 use crate::part_file::{clean_file_name, completed_path};
 use crate::{Completion, FileEvent, PartFile, SourceView, Status};
 
-pub(crate) struct TempDir(PathBuf);
+pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
     pub(crate) fn new(name: &str) -> TempDir {

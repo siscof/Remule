@@ -9,6 +9,7 @@ members = [
 	'ed2k-server',
 	'ed2k-types',
 	'remule-cli',
+	'remule-core',
 	'remule-ec',
 	'remule-gui',
 	'remule-net',

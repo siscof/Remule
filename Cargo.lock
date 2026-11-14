@@ -3208,6 +3208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "remule-core"
+version = "0.1.0"
+dependencies = [
+ "ed2k-codec",
+ "ed2k-formats",
+ "ed2k-hash",
+ "ed2k-peer",
+ "ed2k-types",
+ "md4",
+]
+
+[[package]]
 name = "remule-ec"
 version = "0.1.0"
 dependencies = [

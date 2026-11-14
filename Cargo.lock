@@ -3206,9 +3206,12 @@ dependencies = [
  "ed2k-formats",
  "ed2k-hash",
  "ed2k-kad",
+ "ed2k-peer",
  "ed2k-server",
  "ed2k-types",
  "rand",
+ "remule-core",
+ "remule-net",
  "tokio",
 ]
 
@@ -3863,6 +3866,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

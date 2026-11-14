@@ -655,3 +655,23 @@ async fn the_downloader_fetches_a_file_over_tcp() {
     }));
     assert_eq!(std::fs::read(path).unwrap(), *d);
 }
+
+#[test]
+fn a_peer_with_two_files_gets_one_connection() {
+    let (dir, _d, h, _) = setup("q-onepeer");
+    let mut q = DownloadQueue::new(config(&dir));
+    let other = Md4Hash([0x42; 16]);
+    q.add_file(PartFile::create(&dir.temp(), "a", h.ed2k, SIZE).unwrap());
+    q.add_file(PartFile::create(&dir.temp(), "b", other, 1000).unwrap());
+    let now = Instant::now();
+    let ep = Endpoint::new(SocketAddrV4::new(Ipv4Addr::new(20, 0, 0, 1), 4662));
+    q.add_source(h.ed2k, ep, Origin::Kad, now);
+    q.add_source(other, ep, Origin::Kad, now);
+    let connects = |a: Vec<Action>| {
+        a.iter()
+            .filter(|a| matches!(a, Action::Connect { .. }))
+            .count()
+    };
+    assert_eq!(connects(q.tick(now)), 1);
+    assert_eq!(connects(q.tick(now + Duration::from_secs(1))), 0);
+}

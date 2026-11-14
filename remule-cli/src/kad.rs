@@ -165,8 +165,29 @@ fn load_or_make_prefs(dir: &std::path::Path) -> KadPrefs {
     }
 }
 
-/// Run.
-pub async fn run(a: KadArgs) -> Result<(), String> {
+/// A running Kad node and where its state is kept.
+pub struct KadNode {
+    pub handle: KadHandle,
+    prefs: KadPrefs,
+    dir: PathBuf,
+}
+
+/// How to start a Kad node.
+#[derive(Debug, Clone)]
+pub struct KadStart {
+    /// Where nodes.dat, preferencesKad.dat and the index files are kept.
+    pub dir: PathBuf,
+    /// The nodes.dat to start from (default: DIR/nodes.dat).
+    pub nodes: Option<PathBuf>,
+    pub bootstrap: Vec<SocketAddrV4>,
+    pub udp_port: u16,
+    pub tcp_port: u16,
+    pub user_hash: Md4Hash,
+    pub reachable: bool,
+}
+
+/// Load the state, bind the UDP port and start the node.
+pub async fn start(a: &KadStart) -> Result<KadNode, String> {
     std::fs::create_dir_all(&a.dir).map_err(|e| format!("{}: {e}", a.dir.display()))?;
     let prefs = load_or_make_prefs(&a.dir);
     let nodes_path = a.nodes.clone().unwrap_or_else(|| a.dir.join("nodes.dat"));
@@ -180,12 +201,11 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
         }
         Err(_) => None,
     };
-    let mut rng = rand::thread_rng();
     let cfg = Config {
         kad_id: prefs.kad_id,
-        udp_key_secret: rng.gen(),
-        user_hash: ed2k_server::packets::new_user_hash(&mut rng),
-        tcp_port: a.port,
+        udp_key_secret: rand::thread_rng().gen(),
+        user_hash: a.user_hash,
+        tcp_port: a.tcp_port,
         tcp_firewalled: true,
         udp_firewalled: !a.reachable,
     };
@@ -229,14 +249,55 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
             .map(|b| format!("{b:02X}"))
             .collect::<String>()
     );
-    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", a.port))
+    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", a.udp_port))
         .await
-        .map_err(|e| format!("UDP port {}: {e}", a.port))?;
-    let mut h: KadHandle = driver::spawn(kad, socket);
+        .map_err(|e| format!("UDP port {}: {e}", a.udp_port))?;
+    let handle: KadHandle = driver::spawn(kad, socket);
     for b in &a.bootstrap {
-        h.bootstrap(*b).await;
+        handle.bootstrap(*b).await;
     }
+    Ok(KadNode {
+        handle,
+        prefs,
+        dir: a.dir.clone(),
+    })
+}
 
+impl KadNode {
+    /// Save what was learned, as aMule does on exit.
+    pub async fn save(&self) -> Result<(), String> {
+        match self.handle.nodes().await {
+            Some(n) => {
+                let path = self.dir.join("nodes.dat");
+                std::fs::write(&path, n.write()).map_err(|e| format!("{}: {e}", path.display()))?;
+                println!("wrote {} ({} contacts)", path.display(), n.contacts.len());
+            }
+            None => println!("fewer than 25 contacts: nodes.dat not written"),
+        }
+        if let Some(f) = self.handle.index_files().await {
+            for (name, bytes) in INDEX_FILES.iter().zip([f.load, f.keywords, f.sources]) {
+                let path = self.dir.join(name);
+                std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+        }
+        let path = self.dir.join(prefs::FILE_NAME);
+        std::fs::write(&path, self.prefs.write()).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+/// Run.
+pub async fn run(a: KadArgs) -> Result<(), String> {
+    let node = start(&KadStart {
+        dir: a.dir.clone(),
+        nodes: a.nodes.clone(),
+        bootstrap: a.bootstrap.clone(),
+        udp_port: a.port,
+        tcp_port: a.port,
+        user_hash: ed2k_server::packets::new_user_hash(&mut rand::thread_rng()),
+        reachable: a.reachable,
+    })
+    .await?;
+    let mut h = node.handle;
     let start = Instant::now();
     let mut next_status = 0;
     let mut pending: Vec<SearchParams> = a.searches.iter().map(SearchParams::new).collect();
@@ -323,22 +384,11 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
     if let Some(s) = h.snapshot().await {
         println!("{}", status(start.elapsed(), &s));
     }
-    // Save what we learned, as aMule does on exit.
-    match h.nodes().await {
-        Some(n) => {
-            let path = a.dir.join("nodes.dat");
-            std::fs::write(&path, n.write()).map_err(|e| format!("{}: {e}", path.display()))?;
-            println!("wrote {} ({} contacts)", path.display(), n.contacts.len());
-        }
-        None => println!("fewer than 25 contacts: nodes.dat not written"),
+    KadNode {
+        handle: h,
+        prefs: node.prefs,
+        dir: node.dir,
     }
-    if let Some(f) = h.index_files().await {
-        for (name, bytes) in INDEX_FILES.iter().zip([f.load, f.keywords, f.sources]) {
-            let path = a.dir.join(name);
-            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-    }
-    let path = a.dir.join(prefs::FILE_NAME);
-    std::fs::write(&path, prefs.write()).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(())
+    .save()
+    .await
 }

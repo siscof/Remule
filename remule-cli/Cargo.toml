@@ -3,7 +3,7 @@ name = "remule-cli"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "The remule command-line tool: inspect an aMule config directory, hash files, search a server"
+description = "The remule command-line tool: inspect an aMule config directory, hash files, search servers and Kad, download"
 
 [[bin]]
 name = "remule"
@@ -16,5 +16,8 @@ ed2k-types = { path = "../ed2k-types" }
 clap = { version = "4", features = ["derive"] }
 ed2k-server = { path = "../ed2k-server" }
 ed2k-kad = { path = "../ed2k-kad" }
+ed2k-peer = { path = "../ed2k-peer" }
+remule-core = { path = "../remule-core" }
+remule-net = { path = "../remule-net" }
 rand = "0.8"
-tokio = { version = "1", features = ["net", "time", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["net", "time", "rt-multi-thread", "macros", "signal", "sync"] }

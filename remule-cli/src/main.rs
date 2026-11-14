@@ -6,6 +6,7 @@
 //!     remule search TERMS --server IP:PORT [--obfuscate] [--type T] [--min-size S] ...
 //!     remule ping IP:PORT
 //!     remule kad [--nodes nodes.dat] [--search TERMS]... [--source HASH:SIZE]... [--duration S]
+//!     remule download [LINK]... --temp DIR --incoming DIR [--server IP:PORT]... [--kad DIR]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ed2k_types::tags::FileType;
 use remule_cli::inspect::{self, Outcome};
-use remule_cli::{kad, server};
+use remule_cli::{download, kad, server};
 
 #[derive(Parser)]
 #[command(
@@ -130,6 +131,53 @@ enum Command {
         /// The UDP port is reachable from outside: store what others publish.
         #[arg(long)]
         reachable: bool,
+    },
+    /// Download files from ed2k links, with sources from servers and Kad. Downloads
+    /// already in the temp directory (remule's or aMule's) are resumed.
+    Download {
+        /// ed2k://|file|NAME|SIZE|HASH|/ links (none: just resume the temp directory).
+        links: Vec<String>,
+        /// Where the .part / .part.met files are (aMule's Temp directory works too).
+        #[arg(long, default_value = "remule-temp")]
+        temp: PathBuf,
+        /// Where finished files go.
+        #[arg(long, default_value = "remule-incoming")]
+        incoming: PathBuf,
+        /// An eD2k server to ask for sources (the first that logs in is used).
+        #[arg(long = "server", short)]
+        servers: Vec<SocketAddr>,
+        /// Connect to the server obfuscated.
+        #[arg(long)]
+        obfuscate: bool,
+        /// Also find sources on Kad, keeping its state in this directory.
+        #[arg(long)]
+        kad: Option<PathBuf>,
+        /// The nodes.dat to join Kad from (default: the --kad directory's).
+        #[arg(long)]
+        nodes: Option<PathBuf>,
+        /// TCP port: told to peers and servers, and listened on for callbacks.
+        #[arg(long, default_value_t = 4662)]
+        port: u16,
+        /// Kad's UDP port.
+        #[arg(long, default_value_t = 4672)]
+        udp_port: u16,
+        #[arg(long, default_value = "remule")]
+        nick: String,
+        /// Seconds to run (default: until every file is complete).
+        #[arg(long, default_value_t = 0)]
+        duration: u64,
+        /// Seconds between progress lines.
+        #[arg(long, default_value_t = 30)]
+        status_every: u64,
+        /// Peer connections at once.
+        #[arg(long, default_value_t = 50)]
+        max_connections: usize,
+        /// Download limit in KiB/s (0: none).
+        #[arg(long, default_value_t = 0)]
+        max_download: u32,
+        /// Upload limit in KiB/s (0: none).
+        #[arg(long, default_value_t = 0)]
+        max_upload: u32,
     },
     /// Ping an eD2k server over UDP (its TCP port + 4) for its user and file counts.
     Ping {
@@ -264,6 +312,39 @@ fn main() -> ExitCode {
             limit,
             verbose,
             reachable,
+        })),
+        Command::Download {
+            links,
+            temp,
+            incoming,
+            servers,
+            obfuscate,
+            kad,
+            nodes,
+            port,
+            udp_port,
+            nick,
+            duration,
+            status_every,
+            max_connections,
+            max_download,
+            max_upload,
+        } => run_async(download::run(download::DownloadArgs {
+            links,
+            temp,
+            incoming,
+            servers,
+            obfuscate_server: obfuscate,
+            kad,
+            kad_nodes: nodes,
+            tcp_port: port,
+            udp_port,
+            nick,
+            duration,
+            status_every: status_every.max(1),
+            max_connections,
+            max_download,
+            max_upload,
         })),
         Command::Ping { server, wait } => {
             run_async(server::ping(server, Duration::from_secs(wait)))

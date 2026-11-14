@@ -41,6 +41,7 @@ struct MockFile {
     free: Vec<Range<u64>>,
     released: Vec<Range<u64>>,
     written: Vec<(u64, Vec<u8>)>,
+    wants_sources: bool,
 }
 
 impl MockFile {
@@ -62,6 +63,7 @@ impl MockFile {
             free,
             released: Vec::new(),
             written: Vec::new(),
+            wants_sources: false,
         }
     }
 
@@ -121,6 +123,9 @@ impl PartFile for MockFile {
     fn write(&mut self, start: u64, data: &[u8]) {
         assert_eq!(data, content(start..start + data.len() as u64));
         self.written.push((start, data.to_vec()));
+    }
+    fn wants_sources(&self) -> bool {
+        self.wants_sources
     }
 }
 
@@ -596,4 +601,281 @@ fn old_emule_info_exchange() {
         [PeerPacket::MuleInfo { answer: true, .. }]
     ));
     assert_eq!(r.s.parse_context().extended_requests_version, 2);
+}
+
+// ---- source exchange, secure ident and AICH through the session ----
+
+mod sx_ident_aich {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    use super::*;
+    use crate::packets::AichRecovery;
+    use crate::secident::{IdentConfig, IdentResult, Identity, Need, SecureIdent};
+    use crate::sources::{AnswerBuilder, ExchangedSource};
+
+    fn source(i: u8) -> ExchangedSource {
+        ExchangedSource {
+            id: u32::from_le_bytes([198, 51, 100, i]),
+            port: 4662,
+            server: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 1), 4242),
+            user_hash: Some(Md4Hash([i; 16])),
+            crypt_options: Some(0x0D),
+        }
+    }
+
+    fn wanting_sources() -> MockFile {
+        let mut f = three_parts([false, false, false]);
+        f.wants_sources = true;
+        f
+    }
+
+    #[test]
+    fn sources_are_asked_with_the_multipacket() {
+        let mut r = Rig::connect(wanting_sources());
+        r.sent();
+        r.deliver(peer_hello(true).to_hello_answer().unwrap());
+        let PeerPacket::MultiPacket { requests, .. } = &r.sent()[0] else {
+            panic!()
+        };
+        assert!(requests.contains(&MultiRequest::Sources2 {
+            version: 4,
+            options: 0
+        }));
+        assert!(r.events().contains(&Event::SourcesRequested));
+
+        let mut b = AnswerBuilder::new(FILE, true, 3, 4);
+        b.add(&source(1));
+        b.add(&source(2));
+        r.deliver(b.finish().unwrap());
+        assert_eq!(r.events(), [Event::Sources(vec![source(1), source(2)])]);
+
+        // Another file's answer is not ours.
+        let mut b = AnswerBuilder::new(Md4Hash([9; 16]), true, 3, 4);
+        b.add(&source(3));
+        r.deliver(b.finish().unwrap());
+        assert!(matches!(r.events()[..], [Event::Unhandled(_)]));
+    }
+
+    #[test]
+    fn an_old_peer_is_asked_with_its_own_packet() {
+        let mut r = Rig::connect(wanting_sources());
+        r.sent();
+        r.deliver(peer_hello(false).to_hello_answer().unwrap());
+        let sent = r.sent();
+        assert!(sent.contains(&PeerPacket::RequestSources(FILE)), "{sent:?}");
+        assert!(r.events().contains(&Event::SourcesRequested));
+
+        // SX1 v3: hashes, hybrid IDs, no crypt byte.
+        let mut b = AnswerBuilder::new(FILE, false, 3, 0);
+        b.add(&source(1));
+        r.deliver(b.finish().unwrap());
+        let expected = ExchangedSource {
+            crypt_options: None,
+            ..source(1)
+        };
+        assert_eq!(r.events(), [Event::Sources(vec![expected])]);
+
+        // A v4 layout from a v3 peer is dropped.
+        let mut b = AnswerBuilder::new(FILE, false, 4, 0);
+        b.add(&source(1));
+        r.deliver(b.finish().unwrap());
+        assert!(matches!(r.events()[..], [Event::SourcesRejected(_)]));
+    }
+
+    #[test]
+    fn no_sources_are_asked_unless_wanted() {
+        let mut r = Rig::connect(three_parts([false, false, false]));
+        r.sent();
+        r.deliver(peer_hello(true).to_hello_answer().unwrap());
+        let PeerPacket::MultiPacket { requests, .. } = &r.sent()[0] else {
+            panic!()
+        };
+        assert!(!requests
+            .iter()
+            .any(|q| matches!(q, MultiRequest::Sources | MultiRequest::Sources2 { .. })));
+        assert!(!r.events().contains(&Event::SourcesRequested));
+    }
+
+    fn identity(seed: u64) -> Arc<Identity> {
+        let ck = ed2k_formats::cryptkey_dat::CryptKey::generate(&mut StdRng::seed_from_u64(seed))
+            .unwrap();
+        Arc::new(Identity {
+            key: ck.private_key().unwrap(),
+            public: ck.public_key().unwrap(),
+        })
+    }
+
+    fn cfg(ours: Arc<Identity>) -> IdentConfig {
+        IdentConfig {
+            ours,
+            stored_key: None,
+            peer_ip: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            our_id: 0x0200_007F,
+            our_public_ip: None,
+        }
+    }
+
+    /// Hand what the session sent to the peer's identification; return
+    /// what the peer answers, and its verdict on us.
+    fn to_peer(
+        peer: &mut SecureIdent,
+        sent: Vec<PeerPacket>,
+    ) -> (Vec<Packet>, Option<IdentResult>) {
+        let mut out = Vec::new();
+        let mut verdict = None;
+        for p in sent {
+            match p {
+                PeerPacket::SecIdentState { need, challenge } => {
+                    out.extend(peer.on_state(need, challenge))
+                }
+                PeerPacket::PublicKey(k) => out.extend(peer.on_public_key(k)),
+                PeerPacket::Signature { signature, ip_kind } => {
+                    verdict = peer.on_signature(&signature, ip_kind)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        (out, verdict)
+    }
+
+    fn handshaken() -> Rig {
+        let mut r = Rig::connect(three_parts([false, false, false]));
+        r.sent();
+        r.deliver(peer_hello(true).to_hello_answer().unwrap());
+        r.sent();
+        r.events();
+        r
+    }
+
+    #[test]
+    fn both_sides_identify_through_the_session() {
+        let (us, them) = (identity(1), identity(2));
+        let mut r = handshaken();
+
+        // The peer asks first, before the application started ours.
+        let mut peer = SecureIdent::new(cfg(them.clone()), 3);
+        r.deliver(peer.start(77).unwrap());
+        assert!(r.sent().is_empty());
+
+        let out = r.s.start_secure_ident(cfg(us.clone()), 1234);
+        r.take_sent(out.send);
+        // Our state, then our key for the peer's request; no signature
+        // yet, as we do not have its key.
+        let sent = r.sent();
+        assert_eq!(
+            sent[0],
+            PeerPacket::SecIdentState {
+                need: Need::KeyAndSignature,
+                challenge: 1234
+            }
+        );
+        assert_eq!(sent[1], PeerPacket::PublicKey(us.public.clone()));
+        assert_eq!(sent.len(), 2);
+
+        // The peer sends its key and, having ours, its signature.
+        let (answer, verdict) = to_peer(&mut peer, sent);
+        assert_eq!(verdict, None);
+        for p in answer {
+            r.deliver(p);
+        }
+        assert_eq!(
+            r.events(),
+            [Event::Identified(IdentResult::Passed {
+                key: them.public.clone()
+            })]
+        );
+        // Now we can sign for the peer.
+        let (_, verdict) = to_peer(&mut peer, r.sent());
+        assert_eq!(
+            verdict,
+            Some(IdentResult::Passed {
+                key: us.public.clone()
+            })
+        );
+    }
+
+    #[test]
+    fn a_signature_by_another_key_fails() {
+        let (us, them, mallory) = (identity(1), identity(2), identity(3));
+        let mut r = handshaken();
+        // We know the peer's key from its credits; mallory signs instead.
+        let mut c = cfg(us.clone());
+        c.stored_key = Some(them.public.clone());
+        let out = r.s.start_secure_ident(c, 99);
+        r.take_sent(out.send);
+        assert_eq!(
+            r.sent(),
+            [PeerPacket::SecIdentState {
+                need: Need::Signature,
+                challenge: 99
+            }]
+        );
+        let mut fake = SecureIdent::new(cfg(mallory), 3);
+        fake.on_public_key(us.public.clone());
+        for p in fake.on_state(Need::Signature, 99) {
+            r.deliver(p);
+        }
+        assert_eq!(r.events(), [Event::Identified(IdentResult::Failed)]);
+    }
+
+    fn recovery(part: u16) -> AichRecovery {
+        AichRecovery {
+            hash: FILE,
+            part,
+            root: AichHash([4; 20]),
+            data: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn aich_recovery_is_asked_once_and_answered() {
+        let mut r = handshaken();
+        let root = AichHash([4; 20]);
+        let req = r.s.request_aich(1, root).unwrap();
+        assert!(r.s.request_aich(2, root).is_none());
+        assert_eq!(r.s.aich_pending(), Some(1));
+        r.take_sent(vec![req]);
+        assert_eq!(
+            r.sent(),
+            [PeerPacket::AichRequest {
+                hash: FILE,
+                part: 1,
+                root
+            }]
+        );
+
+        r.deliver(packets::aich_answer(&recovery(1)));
+        assert_eq!(r.events(), [Event::AichRecovery(recovery(1))]);
+        assert_eq!(r.s.aich_pending(), None);
+
+        // A refusal, then an answer for another part.
+        let req = r.s.request_aich(0, root).unwrap();
+        r.take_sent(vec![req]);
+        r.deliver(packets::aich_answer_failed(FILE));
+        assert_eq!(r.events(), [Event::AichRecoveryFailed { part: 0 }]);
+        let req = r.s.request_aich(0, root).unwrap();
+        r.take_sent(vec![req]);
+        r.deliver(packets::aich_answer(&recovery(2)));
+        assert_eq!(r.events(), [Event::AichRecoveryFailed { part: 0 }]);
+
+        // Unasked: aMule disconnects.
+        r.deliver(packets::aich_answer(&recovery(1)));
+        assert!(matches!(
+            r.events()[..],
+            [Event::Closed(CloseReason::Protocol(_))]
+        ));
+    }
+
+    #[test]
+    fn a_peer_without_aich_is_not_asked() {
+        let mut r = Rig::connect(three_parts([false, false, false]));
+        r.sent();
+        r.deliver(peer_hello(false).to_hello_answer().unwrap());
+        assert!(!r.s.peer_supports_aich());
+        assert!(r.s.request_aich(0, AichHash([4; 20])).is_none());
+    }
 }

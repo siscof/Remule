@@ -19,10 +19,14 @@
 //! * completion (`CHashingTask`, `PartFileHashFinished`, `CCompletionTask`):
 //!   the whole file is hashed again, then moved to the incoming directory.
 //!
+//! * AICH recovery (`RequestAICHRecovery`, `AICHRecoveryDataAvailable`):
+//!   the root hash peers report is voted on; once one is trusted, a corrupt
+//!   part asks for recovery data, and the blocks that match it are kept.
+//!
 //! aMule writes and hashes on worker threads; here it is all synchronous,
-//! and the daemon decides where to run it. Not yet ported: AICH recovery
-//! and ICH (phase 8.4), the corruption black box, sparse or preallocated
-//! files, the free-space checks.
+//! and the daemon decides where to run it. Not yet ported: ICH, the
+//! corruption black box, sparse or preallocated files, the free-space
+//! checks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -32,11 +36,12 @@ use std::time::UNIX_EPOCH;
 
 use ed2k_formats::known_met::{hash_of_part_hashes, part_hash_count};
 use ed2k_formats::part_met::{self, Layout, PartMet};
+use ed2k_hash::aich::{self, AichTree, RootTrust, RootVotes};
 use ed2k_hash::FileHashes;
 use ed2k_peer::part_status::ed2k_part_count;
 use ed2k_peer::PartStatus;
 use ed2k_types::ed2k::{EMBLOCKSIZE, MAX_FILE_SIZE, PARTSIZE};
-use ed2k_types::Md4Hash;
+use ed2k_types::{AichHash, Md4Hash};
 use md4::{Digest, Md4};
 
 use crate::blocks::{self, ChunkInfo};
@@ -79,8 +84,27 @@ pub enum FileEvent {
     HashSetNeeded,
     /// Every byte is present: call [`PartFile::complete`].
     ReadyToComplete,
+    /// A corrupt part could be recovered: ask a peer that reported this
+    /// AICH root for the part's recovery data (`RequestAICHRecovery`), and
+    /// give it to [`PartFile::aich_recovery_data`].
+    AichRecoveryWanted { part: u16, root: AichHash },
     /// A disk error; the file is now [`Status::Error`].
     Error(String),
+}
+
+/// `EAICHStatus`, as far as a download goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AichStatus {
+    /// No root known (`AICH_EMPTY`).
+    Empty,
+    /// Peers reported a root, not enough of them agree (`AICH_UNTRUSTED`).
+    Untrusted,
+    /// Enough peers agree (`AICH_TRUSTED`).
+    Trusted,
+    /// From the met or an ed2k link: saved with the download (`AICH_VERIFIED`).
+    Verified,
+    /// Recovery data contradicted the part hashes (`AICH_ERROR`).
+    Error,
 }
 
 /// What [`PartFile::complete`] found.
@@ -159,6 +183,15 @@ pub struct PartFile {
     events: Vec<FileEvent>,
     /// Bytes thrown away by failed hash checks (`m_iLostDueToCorruption`).
     lost_to_corruption: u64,
+    aich_status: AichStatus,
+    aich_root: Option<AichHash>,
+    aich_votes: RootVotes,
+    /// The tree recovery data builds up, under `aich_root`.
+    aich_tree: Option<AichTree>,
+    /// Parts whose recovery data was asked for (`IsClientRequestPending`).
+    aich_wanted: Vec<u16>,
+    /// Bytes saved by AICH recovery.
+    recovered_by_aich: u64,
 }
 
 /// The `.part`'s mtime as aMule stores it: seconds since 1970, 32 bits.
@@ -266,6 +299,8 @@ impl PartFile {
         // Seeded from the file hash: different files spread differently,
         // and a test run is repeatable.
         let seed = u64::from_le_bytes(info.hash.0[..8].try_into().unwrap()) | 1;
+        // A root in the met was verified (`FT_AICH_HASH`).
+        let aich_root = info.aich_hash.as_deref().and_then(|s| s.parse().ok());
         PartFile {
             met_path,
             part_path,
@@ -289,6 +324,16 @@ impl PartFile {
             rng: seed,
             events: Vec::new(),
             lost_to_corruption: 0,
+            aich_status: if aich_root.is_some() {
+                AichStatus::Verified
+            } else {
+                AichStatus::Empty
+            },
+            aich_root,
+            aich_votes: RootVotes::default(),
+            aich_tree: None,
+            aich_wanted: Vec::new(),
+            recovered_by_aich: 0,
         }
     }
 
@@ -447,6 +492,24 @@ impl PartFile {
         self.complete_sources
     }
 
+    pub fn aich_status(&self) -> AichStatus {
+        self.aich_status
+    }
+
+    pub fn aich_root(&self) -> Option<AichHash> {
+        self.aich_root
+    }
+
+    /// Bytes of corrupt parts kept thanks to AICH recovery.
+    pub fn recovered_by_aich(&self) -> u64 {
+        self.recovered_by_aich
+    }
+
+    /// Parts whose recovery data is wanted and not yet received.
+    pub fn aich_wanted(&self) -> &[u16] {
+        &self.aich_wanted
+    }
+
     // ---- settings ----
 
     pub fn set_paused(&mut self, paused: bool) {
@@ -454,6 +517,160 @@ impl PartFile {
             self.info.paused = paused;
             self.dirty = true;
         }
+    }
+
+    /// The AICH root from an ed2k link (`h=`): verified, and saved with
+    /// the download.
+    pub fn set_aich_root(&mut self, root: AichHash) {
+        self.aich_status = AichStatus::Verified;
+        if self.aich_root != Some(root) {
+            self.aich_tree = None;
+        }
+        self.aich_root = Some(root);
+        self.info.aich_hash = Some(root.to_string());
+        self.dirty = true;
+    }
+
+    /// `UntrustedHashReceived`: a source reported this AICH root. `key` is
+    /// its subnet ([`aich::signing_key_v4`] or [`aich::signing_key_v6`]);
+    /// `from_kad` for a root from a Kad search result. A verified root is
+    /// never replaced.
+    pub fn aich_hash_received(&mut self, root: AichHash, key: u32, from_kad: bool) {
+        if !matches!(
+            self.aich_status,
+            AichStatus::Empty | AichStatus::Untrusted | AichStatus::Trusted
+        ) {
+            return;
+        }
+        let Some(trust) = self.aich_votes.received(root, key, from_kad) else {
+            return;
+        };
+        self.aich_status = match trust {
+            RootTrust::Trusted(_) => AichStatus::Trusted,
+            RootTrust::Untrusted(_) => AichStatus::Untrusted,
+        };
+        if self.aich_root != Some(trust.hash()) {
+            self.aich_root = Some(trust.hash());
+            self.aich_tree = None;
+        }
+    }
+
+    /// Trust whatever root is reported most (`IsTrustingEveryHash`).
+    pub fn set_trust_every_aich_hash(&mut self, on: bool) {
+        self.aich_votes.trust_every_hash = on;
+    }
+
+    /// `RequestAICHRecovery`, as far as the file goes: with a trusted root,
+    /// a part bigger than one block, and no request out for it.
+    fn want_aich_recovery(&mut self, part: u16) {
+        let Some(root) = self.aich_root else { return };
+        if !matches!(self.aich_status, AichStatus::Trusted | AichStatus::Verified)
+            || self.aich_wanted.contains(&part)
+        {
+            return;
+        }
+        let (s, e) = self.gaps.part_range(part);
+        if e - s < u64::from(EMBLOCKSIZE) {
+            return;
+        }
+        self.aich_wanted.push(part);
+        self.events
+            .push(FileEvent::AichRecoveryWanted { part, root });
+    }
+
+    /// No peer could send the recovery data for `part`
+    /// (`ClientAICHRequestFailed`): it may be asked for again.
+    pub fn aich_recovery_failed(&mut self, part: u16) {
+        self.aich_wanted.retain(|&p| p != part);
+    }
+
+    /// `ReadRecoveryData` and `AICHRecoveryDataAvailable`: recovery data
+    /// for `part` under `root` arrived. If it hashes up to our trusted
+    /// root, every block of the part whose SHA-1 matches is kept; the rest
+    /// stays missing. Returns the bytes kept, or `None` if the data was
+    /// not usable.
+    pub fn aich_recovery_data(
+        &mut self,
+        part: u16,
+        root: AichHash,
+        data: &[u8],
+    ) -> io::Result<Option<u64>> {
+        self.aich_wanted.retain(|&p| p != part);
+        if !matches!(self.aich_status, AichStatus::Trusted | AichStatus::Verified)
+            || self.aich_root != Some(root)
+            || part >= self.gaps.part_count()
+        {
+            return Ok(None);
+        }
+        let size = self.size();
+        let start = u64::from(part) * PARTSIZE;
+        let tree = self
+            .aich_tree
+            .get_or_insert_with(|| AichTree::with_root(size, root));
+        if !tree.read_recovery_data(start, data) {
+            return Ok(None);
+        }
+        let Some(verified) = tree.verified_block_hashes(start) else {
+            return Ok(None);
+        };
+        self.flush()?;
+        if self.gaps.is_part_complete(part) {
+            return Ok(Some(0));
+        }
+        let (s, e) = self.gaps.part_range(part);
+        let len = (e - s + 1) as usize;
+        let mut buf = vec![0u8; len];
+        let have = self
+            .handle()?
+            .metadata()?
+            .len()
+            .saturating_sub(s)
+            .min(len as u64) as usize;
+        {
+            let f = self.handle()?;
+            f.seek(SeekFrom::Start(s))?;
+            f.read_exact(&mut buf[..have])?;
+        }
+        let ours = aich::block_hashes(&buf);
+        let mut recovered = 0;
+        for (i, (o, v)) in ours.iter().zip(&verified).enumerate() {
+            if o != v {
+                continue;
+            }
+            let bs = s + i as u64 * u64::from(EMBLOCKSIZE);
+            let be = (bs + u64::from(EMBLOCKSIZE)).min(e + 1) - 1;
+            if bs >= s + have as u64 {
+                continue;
+            }
+            self.gaps.fill(bs, be);
+            self.requested.retain(|&(rs, re)| !(rs >= bs && re <= be));
+            recovered += be - bs + 1;
+        }
+        self.recovered_by_aich += recovered;
+        if self.gaps.is_part_complete(part) {
+            if self.verify_part(part)? {
+                if self.status == Status::Empty && !self.hash_set_needed {
+                    self.status = Status::Ready;
+                }
+                self.events.push(FileEvent::PartVerified(part));
+                if self.gaps.is_complete() {
+                    self.status = Status::Completing;
+                    self.events.push(FileEvent::ReadyToComplete);
+                }
+            } else {
+                // The recovery data and the part hash disagree.
+                self.aich_status = AichStatus::Error;
+                self.info.aich_hash = None;
+                self.gaps.add_part(part);
+                self.recovered_by_aich -= recovered;
+                recovered = 0;
+            }
+        }
+        // Done what can be done: no longer listed as corrupt.
+        self.info.corrupted_parts.retain(|&p| p != part);
+        self.dirty = true;
+        self.save_met()?;
+        Ok(Some(recovered))
     }
 
     pub fn set_complete_sources(&mut self, n: u16) {
@@ -835,6 +1052,7 @@ impl PartFile {
             self.lost_to_corruption += e - s + 1;
             self.dirty = true;
             self.events.push(FileEvent::PartCorrupt(part));
+            self.want_aich_recovery(part);
             return;
         }
         if let Some(i) = self.info.corrupted_parts.iter().position(|&p| p == part) {
@@ -910,6 +1128,7 @@ impl PartFile {
                 let (s, e) = self.gaps.part_range(p);
                 self.lost_to_corruption += e - s + 1;
                 self.events.push(FileEvent::PartCorrupt(p));
+                self.want_aich_recovery(p);
             }
             Rehash::Corrupt(corrupt)
         }
@@ -987,6 +1206,12 @@ impl PartFile {
                 return Ok(Completion::Corrupt(parts));
             }
         }
+        // The file's own AICH root, now that it is known.
+        if let Some(root) = result.aich_root {
+            self.aich_root = Some(root);
+            self.aich_status = AichStatus::Verified;
+            self.info.aich_hash = Some(root.to_string());
+        }
         if self.dirty {
             self.save()?;
         }
@@ -1047,6 +1272,8 @@ enum Rehash {
 pub struct SourceView<'a> {
     pub file: &'a mut PartFile,
     pub last_part: &'a mut Option<u16>,
+    /// Ask this source for other sources with the file request.
+    pub wants_sources: bool,
 }
 
 impl ed2k_peer::download::PartFile for SourceView<'_> {
@@ -1093,5 +1320,9 @@ impl ed2k_peer::download::PartFile for SourceView<'_> {
     fn write(&mut self, start: u64, data: &[u8]) {
         // A disk error puts the file in Status::Error, with an event.
         let _ = self.file.write(start, data);
+    }
+
+    fn wants_sources(&self) -> bool {
+        self.wants_sources
     }
 }

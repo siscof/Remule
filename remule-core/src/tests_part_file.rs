@@ -516,6 +516,7 @@ fn the_session_view_reserves_writes_and_reports() {
     let mut view = SourceView {
         file: &mut pf,
         last_part: &mut last,
+        wants_sources: false,
     };
     assert!(view.hash_set_needed());
     assert!(view.set_hash_set(h.part_hashes.clone()));
@@ -608,4 +609,172 @@ fn files_over_4_gb_get_the_large_file_met() {
     let pf = PartFile::open(&dir.temp().join("001.part.met")).unwrap();
     assert_eq!(pf.size(), size);
     assert_eq!(pf.gaps().gap_size(), size);
+}
+
+// ---- AICH recovery ----
+
+mod aich_recovery {
+    use std::net::Ipv4Addr;
+
+    use ed2k_hash::aich::{signing_key_v4, AichTree};
+    use ed2k_types::AichHash;
+
+    use super::*;
+    use crate::AichStatus;
+
+    /// Download what `peer` has, flipping a byte in the block that holds
+    /// offset `bad`.
+    fn download_with_bad_byte(pf: &mut PartFile, d: &[u8], peer: &PartStatus, bad: u64) {
+        let mut last = None;
+        loop {
+            let blocks = pf.reserve_blocks(&mut last, peer, 3);
+            if blocks.is_empty() {
+                break;
+            }
+            for b in blocks {
+                let mut piece = d[b.start as usize..b.end as usize].to_vec();
+                if b.contains(&bad) {
+                    piece[(bad - b.start) as usize] ^= 0xFF;
+                }
+                pf.write(b.start, &piece).unwrap();
+                pf.release_block(b);
+            }
+        }
+    }
+
+    fn trust(pf: &mut PartFile, root: AichHash) {
+        for i in 0..10 {
+            pf.aich_hash_received(root, signing_key_v4(Ipv4Addr::new(10, i, 0, 1)), false);
+        }
+        assert_eq!(pf.aich_status(), AichStatus::Trusted);
+        assert_eq!(pf.aich_root(), Some(root));
+    }
+
+    #[test]
+    fn a_corrupt_part_keeps_its_good_blocks() {
+        let dir = TempDir::new("aich");
+        let (mut pf, d, h) = new_multi(&dir);
+        let root = h.aich_root.unwrap();
+        assert!(pf.set_hash_set(h.part_hashes.clone()));
+        trust(&mut pf, root);
+
+        let block = u64::from(EMBLOCKSIZE);
+        let bad = PARTSIZE + 3 * block + 17;
+        download_with_bad_byte(&mut pf, &d, &parts(3, &[1]), bad);
+        pf.flush().unwrap();
+        assert_eq!(
+            pf.take_events(),
+            [
+                FileEvent::PartCorrupt(1),
+                FileEvent::AichRecoveryWanted { part: 1, root }
+            ]
+        );
+        assert_eq!(pf.aich_wanted(), [1]);
+
+        // A peer with the whole file sends the part's recovery data.
+        let mut full = AichTree::from_blocks(MULTI, &h.aich_blocks).unwrap();
+        let data = full.part_recovery_data(PARTSIZE).unwrap();
+        let kept = pf.aich_recovery_data(1, root, &data).unwrap();
+        assert_eq!(kept, Some(PARTSIZE - block));
+        assert_eq!(pf.recovered_by_aich(), PARTSIZE - block);
+        assert!(pf.aich_wanted().is_empty());
+        assert!(pf.corrupted_parts().is_empty());
+        // Only the bad block is missing from part 1.
+        let start = PARTSIZE + 3 * block;
+        assert_eq!(
+            pf.gaps().missing_in(PARTSIZE, 2 * PARTSIZE - 1),
+            [(start, start + block - 1)]
+        );
+
+        // It is fetched again, and the part checks out.
+        download_with_bad_byte(&mut pf, &d, &parts(3, &[1]), u64::MAX);
+        pf.flush().unwrap();
+        assert_eq!(pf.take_events(), [FileEvent::PartVerified(1)]);
+        assert_eq!(pf.status(), Status::Ready);
+    }
+
+    #[test]
+    fn recovery_data_under_another_root_is_refused() {
+        let dir = TempDir::new("aich-root");
+        let (mut pf, d, h) = new_multi(&dir);
+        let root = h.aich_root.unwrap();
+        assert!(pf.set_hash_set(h.part_hashes.clone()));
+        trust(&mut pf, root);
+        download_with_bad_byte(&mut pf, &d, &parts(3, &[0]), 5);
+        pf.flush().unwrap();
+        pf.take_events();
+
+        let mut full = AichTree::from_blocks(MULTI, &h.aich_blocks).unwrap();
+        let data = full.part_recovery_data(0).unwrap();
+        // Data for another part, a root we do not trust, garbage.
+        assert_eq!(
+            pf.aich_recovery_data(0, AichHash([1; 20]), &data).unwrap(),
+            None
+        );
+        assert_eq!(pf.aich_recovery_data(0, root, &data[..40]).unwrap(), None);
+        assert_eq!(pf.gaps().part_gap_size(0), PARTSIZE);
+
+        // A failed request lets the next corruption ask again.
+        pf.aich_recovery_failed(0);
+        assert!(pf.aich_wanted().is_empty());
+    }
+
+    #[test]
+    fn an_untrusted_root_asks_for_nothing() {
+        let dir = TempDir::new("aich-untrusted");
+        let (mut pf, d, h) = new_multi(&dir);
+        let root = h.aich_root.unwrap();
+        assert!(pf.set_hash_set(h.part_hashes.clone()));
+        pf.aich_hash_received(root, signing_key_v4(Ipv4Addr::new(10, 0, 0, 1)), false);
+        assert_eq!(pf.aich_status(), AichStatus::Untrusted);
+        download_with_bad_byte(&mut pf, &d, &parts(3, &[0]), 5);
+        pf.flush().unwrap();
+        assert_eq!(pf.take_events(), [FileEvent::PartCorrupt(0)]);
+        // Nor is data taken under it.
+        let mut full = AichTree::from_blocks(MULTI, &h.aich_blocks).unwrap();
+        let data = full.part_recovery_data(0).unwrap();
+        assert_eq!(pf.aich_recovery_data(0, root, &data).unwrap(), None);
+    }
+
+    #[test]
+    fn a_root_from_a_link_is_saved_and_completion_records_the_files() {
+        let dir = TempDir::new("aich-link");
+        let (mut pf, d, h) = new_multi(&dir);
+        let root = h.aich_root.unwrap();
+        pf.set_aich_root(root);
+        pf.save().unwrap();
+        // Reports from peers do not move a verified root.
+        pf.aich_hash_received(AichHash([1; 20]), 7, false);
+        assert_eq!(pf.aich_root(), Some(root));
+        let met_path = pf.met_path().to_owned();
+        assert_eq!(read_met(&met_path).1.aich_hash, Some(root.to_string()));
+        drop(pf);
+
+        let mut pf = PartFile::open(&met_path).unwrap();
+        assert_eq!(pf.aich_status(), AichStatus::Verified);
+        assert_eq!(pf.aich_root(), Some(root));
+
+        // Completion records the file's own root.
+        download(&mut pf, &d, &PartStatus::Complete, None);
+        assert!(matches!(
+            pf.complete(&dir.incoming()).unwrap(),
+            Completion::Done(_)
+        ));
+        assert_eq!(pf.aich_root(), Some(root));
+        assert_eq!(pf.info().aich_hash, Some(root.to_string()));
+    }
+
+    #[test]
+    fn the_session_view_passes_the_source_wish() {
+        use ed2k_peer::download::PartFile as _;
+        let dir = TempDir::new("aich-view");
+        let (mut pf, _, _) = new_multi(&dir);
+        let mut last = None;
+        let view = SourceView {
+            file: &mut pf,
+            last_part: &mut last,
+            wants_sources: true,
+        };
+        assert!(view.wants_sources());
+    }
 }

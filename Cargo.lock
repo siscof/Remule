@@ -1137,8 +1137,13 @@ name = "ed2k-peer"
 version = "0.1.0"
 dependencies = [
  "ed2k-codec",
+ "ed2k-crypto",
+ "ed2k-formats",
+ "ed2k-hash",
  "ed2k-types",
  "flate2",
+ "rand",
+ "rsa",
  "thiserror 2.0.18",
 ]
 

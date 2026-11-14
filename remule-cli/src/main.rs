@@ -6,6 +6,7 @@
 //!     remule search TERMS --server IP:PORT [--obfuscate] [--type T] [--min-size S] ...
 //!     remule ping IP:PORT
 //!     remule kad [--nodes nodes.dat] [--search TERMS]... [--source HASH:SIZE]... [--duration S]
+//!     remule share DIR... [--config DIR] [--links]
 //!     remule download [LINK]... --temp DIR --incoming DIR [--server IP:PORT]... [--kad DIR]
 
 use std::net::SocketAddr;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use ed2k_types::tags::FileType;
 use remule_cli::inspect::{self, Outcome};
-use remule_cli::{download, kad, server};
+use remule_cli::{download, kad, server, share};
 
 #[derive(Parser)]
 #[command(
@@ -178,6 +179,25 @@ enum Command {
         /// Upload limit in KiB/s (0: none).
         #[arg(long, default_value_t = 0)]
         max_upload: u32,
+    },
+    /// Share directories as aMule does: hash new files into known.met and
+    /// known2_64.met, and list the shared files.
+    Share {
+        /// The directories to share (not recursive, as in aMule).
+        #[arg(required = true)]
+        dirs: Vec<PathBuf>,
+        /// The config directory with known.met (aMule's works, with aMule closed).
+        #[arg(long, default_value = "remule-config")]
+        config: PathBuf,
+        /// A directory never to share (aMule's Temp, say).
+        #[arg(long)]
+        reserved: Vec<PathBuf>,
+        /// Share files whose names start with a dot.
+        #[arg(long)]
+        hidden: bool,
+        /// Print each file's ed2k link.
+        #[arg(long)]
+        links: bool,
     },
     /// Ping an eD2k server over UDP (its TCP port + 4) for its user and file counts.
     Ping {
@@ -346,6 +366,25 @@ fn main() -> ExitCode {
             max_download,
             max_upload,
         })),
+        Command::Share {
+            dirs,
+            config,
+            reserved,
+            hidden,
+            links,
+        } => match share::run(share::ShareArgs {
+            config,
+            dirs,
+            reserved,
+            hidden,
+            links,
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("remule: {e}");
+                ExitCode::from(1)
+            }
+        },
         Command::Ping { server, wait } => {
             run_async(server::ping(server, Duration::from_secs(wait)))
         }

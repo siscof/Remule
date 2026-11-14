@@ -8,6 +8,8 @@
 //!   by aMule (`CPartFile`).
 //! * [`download_queue`]: the files, their sources and one session per
 //!   connection (`CDownloadQueue`), without IO.
+//! * [`shared`]: the shared files, `known.met` and `known2_64.met`
+//!   (`CSharedFileList`, `CKnownFileList`).
 //! * [`downloader`]: the queue on tokio, with peer connections on
 //!   `remule-net`.
 
@@ -16,6 +18,7 @@ pub mod download_queue;
 pub mod downloader;
 pub mod gap_list;
 pub mod part_file;
+pub mod shared;
 
 pub use gap_list::GapList;
 pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, SourceView, Status};
@@ -26,3 +29,5 @@ mod tests;
 mod tests_part_file;
 #[cfg(test)]
 mod tests_queue;
+#[cfg(test)]
+mod tests_shared;

@@ -6,8 +6,14 @@
 //!   ranking (`BlockReservation.h`, `GetNextRequestedBlock`).
 //! * [`part_file`]: a download on disk, `.part` and `.part.met`, resumable
 //!   by aMule (`CPartFile`).
+//! * [`download_queue`]: the files, their sources and one session per
+//!   connection (`CDownloadQueue`), without IO.
+//! * [`downloader`]: the queue on tokio, with peer connections on
+//!   `remule-net`.
 
 pub mod blocks;
+pub mod download_queue;
+pub mod downloader;
 pub mod gap_list;
 pub mod part_file;
 
@@ -18,3 +24,5 @@ pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, Sour
 mod tests;
 #[cfg(test)]
 mod tests_part_file;
+#[cfg(test)]
+mod tests_queue;

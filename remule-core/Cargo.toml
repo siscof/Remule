@@ -1,0 +1,16 @@
+[package]
+name = "remule-core"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "remule's client core: part files (downloads in progress), later the download and upload queues"
+
+[dependencies]
+ed2k-formats = { path = "../ed2k-formats" }
+ed2k-hash = { path = "../ed2k-hash" }
+ed2k-peer = { path = "../ed2k-peer" }
+ed2k-types = { path = "../ed2k-types" }
+md4 = "0.10"
+
+[dev-dependencies]
+ed2k-codec = { path = "../ed2k-codec" }

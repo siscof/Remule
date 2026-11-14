@@ -16,10 +16,10 @@ use ed2k_types::Md4Hash;
 use crate::part_file::{clean_file_name, completed_path};
 use crate::{Completion, FileEvent, PartFile, SourceView, Status};
 
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new(name: &str) -> TempDir {
+    pub(crate) fn new(name: &str) -> TempDir {
         static N: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
             "remule-core-{}-{}-{name}",
@@ -32,11 +32,11 @@ impl TempDir {
         TempDir(p)
     }
 
-    fn temp(&self) -> PathBuf {
+    pub(crate) fn temp(&self) -> PathBuf {
         self.0.join("temp")
     }
 
-    fn incoming(&self) -> PathBuf {
+    pub(crate) fn incoming(&self) -> PathBuf {
         self.0.join("incoming")
     }
 }
@@ -47,7 +47,7 @@ impl Drop for TempDir {
     }
 }
 
-fn data(size: u64, seed: u64) -> Vec<u8> {
+pub(crate) fn data(size: u64, seed: u64) -> Vec<u8> {
     let mut x = seed | 1;
     (0..size)
         .map(|_| {
@@ -59,14 +59,14 @@ fn data(size: u64, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-fn hashes(d: &[u8]) -> FileHashes {
+pub(crate) fn hashes(d: &[u8]) -> FileHashes {
     let mut h = Hasher::new();
     h.update(d);
     h.finish()
 }
 
 /// A peer with only these parts.
-fn parts(count: usize, have: &[usize]) -> PartStatus {
+pub(crate) fn parts(count: usize, have: &[usize]) -> PartStatus {
     PartStatus::Parts((0..count).map(|i| have.contains(&i)).collect())
 }
 

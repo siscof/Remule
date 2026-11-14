@@ -1,0 +1,657 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! The download queue against scripted seeders: first without IO, every
+//! packet through the real encoder and parser; then on tokio over real
+//! TCP connections, obfuscated and plain.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ed2k_codec::Packet;
+use ed2k_hash::aich::AichTree;
+use ed2k_hash::FileHashes;
+use ed2k_peer::hello::{CryptSettings, MiscOptions2};
+use ed2k_peer::packets::{self, AichRecovery, MultiAnswer, MultiRequest, ParseContext};
+use ed2k_peer::sources::{AnswerBuilder, ExchangedSource};
+use ed2k_peer::{Hello, PartStatus, PeerPacket};
+use ed2k_types::ed2k::{EMBLOCKSIZE, PARTSIZE};
+use ed2k_types::Md4Hash;
+
+use crate::download_queue::{
+    crypt, Action, ConnId, DownloadQueue, Endpoint, Origin, QueueConfig, Report, SourceState,
+};
+use crate::tests_part_file::{data, hashes, parts, TempDir};
+use crate::PartFile;
+
+const SIZE: u64 = 2 * PARTSIZE + 12_345;
+
+fn ip_id(ip: Ipv4Addr) -> u32 {
+    u32::from_le_bytes(ip.octets())
+}
+
+/// An uploader as far as a download needs one.
+#[derive(Clone)]
+struct Seeder {
+    hello: Hello,
+    data: Arc<Vec<u8>>,
+    hashes: Arc<FileHashes>,
+    name: String,
+    parts: PartStatus,
+    /// Sources to give when asked.
+    exchange: Vec<ExchangedSource>,
+    /// Queue the downloader instead of giving it a slot.
+    queue_first: bool,
+    /// Answer the file request with "no such file".
+    no_file: bool,
+    /// Flip a byte at these offsets, once each.
+    corrupt: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl Seeder {
+    fn new(ip: Ipv4Addr, port: u16, d: Arc<Vec<u8>>, h: Arc<FileHashes>, have: PartStatus) -> Self {
+        // A user hash of its own: address and port.
+        let mut uh = [0u8; 16];
+        uh[..4].copy_from_slice(&ip.octets());
+        uh[4..6].copy_from_slice(&port.to_le_bytes());
+        uh[15] = 0x5E;
+        let mut hello = Hello::amule(Md4Hash(uh), ip_id(ip), port, "seeder");
+        hello.misc2 = Some(MiscOptions2::amule(
+            0,
+            CryptSettings {
+                supported: true,
+                requested: false,
+                required: false,
+            },
+        ));
+        Seeder {
+            hello,
+            data: d,
+            hashes: h,
+            name: "test file.bin".into(),
+            parts: have,
+            exchange: Vec::new(),
+            queue_first: false,
+            no_file: false,
+            corrupt: Arc::default(),
+        }
+    }
+
+    fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            addr: SocketAddrV4::new(Ipv4Addr::from(self.hello.id.to_le_bytes()), self.hello.port),
+            user_hash: Some(self.hello.user_hash),
+            crypt: crypt::SUPPORTED,
+        }
+    }
+
+    fn file(&self) -> Md4Hash {
+        self.hashes.ed2k
+    }
+
+    /// What the seeder answers to one packet from the downloader.
+    fn answer(&self, p: Packet) -> Vec<Packet> {
+        let ctx = ParseContext {
+            unicode: true,
+            extended_requests_version: 2,
+        };
+        let file = self.file();
+        match PeerPacket::parse(p, ctx).unwrap() {
+            PeerPacket::Hello(_) => vec![self.hello.to_hello_answer().unwrap()],
+            PeerPacket::MultiPacket { hash, requests, .. } => {
+                assert_eq!(hash, file);
+                if self.no_file {
+                    return vec![packets::no_such_file(hash)];
+                }
+                let mut answers = Vec::new();
+                let mut out = Vec::new();
+                for r in requests {
+                    match r {
+                        MultiRequest::FileName(_) => {
+                            answers.push(MultiAnswer::FileName(self.name.clone()))
+                        }
+                        MultiRequest::FileStatus => {
+                            answers.push(MultiAnswer::FileStatus(self.parts.clone()))
+                        }
+                        MultiRequest::AichFileHash => {
+                            answers.push(MultiAnswer::AichFileHash(self.hashes.aich_root.unwrap()))
+                        }
+                        MultiRequest::Sources2 { version, .. } => {
+                            let mut b = AnswerBuilder::new(hash, true, 3, version);
+                            self.exchange.iter().for_each(|s| b.add(s));
+                            out.extend(b.finish());
+                        }
+                        _ => {}
+                    }
+                }
+                let mut v = vec![packets::multi_packet_answer(hash, &answers, true)];
+                v.extend(out);
+                v
+            }
+            PeerPacket::HashSetRequest(h) => {
+                vec![packets::hash_set_answer(h, &self.hashes.part_hashes)]
+            }
+            PeerPacket::StartUploadReq(_) => {
+                if self.queue_first {
+                    vec![packets::queue_ranking(3)]
+                } else {
+                    vec![packets::accept_upload_req()]
+                }
+            }
+            PeerPacket::RequestParts { hash, ranges } => ranges
+                .into_iter()
+                .map(|r| {
+                    assert!(self.parts.has((r.start / PARTSIZE) as usize));
+                    let mut piece = self.data[r.start as usize..r.end as usize].to_vec();
+                    let mut bad = self.corrupt.lock().unwrap();
+                    for off in bad.clone() {
+                        if r.contains(&off) {
+                            piece[(off - r.start) as usize] ^= 0xFF;
+                            bad.remove(&off);
+                        }
+                    }
+                    packets::sending_part(hash, r.start, &piece)
+                })
+                .collect(),
+            PeerPacket::AichRequest { hash, part, root } => {
+                let mut tree = AichTree::from_blocks(SIZE, &self.hashes.aich_blocks).unwrap();
+                let data = tree.part_recovery_data(u64::from(part) * PARTSIZE).unwrap();
+                vec![packets::aich_answer(&AichRecovery {
+                    hash,
+                    part,
+                    root,
+                    data,
+                })]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn ours() -> Hello {
+    let mut h = Hello::amule(
+        Md4Hash([0x77; 16]),
+        ip_id(Ipv4Addr::new(10, 99, 0, 1)),
+        4662,
+        "remule",
+    );
+    h.misc2 = Some(MiscOptions2::amule(0, CryptSettings::default()));
+    h
+}
+
+fn config(dir: &TempDir) -> QueueConfig {
+    let mut c = QueueConfig::new(ours(), dir.incoming());
+    c.filter_lan = false;
+    c.reask = Duration::from_secs(5);
+    c.flush_every = Duration::from_secs(2);
+    c
+}
+
+/// Bytes on the wire and back, as the network would deliver them.
+fn wire(p: Packet) -> Packet {
+    Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap()
+}
+
+/// The queue and its scripted peers, no network.
+struct World {
+    q: DownloadQueue,
+    seeders: HashMap<SocketAddr, Seeder>,
+    conns: HashMap<ConnId, SocketAddr>,
+    reports: Vec<Report>,
+    now: Instant,
+    /// Addresses that refuse connections.
+    unreachable: HashSet<SocketAddr>,
+}
+
+impl World {
+    fn new(q: DownloadQueue) -> Self {
+        World {
+            q,
+            seeders: HashMap::new(),
+            conns: HashMap::new(),
+            reports: Vec::new(),
+            now: Instant::now(),
+            unreachable: HashSet::new(),
+        }
+    }
+
+    fn add_seeder(&mut self, s: Seeder) {
+        self.seeders.insert(SocketAddr::V4(s.endpoint().addr), s);
+    }
+
+    fn run(&mut self, mut work: VecDeque<Action>) {
+        while let Some(a) = work.pop_front() {
+            match a {
+                Action::Connect { conn, addr, .. } => {
+                    if self.unreachable.contains(&addr) || !self.seeders.contains_key(&addr) {
+                        work.extend(self.q.closed(conn, self.now));
+                    } else {
+                        self.conns.insert(conn, addr);
+                        work.extend(self.q.connected(conn, self.now));
+                    }
+                }
+                Action::Send { conn, packets } => {
+                    let Some(addr) = self.conns.get(&conn) else {
+                        continue;
+                    };
+                    let seeder = self.seeders[addr].clone();
+                    for p in packets {
+                        for reply in seeder.answer(wire(p)) {
+                            work.extend(self.q.packet(conn, wire(reply), self.now));
+                        }
+                    }
+                }
+                Action::Close { conn } => {
+                    self.conns.remove(&conn);
+                }
+                Action::Report(r) => self.reports.push(r),
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        self.now += Duration::from_secs(1);
+        let a = self.q.tick(self.now);
+        self.run(a.into());
+    }
+
+    fn add_source(&mut self, file: Md4Hash, ep: Endpoint) {
+        let a = self.q.add_source(file, ep, Origin::Manual, self.now);
+        self.run(a.into());
+    }
+
+    /// Tick until `done` holds, at most `n` times.
+    fn tick_until(&mut self, n: usize, done: impl Fn(&World) -> bool) {
+        for _ in 0..n {
+            if done(self) {
+                return;
+            }
+            self.tick();
+        }
+        assert!(done(self), "not done after {n} ticks: {:#?}", self.reports);
+    }
+
+    fn completed(&self) -> bool {
+        self.reports
+            .iter()
+            .any(|r| matches!(r, Report::Completed { .. }))
+    }
+}
+
+fn setup(name: &str) -> (TempDir, Arc<Vec<u8>>, Arc<FileHashes>, DownloadQueue) {
+    let dir = TempDir::new(name);
+    let d = Arc::new(data(SIZE, 21));
+    let h = Arc::new(hashes(&d));
+    let mut q = DownloadQueue::new(config(&dir));
+    let pf = PartFile::create(&dir.temp(), "test file.bin", h.ed2k, SIZE).unwrap();
+    assert!(q.add_file(pf));
+    (dir, d, h, q)
+}
+
+fn seeder_at(last: u8, d: &Arc<Vec<u8>>, h: &Arc<FileHashes>, have: PartStatus) -> Seeder {
+    Seeder::new(
+        Ipv4Addr::new(10, last, 0, 2),
+        4662,
+        d.clone(),
+        h.clone(),
+        have,
+    )
+}
+
+#[test]
+fn a_file_downloads_from_one_seeder() {
+    let (dir, d, h, q) = setup("q-one");
+    let mut w = World::new(q);
+    let s = seeder_at(1, &d, &h, PartStatus::Complete);
+    let ep = s.endpoint();
+    w.add_seeder(s);
+    w.add_source(h.ed2k, ep);
+    w.tick_until(10, World::completed);
+
+    let path = dir.incoming().join("test file.bin");
+    assert!(w.reports.contains(&Report::Completed {
+        file: h.ed2k,
+        path: path.clone()
+    }));
+    assert_eq!(std::fs::read(path).unwrap(), *d);
+    assert!(w.q.all_done());
+    assert_eq!(w.q.stats().received, SIZE);
+    assert!(w.reports.contains(&Report::DownloadStarted {
+        file: h.ed2k,
+        addr: ep.addr
+    }));
+    // Hung up once done.
+    assert!(w.conns.is_empty());
+    assert_eq!(w.q.stats().connections, 0);
+}
+
+#[test]
+fn source_exchange_finds_the_rest() {
+    let (_dir, d, h, q) = setup("q-sx");
+    let mut w = World::new(q);
+    let full = seeder_at(2, &d, &h, PartStatus::Complete);
+    let mut partial = seeder_at(1, &d, &h, parts(3, &[0]));
+    let fe = full.endpoint();
+    partial.exchange.push(ExchangedSource {
+        id: ip_id(*fe.addr.ip()),
+        port: fe.addr.port(),
+        server: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+        user_hash: fe.user_hash,
+        crypt_options: Some(crypt::SUPPORTED),
+    });
+    let pe = partial.endpoint();
+    w.add_seeder(partial);
+    w.add_seeder(full);
+    // Only the partial seeder is known.
+    w.add_source(h.ed2k, pe);
+    w.tick_until(20, World::completed);
+    assert!(w.reports.contains(&Report::SourceAdded {
+        file: h.ed2k,
+        addr: fe.addr,
+        origin: Origin::SourceExchange
+    }));
+}
+
+#[test]
+fn a_queued_source_calls_back_with_a_slot() {
+    let (_dir, d, h, q) = setup("q-callback");
+    let mut w = World::new(q);
+    let mut s = seeder_at(1, &d, &h, PartStatus::Complete);
+    s.queue_first = true;
+    let ep = s.endpoint();
+    let addr = SocketAddr::V4(ep.addr);
+    w.add_seeder(s.clone());
+    w.add_source(h.ed2k, ep);
+    w.tick();
+    assert!(w.reports.contains(&Report::Queued {
+        file: h.ed2k,
+        addr: ep.addr,
+        rank: Some(3)
+    }));
+    // The seeder hangs up; we stay in its queue.
+    let (&conn, _) = w.conns.iter().next().unwrap();
+    w.conns.remove(&conn);
+    let a = w.q.closed(conn, w.now);
+    w.run(a.into());
+    assert_eq!(w.q.sources_of(&h.ed2k)[0].2, SourceState::OnQueue);
+
+    // Later it connects to us with a slot: hello, then the accept.
+    let conn = w.q.incoming();
+    w.conns.insert(conn, addr);
+    s.queue_first = false;
+    w.seeders.insert(addr, s.clone());
+    let mut hello = s.hello.clone();
+    hello.misc2 = s.hello.misc2;
+    let a = w.q.packet(conn, wire(hello.to_hello().unwrap()), w.now);
+    w.run(a.into());
+    let a = w.q.packet(conn, wire(packets::accept_upload_req()), w.now);
+    w.run(a.into());
+    w.tick_until(10, World::completed);
+}
+
+#[test]
+fn sources_that_fail_are_dropped_for_a_while() {
+    let (_dir, d, h, q) = setup("q-dead");
+    let mut w = World::new(q);
+    let mut nofile = seeder_at(1, &d, &h, PartStatus::Complete);
+    nofile.no_file = true;
+    let a = nofile.endpoint();
+    let b = seeder_at(2, &d, &h, PartStatus::Complete).endpoint();
+    w.add_seeder(nofile);
+    w.unreachable.insert(SocketAddr::V4(b.addr));
+    w.add_source(h.ed2k, a);
+    w.add_source(h.ed2k, b);
+    w.tick();
+    let dropped: Vec<_> = w
+        .reports
+        .iter()
+        .filter_map(|r| match r {
+            Report::SourceDropped { addr, why, .. } => Some((*addr, why.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        dropped.contains(&(a.addr, "does not have the file".into())),
+        "{dropped:?}"
+    );
+    assert!(
+        dropped.contains(&(b.addr, "could not connect".into())),
+        "{dropped:?}"
+    );
+    assert_eq!(w.q.source_count(&h.ed2k), 0);
+    // Not taken back until the dead delay is over.
+    assert!(w.q.add_source(h.ed2k, b, Origin::Kad, w.now).is_empty());
+    let later = w.now + w.q.config().dead_delay + Duration::from_secs(1);
+    w.q.tick(later);
+    assert!(!w.q.add_source(h.ed2k, b, Origin::Kad, later).is_empty());
+}
+
+#[test]
+fn bad_and_duplicate_sources_are_refused() {
+    let (dir, _d, h, mut q) = setup("q-filter");
+    let now = Instant::now();
+    let ep = |a: [u8; 4], port| Endpoint::new(SocketAddrV4::new(Ipv4Addr::from(a), port));
+    assert!(q
+        .add_source(h.ed2k, ep([0, 0, 0, 0], 4662), Origin::Kad, now)
+        .is_empty());
+    assert!(q
+        .add_source(h.ed2k, ep([1, 2, 3, 4], 0), Origin::Kad, now)
+        .is_empty());
+    assert!(q
+        .add_source(h.ed2k, ep([224, 0, 0, 1], 4662), Origin::Kad, now)
+        .is_empty());
+    assert!(q
+        .add_source(Md4Hash([1; 16]), ep([1, 2, 3, 4], 4662), Origin::Kad, now)
+        .is_empty());
+    // Ourselves.
+    assert!(q
+        .add_source(h.ed2k, ep([10, 99, 0, 1], 4662), Origin::Kad, now)
+        .is_empty());
+    assert_eq!(
+        q.add_source(h.ed2k, ep([1, 2, 3, 4], 4662), Origin::Kad, now)
+            .len(),
+        1
+    );
+    assert!(q
+        .add_source(h.ed2k, ep([1, 2, 3, 4], 4662), Origin::Server, now)
+        .is_empty());
+    assert_eq!(q.source_count(&h.ed2k), 1);
+
+    // LAN addresses, when filtered.
+    let mut c = config(&dir);
+    c.filter_lan = true;
+    let mut q = DownloadQueue::new(c);
+    q.add_file(PartFile::create(&dir.temp(), "x", Md4Hash([5; 16]), 100).unwrap());
+    assert!(q
+        .add_source(
+            Md4Hash([5; 16]),
+            ep([192, 168, 1, 2], 4662),
+            Origin::Kad,
+            now
+        )
+        .is_empty());
+    assert!(q
+        .add_source(Md4Hash([5; 16]), ep([127, 0, 0, 1], 4662), Origin::Kad, now)
+        .is_empty());
+}
+
+#[test]
+fn connections_respect_the_limits() {
+    let (dir, _d, h, _) = setup("q-limits");
+    let mut c = config(&dir);
+    c.max_connections = 4;
+    c.max_new_per_tick = 3;
+    let mut q = DownloadQueue::new(c);
+    q.add_file(PartFile::create(&dir.temp(), "y", h.ed2k, SIZE).unwrap());
+    let now = Instant::now();
+    for i in 1..=10u8 {
+        let mut ep = Endpoint::new(SocketAddrV4::new(Ipv4Addr::new(20, 0, 0, i), 4662));
+        if i == 1 {
+            ep.user_hash = Some(Md4Hash([i; 16]));
+            ep.crypt = crypt::SUPPORTED;
+        }
+        q.add_source(h.ed2k, ep, Origin::Kad, now);
+    }
+    let connects = |a: &[Action]| {
+        a.iter()
+            .filter_map(|a| match a {
+                Action::Connect { obfuscate_for, .. } => Some(*obfuscate_for),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = connects(&q.tick(now));
+    assert_eq!(first.len(), 3);
+    // The one with a user hash that supports obfuscation gets it.
+    assert_eq!(first.iter().filter(|o| o.is_some()).count(), 1);
+    assert_eq!(connects(&q.tick(now + Duration::from_secs(1))).len(), 1);
+    assert!(connects(&q.tick(now + Duration::from_secs(2))).is_empty());
+    assert_eq!(q.stats().connections, 4);
+}
+
+#[test]
+fn a_corrupt_part_is_recovered_through_aich() {
+    let (_dir, d, h, mut q) = setup("q-aich");
+    q.file_mut(&h.ed2k).unwrap().set_trust_every_aich_hash(true);
+    let mut w = World::new(q);
+    // The first seeder has parts 0 and 1 and spoils one byte of part 0.
+    let first = seeder_at(1, &d, &h, parts(3, &[0, 1]));
+    first.corrupt.lock().unwrap().insert(5);
+    let fe = first.endpoint();
+    w.add_seeder(first);
+    w.add_source(h.ed2k, fe);
+    w.tick_until(20, |w| {
+        w.reports
+            .iter()
+            .any(|r| matches!(r, Report::AichRecovered { .. }))
+    });
+    assert!(w.reports.contains(&Report::PartCorrupt {
+        file: h.ed2k,
+        part: 0
+    }));
+    assert!(w.reports.contains(&Report::AichRecovered {
+        file: h.ed2k,
+        part: 0,
+        bytes: PARTSIZE - u64::from(EMBLOCKSIZE)
+    }));
+    // A second seeder has the last part; the bad block is fetched again.
+    let full = seeder_at(2, &d, &h, PartStatus::Complete);
+    let full_ep = full.endpoint();
+    w.add_seeder(full);
+    w.add_source(h.ed2k, full_ep);
+    w.tick_until(40, World::completed);
+    assert!(w.reports.contains(&Report::PartVerified {
+        file: h.ed2k,
+        part: 0
+    }));
+}
+
+// ---- over TCP ----
+
+/// Serve `seeder` on a local port until the test ends.
+async fn serve(seeder: Seeder, listener: tokio::net::TcpListener) {
+    use remule_net::{establish, Bandwidth, ConnConfig, Handshake, Priority};
+    let bw = Arc::new(Bandwidth::unlimited());
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let s = seeder.clone();
+        let cfg = ConnConfig::new(bw.clone());
+        tokio::spawn(async move {
+            let hs = Handshake::Incoming {
+                own_hash: s.hello.user_hash,
+                max_padding: 16,
+                require: false,
+            };
+            let Ok((mut r, mut w)) = establish(stream, hs, cfg).await else {
+                return;
+            };
+            while let Ok(Some(p)) = r.recv().await {
+                for reply in s.answer(p) {
+                    if w.send(&reply, Priority::Standard).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_downloader_fetches_a_file_over_tcp() {
+    use tokio::sync::mpsc;
+
+    use crate::downloader::{run, Command, DownloaderConfig};
+
+    let dir = TempDir::new("q-tcp");
+    let d = Arc::new(data(SIZE, 33));
+    let h = Arc::new(hashes(&d));
+
+    // Two seeders on 127.0.0.1: the first has part 0 and passes on the
+    // second, which has everything. The first is reached obfuscated.
+    let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (p1, p2) = (
+        l1.local_addr().unwrap().port(),
+        l2.local_addr().unwrap().port(),
+    );
+    let localhost = Ipv4Addr::LOCALHOST;
+    let mut s1 = Seeder::new(localhost, p1, d.clone(), h.clone(), parts(3, &[0]));
+    s1.hello.user_hash = Md4Hash([0x51; 16]);
+    let mut s2 = Seeder::new(localhost, p2, d.clone(), h.clone(), PartStatus::Complete);
+    s2.hello.user_hash = Md4Hash([0x52; 16]);
+    s1.exchange.push(ExchangedSource {
+        id: ip_id(localhost),
+        port: p2,
+        server: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+        user_hash: None,
+        crypt_options: Some(0),
+    });
+    let first = s1.endpoint();
+    tokio::spawn(serve(s1, l1));
+    tokio::spawn(serve(s2, l2));
+
+    let mut cfg = config(&dir);
+    cfg.ours.id = ip_id(Ipv4Addr::new(10, 99, 0, 1));
+    let queue = DownloadQueue::new(cfg);
+    let mut dl = DownloaderConfig::new(Arc::new(remule_net::Bandwidth::unlimited()));
+    dl.tick = Duration::from_millis(50);
+    dl.stop_when_done = true;
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+    let pf = PartFile::create(&dir.temp(), "test file.bin", h.ed2k, SIZE).unwrap();
+    cmd_tx.send(Command::AddFile(Box::new(pf))).unwrap();
+    cmd_tx
+        .send(Command::AddSources {
+            file: h.ed2k,
+            sources: vec![first],
+            origin: Origin::Manual,
+        })
+        .unwrap();
+
+    let queue = tokio::time::timeout(
+        Duration::from_secs(120),
+        run(queue, dl, None, cmd_rx, rep_tx),
+    )
+    .await
+    .expect("download timed out");
+    assert!(queue.all_done());
+    let mut reports = Vec::new();
+    while let Ok(r) = rep_rx.try_recv() {
+        reports.push(r);
+    }
+    assert!(reports.iter().any(|r| matches!(
+        r,
+        Report::SourceAdded {
+            origin: Origin::SourceExchange,
+            ..
+        }
+    )));
+    let path = dir.incoming().join("test file.bin");
+    assert!(reports.contains(&Report::Completed {
+        file: h.ed2k,
+        path: path.clone()
+    }));
+    assert_eq!(std::fs::read(path).unwrap(), *d);
+}

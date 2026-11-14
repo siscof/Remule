@@ -12,7 +12,7 @@ pub mod gap_list;
 pub mod part_file;
 
 pub use gap_list::GapList;
-pub use part_file::{Completion, FileEvent, OpenError, PartFile, SourceView, Status};
+pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, SourceView, Status};
 
 #[cfg(test)]
 mod tests;

@@ -6,6 +6,8 @@
 //! * [`part_status`]: the part bitmap of `OP_FILESTATUS` and file requests.
 //! * [`packets`]: file requests, hash sets, upload requests, block requests
 //!   and the data blocks themselves, built and parsed.
+//! * [`sources`]: source exchange (SX1 and SX2) answers, and when to ask.
+//! * [`secident`]: secure user identification between two clients.
 //!
 //! * [`download`]: downloading a file from one peer, as a state machine.
 //!
@@ -15,6 +17,8 @@ pub mod download;
 pub mod hello;
 pub mod packets;
 pub mod part_status;
+pub mod secident;
+pub mod sources;
 
 pub use hello::{Hello, MiscOptions1, MiscOptions2, MuleInfo};
 pub use packets::{BadPacket, Block, ParseContext, PeerPacket};
@@ -24,3 +28,5 @@ pub use part_status::PartStatus;
 mod tests;
 #[cfg(test)]
 mod tests_download;
+#[cfg(test)]
+mod tests_sx;

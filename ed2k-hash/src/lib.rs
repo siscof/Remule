@@ -15,6 +15,8 @@
 //! [`Hasher`] streams: feed it the file in any chunks, it never holds more
 //! than the running digests and the hash lists.
 
+pub mod aich;
+
 use std::fmt;
 use std::io::{self, Read};
 
@@ -264,3 +266,5 @@ impl fmt::Display for FileHashes {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_aich;

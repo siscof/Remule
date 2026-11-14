@@ -16,10 +16,12 @@ use std::ops::Range;
 use ed2k_codec::packet::CLIENT_UNPACK_LIMIT;
 use ed2k_codec::{LenField, Packet, Reader, StrEncoding, Writer};
 use ed2k_types::ed2k::client_tcp::{Extended, Standard};
+use ed2k_types::ed2k::SOURCEEXCHANGE2_VERSION;
 use ed2k_types::{AichHash, Md4Hash, Protocol};
 
 use crate::hello::{Hello, MuleInfo};
 use crate::part_status::PartStatus;
+use crate::secident::Need;
 
 /// A malformed packet from a peer. aMule drops the connection for these.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -227,8 +229,60 @@ pub enum PeerPacket {
         hash: Md4Hash,
         aich: AichHash,
     },
+    /// `OP_REQUESTSOURCES`: send me other sources of this file (SX1).
+    RequestSources(Md4Hash),
+    /// `OP_REQUESTSOURCES2`
+    RequestSources2 {
+        version: u8,
+        options: u16,
+        hash: Md4Hash,
+    },
+    /// `OP_ANSWERSOURCES`: the body is read with
+    /// [`sources::parse_answer`](crate::sources::parse_answer), which
+    /// needs the peer's SX1 version.
+    AnswerSources {
+        hash: Md4Hash,
+        body: Vec<u8>,
+    },
+    /// `OP_ANSWERSOURCES2`
+    AnswerSources2 {
+        version: u8,
+        hash: Md4Hash,
+        body: Vec<u8>,
+    },
+    /// `OP_SECIDENTSTATE`
+    SecIdentState {
+        need: Need,
+        challenge: u32,
+    },
+    /// `OP_PUBLICKEY`
+    PublicKey(Vec<u8>),
+    /// `OP_SIGNATURE`; `ip_kind` follows the signature in v2.
+    Signature {
+        signature: Vec<u8>,
+        ip_kind: Option<u8>,
+    },
+    /// `OP_AICHREQUEST`: recovery data for a part, under this root.
+    AichRequest {
+        hash: Md4Hash,
+        part: u16,
+        root: AichHash,
+    },
+    /// `OP_AICHANSWER`; `None` when the peer could not answer (a packet of
+    /// at most 16 bytes).
+    AichAnswer(Option<AichRecovery>),
     /// Anything else, for the caller to handle or ignore.
     Other(Packet),
+}
+
+/// The recovery data in an `OP_AICHANSWER`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AichRecovery {
+    pub hash: Md4Hash,
+    pub part: u16,
+    pub root: AichHash,
+    /// Read with `AichTree::read_recovery_data` (ed2k-hash).
+    pub data: Vec<u8>,
 }
 
 fn edonkey(op: Standard, payload: Vec<u8>) -> Packet {
@@ -487,6 +541,37 @@ pub fn multi_packet_answer(hash: Md4Hash, answers: &[MultiAnswer], unicode: bool
         }
     }
     emule(Extended::MultiPacketAnswer, w.into_bytes())
+}
+
+/// `OP_REQUESTSOURCES`
+pub fn request_sources(hash: Md4Hash) -> Packet {
+    emule(Extended::RequestSources, hash.0.to_vec())
+}
+
+/// `OP_REQUESTSOURCES2` at our version, without options.
+pub fn request_sources2(hash: Md4Hash) -> Packet {
+    let mut w = Writer::new();
+    w.u8(SOURCEEXCHANGE2_VERSION).u16(0).hash(hash);
+    emule(Extended::RequestSources2, w.into_bytes())
+}
+
+/// `OP_AICHREQUEST`
+pub fn aich_request(hash: Md4Hash, part: u16, root: AichHash) -> Packet {
+    let mut w = Writer::new();
+    w.hash(hash).u16(part).bytes(&root.0);
+    emule(Extended::AichRequest, w.into_bytes())
+}
+
+/// `OP_AICHANSWER` with recovery data.
+pub fn aich_answer(r: &AichRecovery) -> Packet {
+    let mut w = Writer::new();
+    w.hash(r.hash).u16(r.part).bytes(&r.root.0).bytes(&r.data);
+    emule(Extended::AichAnswer, w.into_bytes())
+}
+
+/// `OP_AICHANSWER` saying no: just the file hash.
+pub fn aich_answer_failed(hash: Md4Hash) -> Packet {
+    emule(Extended::AichAnswer, hash.0.to_vec())
 }
 
 /// `OP_AICHFILEHASHREQ`
@@ -764,6 +849,104 @@ impl PeerPacket {
                 PeerPacket::AichFileHashAns {
                     hash: r.hash().map_err(&io)?,
                     aich: read_aich(&mut r).map_err(&io)?,
+                }
+            }
+            Extended::RequestSources => {
+                if p.len() != 16 {
+                    return Err(BadPacket::new("source request", "invalid size"));
+                }
+                PeerPacket::RequestSources(exactly_hash("source request", p)?)
+            }
+            Extended::RequestSources2 => {
+                if p.len() != 19 {
+                    return Err(BadPacket::new("source request", "invalid size"));
+                }
+                let mut r = Reader::new(p);
+                let io = BadPacket::io("source request");
+                PeerPacket::RequestSources2 {
+                    version: r.u8().map_err(&io)?,
+                    options: r.u16().map_err(&io)?,
+                    hash: r.hash().map_err(&io)?,
+                }
+            }
+            Extended::AnswerSources => {
+                let hash = Reader::new(p)
+                    .hash()
+                    .map_err(BadPacket::io("source answer"))?;
+                PeerPacket::AnswerSources {
+                    hash,
+                    body: p[16..].to_vec(),
+                }
+            }
+            Extended::AnswerSources2 => {
+                let mut r = Reader::new(p);
+                let io = BadPacket::io("source answer");
+                let version = r.u8().map_err(&io)?;
+                let hash = r.hash().map_err(&io)?;
+                PeerPacket::AnswerSources2 {
+                    version,
+                    hash,
+                    body: p[17..].to_vec(),
+                }
+            }
+            // aMule ignores a malformed state, key or signature.
+            Extended::SecIdentState => {
+                match (p.len(), p.first().and_then(|&v| Need::from_value(v))) {
+                    (5, Some(need)) => PeerPacket::SecIdentState {
+                        need,
+                        challenge: u32::from_le_bytes([p[1], p[2], p[3], p[4]]),
+                    },
+                    _ => PeerPacket::Other(packet),
+                }
+            }
+            Extended::PublicKey => match p.split_first() {
+                Some((&n, key)) if usize::from(n) == key.len() && p.len() <= 250 => {
+                    PeerPacket::PublicKey(key.to_vec())
+                }
+                _ => PeerPacket::Other(packet),
+            },
+            Extended::Signature => match p.split_first() {
+                Some((&n, rest)) if p.len() <= 250 && usize::from(n) == rest.len() => {
+                    PeerPacket::Signature {
+                        signature: rest.to_vec(),
+                        ip_kind: None,
+                    }
+                }
+                Some((&n, rest)) if p.len() <= 250 && usize::from(n) + 1 == rest.len() => {
+                    PeerPacket::Signature {
+                        signature: rest[..rest.len() - 1].to_vec(),
+                        ip_kind: rest.last().copied(),
+                    }
+                }
+                _ => PeerPacket::Other(packet),
+            },
+            Extended::AichRequest => {
+                if p.len() != 16 + 2 + 20 {
+                    return Err(BadPacket::new("AICH request", "wrong size"));
+                }
+                let mut r = Reader::new(p);
+                let io = BadPacket::io("AICH request");
+                PeerPacket::AichRequest {
+                    hash: r.hash().map_err(&io)?,
+                    part: r.u16().map_err(&io)?,
+                    root: read_aich(&mut r).map_err(&io)?,
+                }
+            }
+            Extended::AichAnswer => {
+                if p.len() <= 16 {
+                    PeerPacket::AichAnswer(None)
+                } else {
+                    let mut r = Reader::new(p);
+                    let io = BadPacket::io("AICH answer");
+                    let hash = r.hash().map_err(&io)?;
+                    let part = r.u16().map_err(&io)?;
+                    let root = read_aich(&mut r).map_err(&io)?;
+                    PeerPacket::AichAnswer(Some(AichRecovery {
+                        hash,
+                        part,
+                        root,
+                        data: p[38..].to_vec(),
+                    }))
                 }
             }
             _ => PeerPacket::Other(packet),

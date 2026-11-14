@@ -26,16 +26,18 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use ed2k_codec::Packet;
-use ed2k_types::ed2k::{CONNECTION_TIMEOUT, DOWNLOADTIMEOUT};
+use ed2k_types::ed2k::{CONNECTION_TIMEOUT, DOWNLOADTIMEOUT, SOURCEEXCHANGE2_VERSION};
 use ed2k_types::{AichHash, Md4Hash};
 use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::hello::{EmuleInfo, Hello, MuleInfo};
 use crate::packets::{
-    self, Block, CompressedBlock, FileRequestExt, MultiAnswer, MultiRequest, ParseContext,
-    PeerPacket,
+    self, AichRecovery, Block, CompressedBlock, FileRequestExt, MultiAnswer, MultiRequest,
+    ParseContext, PeerPacket,
 };
 use crate::part_status::{ed2k_part_count, part_count, PartStatus};
+use crate::secident::{IdentConfig, IdentResult, Need, SecureIdent};
+use crate::sources::{self, ExchangedSource};
 
 /// Blocks asked for at once: one `OP_REQUESTPARTS` holds three.
 pub const PIPELINE: usize = 3;
@@ -68,6 +70,12 @@ pub trait PartFile {
     /// Store data (`WriteToBuffer`). `start..start + data.len()` lies inside
     /// a block reserved by this session.
     fn write(&mut self, start: u64, data: &[u8]);
+    /// Ask this peer for other sources with the file request. The download
+    /// queue decides, with
+    /// [`source_request_allowed`](crate::sources::source_request_allowed).
+    fn wants_sources(&self) -> bool {
+        false
+    }
 }
 
 /// `DS_*`, those a connected download goes through.
@@ -124,6 +132,21 @@ pub enum Event {
     /// The transfer ended: the peer ran out of slots for us, or stalled.
     DownloadStopped,
     AichFileHash(AichHash),
+    /// Sources were asked for with the file request (`SetLastAskedForSources`).
+    SourcesRequested,
+    /// Other sources of the file, from the peer (source exchange). They are
+    /// not filtered: bad and banned addresses are the application's.
+    Sources(Vec<ExchangedSource>),
+    /// A source answer that does not fit its version; aMule drops it.
+    SourcesRejected(String),
+    /// The peer's secure identification ended.
+    Identified(IdentResult),
+    /// Recovery data for the part asked with [`Session::request_aich`].
+    AichRecovery(AichRecovery),
+    /// The peer could not, or did not, send it.
+    AichRecoveryFailed {
+        part: u16,
+    },
     Closed(CloseReason),
     /// A packet this session does not handle (uploads, chat, sources, …).
     Unhandled(Box<PeerPacket>),
@@ -163,6 +186,12 @@ struct PeerCaps {
     ext_multi_packet: bool,
     aich: bool,
     large_files: bool,
+    /// Speaks the eMule protocol (`ExtProtocolAvailable`).
+    ext_protocol: bool,
+    source_exchange1: u8,
+    source_exchange2: bool,
+    /// Secure ident versions (`m_bySupportSecIdent`).
+    secure_ident: u8,
 }
 
 /// One connection to a peer, downloading one file.
@@ -180,6 +209,11 @@ pub struct Session {
     pending: Vec<Pending>,
     started: Instant,
     last_block: Instant,
+    ident: Option<SecureIdent>,
+    /// A state that came before [`Session::start_secure_ident`].
+    early_ident_state: Option<(Need, u32)>,
+    /// The AICH recovery asked for (`m_fAICHRequested`): part and root.
+    aich_request: Option<(u16, AichHash)>,
 }
 
 /// `IsLowID`
@@ -207,6 +241,9 @@ impl Session {
             pending: Vec::new(),
             started: now,
             last_block: now,
+            ident: None,
+            early_ident_state: None,
+            aich_request: None,
         }
     }
 
@@ -292,6 +329,10 @@ impl Session {
             ext_multi_packet: m2.ext_multi_packet,
             aich: m1.aich_version & 1 == 1,
             large_files: m2.large_files,
+            ext_protocol: hello.misc1.is_some() || hello.is_emule(),
+            source_exchange1: m1.source_exchange1_version,
+            source_exchange2: m2.source_exchange2,
+            secure_ident: m1.secure_ident,
         };
         out.events.push(Event::Handshake(Box::new(hello.clone())));
         self.peer = Some(hello);
@@ -299,9 +340,16 @@ impl Session {
 
     // --------------------------------------------------------- sending ---
 
-    /// `SendFileRequest`, without source exchange (row 8.4).
+    /// Whether the peer can be asked for sources (the protocol half of
+    /// `IsSourceRequestAllowed`).
+    fn can_exchange_sources(&self) -> bool {
+        self.caps.ext_protocol && (self.caps.source_exchange2 || self.caps.source_exchange1 > 1)
+    }
+
+    /// `SendFileRequest`
     fn send_file_request(&mut self, file: &dyn PartFile, out: &mut Output) {
         self.state = State::Connected;
+        let ask_sources = file.wants_sources() && self.can_exchange_sources();
         let ext = (self.caps.extended_requests > 0).then(|| FileRequestExt {
             parts: file.status(),
             complete_sources: (self.caps.extended_requests > 1).then(|| file.complete_sources()),
@@ -311,6 +359,16 @@ impl Session {
             let mut reqs = vec![MultiRequest::FileName(ext)];
             if several_parts {
                 reqs.push(MultiRequest::FileStatus);
+            }
+            if ask_sources {
+                reqs.push(if self.caps.source_exchange2 {
+                    MultiRequest::Sources2 {
+                        version: SOURCEEXCHANGE2_VERSION,
+                        options: 0,
+                    }
+                } else {
+                    MultiRequest::Sources
+                });
             }
             if self.caps.aich {
                 reqs.push(MultiRequest::AichFileHash);
@@ -323,10 +381,54 @@ impl Session {
             if several_parts {
                 out.send.push(packets::set_req_file_id(self.file));
             }
+            if ask_sources {
+                out.send.push(if self.caps.source_exchange2 {
+                    packets::request_sources2(self.file)
+                } else {
+                    packets::request_sources(self.file)
+                });
+            }
             if self.caps.aich {
                 out.send.push(packets::aich_file_hash_req(self.file));
             }
         }
+        if ask_sources {
+            out.events.push(Event::SourcesRequested);
+        }
+    }
+
+    /// Start secure identification (`InfoPacketsReceived`), once the
+    /// handshake is done and the application has looked up the peer's
+    /// credits. `challenge` should be random.
+    pub fn start_secure_ident(&mut self, cfg: IdentConfig, challenge: u32) -> Output {
+        let mut out = Output::default();
+        let mut ident = SecureIdent::new(cfg, self.caps.secure_ident);
+        out.send.extend(ident.start(challenge));
+        if let Some((need, ch)) = self.early_ident_state.take() {
+            out.send.extend(ident.on_state(need, ch));
+        }
+        self.ident = Some(ident);
+        out
+    }
+
+    /// `SendAICHRequest`: ask for the recovery data of `part` under `root`.
+    /// `None` if the peer does not do AICH or a request is pending.
+    pub fn request_aich(&mut self, part: u16, root: AichHash) -> Option<Packet> {
+        if !self.caps.aich || self.aich_request.is_some() || self.state == State::Closed {
+            return None;
+        }
+        self.aich_request = Some((part, root));
+        Some(packets::aich_request(self.file, part, root))
+    }
+
+    /// The AICH recovery asked for and not answered (`IsAICHReqPending`).
+    pub fn aich_pending(&self) -> Option<u16> {
+        self.aich_request.map(|(p, _)| p)
+    }
+
+    /// Whether the peer supports AICH (`IsSupportingAICH`).
+    pub fn peer_supports_aich(&self) -> bool {
+        self.caps.aich
     }
 
     fn send_hash_set_request(&mut self, out: &mut Output) {
@@ -476,6 +578,17 @@ impl Session {
                 answer,
             } => {
                 self.caps.extended_requests = info.extended_requests;
+                self.caps.ext_protocol = true;
+                self.caps.secure_ident = (info.features & 3) as u8;
+                self.caps.source_exchange1 = info.source_exchange;
+                if info.compression == 0 {
+                    self.caps.source_exchange1 = 0;
+                    self.caps.extended_requests = 0;
+                }
+                // Implied by old versions.
+                if info.version > 0x21 && info.version < 0x25 {
+                    self.caps.source_exchange1 = 1;
+                }
                 if !answer {
                     let reply = MuleInfo::Info(self.our_mule_info())
                         .to_packet(true)
@@ -544,9 +657,58 @@ impl Session {
                     self.stop_downloading(file, State::OnQueue, out);
                 }
             }
+            PeerPacket::AnswerSources { hash, body } if hash == self.file => {
+                self.sources(
+                    sources::parse_answer(&body, false, self.caps.source_exchange1),
+                    out,
+                );
+            }
+            PeerPacket::AnswerSources2 {
+                version,
+                hash,
+                body,
+            } if hash == self.file => {
+                self.sources(sources::parse_answer(&body, true, version), out);
+            }
+            PeerPacket::SecIdentState { need, challenge } => match &mut self.ident {
+                Some(ident) => out.send.extend(ident.on_state(need, challenge)),
+                None => self.early_ident_state = Some((need, challenge)),
+            },
+            PeerPacket::PublicKey(key) if self.ident.is_some() => {
+                let ident = self.ident.as_mut().unwrap();
+                out.send.extend(ident.on_public_key(key));
+            }
+            PeerPacket::Signature { signature, ip_kind } if self.ident.is_some() => {
+                let ident = self.ident.as_mut().unwrap();
+                if let Some(r) = ident.on_signature(&signature, ip_kind) {
+                    out.events.push(Event::Identified(r));
+                }
+            }
+            PeerPacket::AichAnswer(answer) => {
+                let Some((part, _)) = self.aich_request.take() else {
+                    return Err("unrequested AICH answer".into());
+                };
+                match answer {
+                    Some(r) if r.hash == self.file && r.part == part => {
+                        out.events.push(Event::AichRecovery(r))
+                    }
+                    _ => out.events.push(Event::AichRecoveryFailed { part }),
+                }
+            }
             p => out.events.push(Event::Unhandled(Box::new(p))),
         }
         Ok(())
+    }
+
+    fn sources(
+        &mut self,
+        parsed: Result<Vec<ExchangedSource>, sources::BadAnswer>,
+        out: &mut Output,
+    ) {
+        match parsed {
+            Ok(v) => out.events.push(Event::Sources(v)),
+            Err(e) => out.events.push(Event::SourcesRejected(e.0)),
+        }
     }
 
     /// `ProcessFileInfo`: a file of one part is complete at the peer.

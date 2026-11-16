@@ -49,6 +49,8 @@ cleanup() {
 trap cleanup EXIT
 
 dump_logs() {
+	echo "----- TCP sockets (Recv-Q / Send-Q) -----"
+	ss -tnpi 2>/dev/null | grep -A1 ":$REMULE_PORT" || true
 	echo "----- remule log -----"
 	cat "$WORK/remule.log" || true
 	echo "----- fake server -----"

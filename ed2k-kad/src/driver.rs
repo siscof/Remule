@@ -5,9 +5,10 @@
 use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
+use ed2k_codec::Tag;
 use ed2k_formats::nodes_dat::NodesDat;
 use ed2k_server::search::SearchParams;
-use ed2k_types::Md4Hash;
+use ed2k_types::{Md4Hash, UInt128};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
@@ -52,6 +53,18 @@ enum Command {
         oneshot::Sender<Result<(u32, String), SearchError>>,
     ),
     Sources(Md4Hash, u64, oneshot::Sender<Result<u32, SearchError>>),
+    StoreKeyword(
+        UInt128,
+        Vec<(UInt128, Vec<Tag>)>,
+        oneshot::Sender<Result<u32, SearchError>>,
+    ),
+    StoreSource(
+        Md4Hash,
+        u64,
+        Vec<Tag>,
+        oneshot::Sender<Result<u32, SearchError>>,
+    ),
+    StoreCounts(oneshot::Sender<(usize, usize)>),
     Bootstrap(SocketAddrV4),
     Snapshot(oneshot::Sender<Snapshot>),
     Nodes(oneshot::Sender<Option<NodesDat>>),
@@ -109,6 +122,36 @@ impl KadHandle {
         self.ask(|tx| Command::Sources(hash, size, tx))
             .await
             .unwrap_or(Err(SearchError::AlreadySearching))
+    }
+
+    /// Publish files under a keyword (see [`Kad::store_keyword`]).
+    pub async fn store_keyword(
+        &self,
+        target: UInt128,
+        files: Vec<(UInt128, Vec<Tag>)>,
+    ) -> Result<u32, SearchError> {
+        self.ask(|tx| Command::StoreKeyword(target, files, tx))
+            .await
+            .unwrap_or(Err(SearchError::AlreadySearching))
+    }
+
+    /// Publish ourselves as a source (see [`Kad::store_source`]).
+    pub async fn store_source(
+        &self,
+        hash: Md4Hash,
+        size: u64,
+        tags: Vec<Tag>,
+    ) -> Result<u32, SearchError> {
+        self.ask(|tx| Command::StoreSource(hash, size, tags, tx))
+            .await
+            .unwrap_or(Err(SearchError::AlreadySearching))
+    }
+
+    /// Keyword and source publishes running (see [`Kad::store_counts`]).
+    pub async fn store_counts(&self) -> (usize, usize) {
+        self.ask(Command::StoreCounts)
+            .await
+            .unwrap_or((usize::MAX, usize::MAX))
     }
 
     pub async fn bootstrap(&self, to: SocketAddrV4) {
@@ -211,6 +254,23 @@ async fn run(
                         }
                         Err(e) => { let _ = tx.send(Err(e)); }
                     },
+                    Command::StoreKeyword(target, files, tx) => match kad.store_keyword(target, files, t) {
+                        Ok((id, out)) => {
+                            send_all(&socket, out).await;
+                            let _ = tx.send(Ok(id));
+                        }
+                        Err(e) => { let _ = tx.send(Err(e)); }
+                    },
+                    Command::StoreSource(h, size, tags, tx) => match kad.store_source(h, size, tags, t) {
+                        Ok((id, out)) => {
+                            send_all(&socket, out).await;
+                            let _ = tx.send(Ok(id));
+                        }
+                        Err(e) => { let _ = tx.send(Err(e)); }
+                    },
+                    Command::StoreCounts(tx) => {
+                        let _ = tx.send(kad.store_counts());
+                    }
                     Command::Bootstrap(to) => {
                         let d = kad.bootstrap(to, t);
                         send_all(&socket, vec![d]).await;

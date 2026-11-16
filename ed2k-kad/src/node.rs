@@ -6,9 +6,10 @@
 //! requests, pings), keeps its routing table alive with the small timer
 //! (hello to the oldest contact of each bin every minute), the big timer
 //! (a random lookup in a thin zone every 10 s) and a lookup of its own ID,
-//! and runs keyword and source searches. It does not store or publish
-//! nothing yet, but it stores what others publish to it ([`crate::index`])
-//! when it is reachable, answers searches from that, and keeps flooders out
+//! runs keyword and source searches, and publishes: files under keywords
+//! and ourselves as a source ([`Kad::store_keyword`], [`Kad::store_source`]).
+//! It stores what others publish to it ([`crate::index`]) when it is
+//! reachable, answers searches from that, and keeps flooders out
 //! ([`crate::tracking`]).
 
 use std::collections::{BTreeMap, HashMap};
@@ -381,6 +382,27 @@ impl Kad {
                 &to,
                 now,
             ),
+            Action::PublishKey { to, files } => self.send_to_contact(
+                &KadPacket::PublishKeyReq {
+                    key: search_target,
+                    files: files
+                        .into_iter()
+                        .map(|(id, tags)| (id, tags.into_iter().map(SizedTag::new).collect()))
+                        .collect(),
+                },
+                &to,
+                now,
+            ),
+            Action::PublishSource { to, tags } => self.send_to_contact(
+                &KadPacket::PublishSourceReq {
+                    file: search_target,
+                    // Our user hash names us as the source.
+                    source: UInt128::from_be_bytes(self.cfg.user_hash.0),
+                    tags: tags.into_iter().map(SizedTag::new).collect(),
+                },
+                &to,
+                now,
+            ),
         }
     }
 
@@ -466,6 +488,47 @@ impl Kad {
             .ok_or(SearchError::AlreadySearching)
     }
 
+    /// `STOREKEYWORD`: publish files under a keyword (`keyword_target` of
+    /// the word). Each file is its ID and the tags a keyword search
+    /// returns ([`keyword_publish_tags`]).
+    pub fn store_keyword(
+        &mut self,
+        target: UInt128,
+        files: Vec<(UInt128, Vec<Tag>)>,
+        now: u64,
+    ) -> Result<(u32, Vec<Datagram>), SearchError> {
+        self.start(SearchKind::StoreKeyword { files }, target, now)
+            .ok_or(SearchError::AlreadySearching)
+    }
+
+    /// `STOREFILE`: publish ourselves as a source of a file, with these
+    /// source tags ([`source_publish_tags`]).
+    pub fn store_source(
+        &mut self,
+        hash: Md4Hash,
+        size: u64,
+        tags: Vec<Tag>,
+        now: u64,
+    ) -> Result<(u32, Vec<Datagram>), SearchError> {
+        let target = UInt128::from_be_bytes(hash.0);
+        self.start(SearchKind::StoreSource { tags, size }, target, now)
+            .ok_or(SearchError::AlreadySearching)
+    }
+
+    /// Publish searches running now, keyword and source
+    /// (`GetTotalStoreKey`, `GetTotalStoreSrc`).
+    pub fn store_counts(&self) -> (usize, usize) {
+        let mut k = (0, 0);
+        for s in self.searches.values() {
+            match s.kind {
+                SearchKind::StoreKeyword { .. } => k.0 += 1,
+                SearchKind::StoreSource { .. } => k.1 += 1,
+                _ => {}
+            }
+        }
+        k
+    }
+
     // ------------------------------------------------------------ timers
 
     /// Run the timers; call it about once a second.
@@ -512,10 +575,9 @@ impl Kad {
                 if done {
                     let s = self.searches.remove(&id).expect("present");
                     self.by_target.remove(&s.target);
-                    if matches!(
-                        s.kind,
-                        SearchKind::Keyword { .. } | SearchKind::Source { .. }
-                    ) {
+                    // Lookups and publishes report how they went; for a
+                    // publish, answers are the nodes that took it.
+                    if !matches!(s.kind, SearchKind::Node | SearchKind::NodeComplete) {
                         out.events.push(Event::SearchDone {
                             search: id,
                             answers: s.answers,
@@ -875,10 +937,58 @@ impl Kad {
                     self.publish_res(file, load, from, sender_key, now, out);
                 }
             }
-            // We publish nothing yet.
-            KadPacket::PublishRes { .. } | KadPacket::PublishResAck | KadPacket::Other { .. } => {}
+            // A node took one of our publishes.
+            KadPacket::PublishRes { target, .. } => {
+                if let Some(id) = self.by_target.get(&target).copied() {
+                    if let Some(s) = self.searches.get_mut(&id) {
+                        s.publish_answered();
+                    }
+                }
+            }
+            KadPacket::PublishResAck | KadPacket::Other { .. } => {}
         }
     }
+}
+
+/// `PreparePacketForTags`: what a keyword publish says of a file. Archives
+/// and disc images are published as programs.
+pub fn keyword_publish_tags(name: &str, size: u64, complete_sources: u32) -> Vec<Tag> {
+    use ed2k_types::tags::{kad as t, FileType};
+    let mut tags = vec![
+        Tag::new(
+            TagName::Str(t::FILENAME.to_vec()),
+            TagValue::String(name.into()),
+        ),
+        int_tag(t::FILESIZE, size),
+        int_tag(t::SOURCES, u64::from(complete_sources)),
+    ];
+    if let Some(ft) = FileType::of_name(name) {
+        tags.push(Tag::new(
+            TagName::Str(t::FILETYPE.to_vec()),
+            TagValue::String(ft.published().as_str().into()),
+        ));
+    }
+    tags
+}
+
+/// The source tags of a `STOREFILE` for a client that can be reached
+/// directly (type 1, or 4 for a file over 4 GB), on `tcp_port`, with our
+/// obfuscation flags. Firewalled clients publish through a buddy, which is
+/// not ported.
+pub fn source_publish_tags(size: u64, tcp_port: u16, crypt_options: u8) -> Vec<Tag> {
+    use ed2k_types::tags::kad as t;
+    let large = size > u64::from(u32::MAX);
+    vec![
+        Tag::new(
+            TagName::Str(t::SOURCETYPE.to_vec()),
+            TagValue::U8(if large { 4 } else { 1 }),
+        ),
+        int_tag(t::SOURCEPORT, u64::from(tcp_port)),
+        Tag::new(
+            TagName::Str(t::ENCRYPTION.to_vec()),
+            TagValue::U8(crypt_options),
+        ),
+    ]
 }
 
 fn int_tag(name: &[u8], v: u64) -> Tag {

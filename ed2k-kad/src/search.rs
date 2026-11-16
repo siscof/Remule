@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
 
-use ed2k_codec::Tag;
+use ed2k_codec::{Tag, TagName, TagValue};
 use ed2k_types::kad::FindType;
 use ed2k_types::tags::kad as tag;
 use ed2k_types::{Md4Hash, UInt128};
@@ -32,9 +32,16 @@ pub const NODECOMP_LIFETIME: u64 = 10;
 pub const NODECOMP_TOTAL: u32 = 10;
 /// `SEARCHKEYWORD_TOTAL` / `SEARCHFILE_TOTAL`
 pub const RESULTS_TOTAL: u32 = 300;
+/// `SEARCHSTOREFILE_LIFETIME`, `SEARCHSTOREKEYWORD_LIFETIME`: seconds.
+pub const STORE_LIFETIME: u64 = 140;
+/// `SEARCHSTOREFILE_TOTAL`, `SEARCHSTOREKEYWORD_TOTAL`: nodes that took a publish.
+pub const STORE_TOTAL: u32 = 10;
+/// Files per keyword publish, and per packet.
+pub const STORE_KEYWORD_FILES: usize = 150;
+pub const STORE_KEYWORD_PER_PACKET: usize = 50;
 
 /// What is being looked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SearchKind {
     /// `NODE`: a routing lookup; it ends with the first answer.
     Node,
@@ -44,6 +51,11 @@ pub enum SearchKind {
     Keyword { terms: Vec<u8> },
     /// Sources of a file of this size.
     Source { size: u64 },
+    /// `STOREKEYWORD`: publish these files (ID and tags) under the keyword.
+    StoreKeyword { files: Vec<(UInt128, Vec<Tag>)> },
+    /// `STOREFILE`: publish ourselves as a source of the file. `tags` are
+    /// the source tags; the file size is added for nodes of version 2 on.
+    StoreSource { tags: Vec<Tag>, size: u64 },
 }
 
 impl SearchKind {
@@ -51,6 +63,25 @@ impl SearchKind {
         match self {
             SearchKind::Node | SearchKind::NodeComplete => FindType::FindNode.into(),
             SearchKind::Keyword { .. } | SearchKind::Source { .. } => FindType::FindValue.into(),
+            SearchKind::StoreKeyword { .. } | SearchKind::StoreSource { .. } => {
+                FindType::Store.into()
+            }
+        }
+    }
+
+    fn is_store(&self) -> bool {
+        matches!(
+            self,
+            SearchKind::StoreKeyword { .. } | SearchKind::StoreSource { .. }
+        )
+    }
+
+    /// `SEARCH*_LIFETIME`
+    fn lifetime(&self) -> u64 {
+        if self.is_store() {
+            STORE_LIFETIME
+        } else {
+            LIFETIME
         }
     }
 }
@@ -64,6 +95,13 @@ pub enum Action {
     SearchKey { to: Contact, terms: Vec<u8> },
     /// `KADEMLIA2_SEARCH_SOURCE_REQ`
     SearchSource { to: Contact, size: u64 },
+    /// `KADEMLIA2_PUBLISH_KEY_REQ` with up to 50 files.
+    PublishKey {
+        to: Contact,
+        files: Vec<(UInt128, Vec<Tag>)>,
+    },
+    /// `KADEMLIA2_PUBLISH_SOURCE_REQ`
+    PublishSource { to: Contact, tags: Vec<Tag> },
 }
 
 /// A file found by a keyword search (`ProcessResultKeyword`).
@@ -202,7 +240,7 @@ impl Search {
     /// `PrepareToStop`: no more requests; the search ends 15 s from `now`.
     pub fn stop_at(&mut self, now: u64) {
         if !self.stopping {
-            self.created = (now + 15).saturating_sub(LIFETIME);
+            self.created = (now + 15).saturating_sub(self.kind.lifetime());
             self.stopping = true;
         }
     }
@@ -210,7 +248,7 @@ impl Search {
     /// `CSearchManager::JumpStart` for this search: whether it is over,
     /// and what to send.
     pub fn tick(&mut self, now: u64) -> (bool, Vec<Action>) {
-        let age_end = self.created + LIFETIME;
+        let age_end = self.created + self.kind.lifetime();
         match self.kind {
             SearchKind::Node => {
                 if age_end < now {
@@ -229,6 +267,15 @@ impl Search {
                     return (true, Vec::new());
                 }
                 if self.answers > RESULTS_TOTAL || age_end - 20 < now {
+                    self.stop_at(now);
+                    return (false, Vec::new());
+                }
+            }
+            SearchKind::StoreKeyword { .. } | SearchKind::StoreSource { .. } => {
+                if age_end < now {
+                    return (true, Vec::new());
+                }
+                if self.answers > STORE_TOTAL || age_end - 20 < now {
                     self.stop_at(now);
                     return (false, Vec::new());
                 }
@@ -292,6 +339,9 @@ impl Search {
         if d.chunk(0) > SEARCH_TOLERANCE && !is_lan_ip(from.ip) {
             return None;
         }
+        if self.kind.is_store() {
+            return self.store_to(from);
+        }
         // Kad1 nodes (before version 3) are not asked.
         if from.version < 3 {
             return None;
@@ -309,6 +359,58 @@ impl Search {
         };
         self.requests += 1;
         Some(a)
+    }
+
+    /// `StorePacket` for the store kinds: publish to a close node, until
+    /// enough took it.
+    fn store_to(&mut self, from: &Contact) -> Option<Action> {
+        if self.answers > STORE_TOTAL {
+            return None;
+        }
+        // Kad2 publishing needs version 2.
+        if from.version < 2 {
+            return None;
+        }
+        let a = match &self.kind {
+            SearchKind::StoreKeyword { files } => {
+                if files.is_empty() {
+                    return None;
+                }
+                let files: Vec<_> = files
+                    .iter()
+                    .take(STORE_KEYWORD_FILES)
+                    .take(STORE_KEYWORD_PER_PACKET)
+                    .cloned()
+                    .collect();
+                Action::PublishKey {
+                    to: from.clone(),
+                    files,
+                }
+            }
+            SearchKind::StoreSource { tags, size } => {
+                let mut tags = tags.clone();
+                if from.version >= 2 {
+                    tags.push(Tag::new(
+                        TagName::Str(tag::FILESIZE.to_vec()),
+                        TagValue::int(*size),
+                    ));
+                }
+                Action::PublishSource {
+                    to: from.clone(),
+                    tags,
+                }
+            }
+            _ => return None,
+        };
+        self.requests += 1;
+        Some(a)
+    }
+
+    /// A node answered a publish (`ProcessPublishResult`).
+    pub fn publish_answered(&mut self) {
+        if self.kind.is_store() {
+            self.answers += 1;
+        }
     }
 
     /// `ProcessResponse`: contacts from a `KADEMLIA2_RES` for this target.

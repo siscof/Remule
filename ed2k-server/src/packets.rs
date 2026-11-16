@@ -149,6 +149,115 @@ pub fn callback_request(id: u32) -> Packet {
     edonkey(Opcode::CallbackRequest, id.to_le_bytes().to_vec())
 }
 
+/// A file to offer to the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedFile {
+    pub hash: Md4Hash,
+    pub name: String,
+    pub size: u64,
+    /// Complete here, or a download we share parts of.
+    pub complete: bool,
+    /// By extension (`GetED2KFileTypeID`); archives and disc images are
+    /// offered as programs.
+    pub file_type: Option<ed2k_types::tags::FileType>,
+}
+
+/// `FILE_COMPLETE_ID` / `_PORT`, `FILE_INCOMPLETE_ID` / `_PORT`: what a
+/// server that compresses takes instead of our address.
+const COMPLETE: (u32, u16) = (0xFBFB_FBFB, 0xFBFB);
+const INCOMPLETE: (u32, u16) = (0xFCFC_FCFC, 0xFCFC);
+
+/// `LegacyPacketLimit`: files per `OP_OFFERFILES`, at most 200, under the
+/// server's soft limit and below its hard one (0: not known).
+pub fn offer_limit(soft: u32, hard: u32) -> u32 {
+    let limit = if soft != 0 { soft.min(200) } else { 200 };
+    if hard != 0 {
+        limit.min(hard - 1)
+    } else {
+        limit
+    }
+}
+
+/// `OP_OFFERFILES` (`SendListToServer`, `CreateOfferedFilePacket`): the
+/// files, in the server's dialect (`tcp_flags`). A server that compresses
+/// gets the complete / incomplete markers, others our ID and port, or zero
+/// for a LowID. A file over 4 GB is left out for a server without
+/// large-file support. Packed when the server compresses and it helps.
+pub fn offer_files(files: &[OfferedFile], tcp_flags: u32, our_id: u32, our_port: u16) -> Packet {
+    use ed2k_types::ed2k::server_tcp::flags;
+    use ed2k_types::tags::FileTag;
+    let compression = tcp_flags & flags::COMPRESSION != 0;
+    let large_ok = tcp_flags & flags::LARGEFILES != 0;
+    let new_tags = tcp_flags & flags::NEWTAGS != 0;
+    let unicode = tcp_flags & flags::UNICODE != 0;
+    let int_type = tcp_flags & flags::TYPETAGINTEGER != 0;
+    let enc = if unicode {
+        ed2k_codec::StrEncoding::Utf8
+    } else {
+        ed2k_codec::StrEncoding::Latin1
+    };
+    let id = |t: FileTag| ed2k_codec::TagName::Id(t.value());
+    let mut w = Writer::new();
+    w.u32(0);
+    let mut count = 0u32;
+    for f in files {
+        let large = f.size > u32::MAX as u64;
+        if large && !large_ok {
+            continue;
+        }
+        let (cid, cport) = if compression {
+            if f.complete {
+                COMPLETE
+            } else {
+                INCOMPLETE
+            }
+        } else if our_id >= 0x0100_0000 {
+            (our_id, our_port)
+        } else {
+            (0, 0)
+        };
+        w.hash(f.hash).u32(cid).u16(cport);
+        let mut tags = vec![Tag::new(
+            id(FileTag::Filename),
+            TagValue::String(f.name.clone()),
+        )];
+        tags.push(Tag::new(
+            id(FileTag::Filesize),
+            TagValue::U32(f.size as u32),
+        ));
+        if large {
+            tags.push(Tag::new(
+                id(FileTag::FilesizeHi),
+                TagValue::U32((f.size >> 32) as u32),
+            ));
+        }
+        if let Some(t) = f.file_type.map(|t| t.published()) {
+            tags.push(if int_type {
+                Tag::new(id(FileTag::Filetype), TagValue::U32(t.id()))
+            } else {
+                Tag::new(id(FileTag::Filetype), TagValue::String(t.as_str().into()))
+            });
+        }
+        w.u32(tags.len() as u32);
+        for t in &tags {
+            let ok = if new_tags {
+                t.write_ed2k(&mut w, enc)
+            } else {
+                t.write_kad(&mut w)
+            };
+            ok.expect("offer tags are writable");
+        }
+        count += 1;
+    }
+    let mut bytes = w.into_bytes();
+    bytes[..4].copy_from_slice(&count.to_le_bytes());
+    let mut p = edonkey(Opcode::OfferFiles, bytes);
+    if compression {
+        p.pack();
+    }
+    p
+}
+
 /// `OP_OFFERFILES` with no files.
 pub fn offer_no_files() -> Packet {
     edonkey(Opcode::OfferFiles, 0u32.to_le_bytes().to_vec())

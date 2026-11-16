@@ -527,3 +527,115 @@ fn a_published_keyword_is_found_by_another_node() {
     assert_eq!(k.publish_info, (1 << 24) | (1 << 16) | 1000);
     assert!(net.nodes[39].stats.searches_answered >= 1);
 }
+
+/// The store searches: node 5 publishes a file under a keyword and itself
+/// as its source through real lookups; node 0 then finds both.
+#[test]
+fn store_searches_publish_keywords_and_sources() {
+    use crate::node::{keyword_publish_tags, source_publish_tags};
+    use ed2k_types::Md4Hash;
+
+    let mut rng = StdRng::seed_from_u64(11);
+    let target = keyword_target("remule");
+    let file_hash = Md4Hash([0x42; 16]);
+    let file = UInt128::from_be_bytes(file_hash.0);
+    let mut ids: Vec<UInt128> = (0..40).map(|_| UInt128::new(rng.gen())).collect();
+    // Nodes close to the keyword and to the file.
+    ids[39] = target ^ UInt128::new(99);
+    ids[38] = file ^ UInt128::new(77);
+    let mut net = Net::new(&ids, &mut rng);
+    for a in 0..net.nodes.len() {
+        for _ in 0..8 {
+            let b = rng.gen_range(0..ids.len());
+            if a == b {
+                continue;
+            }
+            let addr = net.addrs[b];
+            let mut v = true;
+            net.nodes[a].routing.add(
+                ids[b],
+                u32::from(*addr.ip()),
+                addr.port(),
+                4662,
+                8,
+                Default::default(),
+                &mut v,
+                false,
+                false,
+                1000,
+            );
+        }
+    }
+    net.run(200);
+    let now = net.now;
+    let size = 123_456;
+    let (kw_id, out) = net.nodes[5]
+        .store_keyword(
+            target,
+            vec![(file, keyword_publish_tags("remule-0.1.tar.gz", size, 1))],
+            now,
+        )
+        .unwrap();
+    net.post(5, out);
+    let (src_id, out) = net.nodes[5]
+        .store_source(file_hash, size, source_publish_tags(size, 4662, 1), now)
+        .unwrap();
+    net.post(5, out);
+    assert_eq!(net.nodes[5].store_counts(), (1, 1));
+    // The same target cannot be published twice at once.
+    assert!(net.nodes[5].store_keyword(target, vec![], now).is_err());
+    let mut events = net.deliver();
+    events.extend(net.run(200));
+    assert!(net.nodes[39].index.stats().keywords >= 1);
+    assert!(net.nodes[38].index.stats().sources >= 1);
+    // Both publishes ended, counting the nodes that took them.
+    for id in [kw_id, src_id] {
+        let done = events.iter().find_map(|(n, e)| match e {
+            Event::SearchDone {
+                search, answers, ..
+            } if *n == 5 && *search == id => Some(*answers),
+            _ => None,
+        });
+        assert!(done.is_some_and(|a| a >= 1), "publish {id}: {done:?}");
+    }
+    assert_eq!(net.nodes[5].store_counts(), (0, 0));
+
+    // Node 0 finds the file by keyword, then node 5 as its source.
+    let now = net.now;
+    let (sid, _, out) = net.nodes[0]
+        .search_keyword(&SearchParams::new("remule"), now)
+        .unwrap();
+    net.post(0, out);
+    let mut events = net.deliver();
+    events.extend(net.run(60));
+    let found = events.iter().find_map(|(n, e)| match e {
+        Event::Found {
+            search,
+            found: Found::Keyword(k),
+        } if *n == 0 && *search == sid => Some(k.clone()),
+        _ => None,
+    });
+    let k = found.expect("keyword result");
+    // Archives are published as programs.
+    assert_eq!(
+        (k.name.as_str(), k.size, k.file_type.as_str()),
+        ("remule-0.1.tar.gz", size, "Pro")
+    );
+
+    let (sid, out) = net.nodes[0]
+        .search_sources(file_hash, size, net.now)
+        .unwrap();
+    net.post(0, out);
+    let mut events = net.deliver();
+    events.extend(net.run(60));
+    let src = events.iter().find_map(|(n, e)| match e {
+        Event::Found {
+            search,
+            found: Found::Source(s),
+        } if *n == 0 && *search == sid => Some(s.clone()),
+        _ => None,
+    });
+    let s = src.expect("source result");
+    assert_eq!((s.source_type, s.tcp_port, s.crypt_options), (1, 4662, 1));
+    assert_eq!(u32::from(s.ip), u32::from(*net.addrs[5].ip()));
+}

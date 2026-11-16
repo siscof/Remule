@@ -12,6 +12,7 @@
 //!   (`CSharedFileList`, `CKnownFileList`).
 //! * [`upload_queue`]: who gets an upload slot (`CUploadQueue`), without IO.
 //! * [`credits`]: upload and download credits, `clients.met`.
+//! * [`publish`]: what to offer to the server and publish on Kad, and when.
 //! * [`downloader`]: the queue on tokio, with peer connections on
 //!   `remule-net`.
 
@@ -21,6 +22,7 @@ pub mod download_queue;
 pub mod downloader;
 pub mod gap_list;
 pub mod part_file;
+pub mod publish;
 pub mod shared;
 pub mod upload_queue;
 
@@ -31,6 +33,8 @@ pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, Sour
 mod tests;
 #[cfg(test)]
 mod tests_part_file;
+#[cfg(test)]
+mod tests_publish;
 #[cfg(test)]
 mod tests_queue;
 #[cfg(test)]

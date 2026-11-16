@@ -20,7 +20,7 @@ set -euo pipefail
 
 REMULE=$(realpath "${REMULE:-target/release/remule}")
 SIZE=${SIZE:-24000000}
-TIMEOUT=${TIMEOUT:-300}
+TIMEOUT=${TIMEOUT:-180}
 REMULE_PORT=4663
 AMULE_PORT=4662
 EC_PORT=4712
@@ -88,6 +88,16 @@ Autoconnect=0
 Reconnect=0
 IPFilterAutoLoad=0
 UPnPEnabled=0
+VerboseDebug=1
+VerboseDebugLogfile=1
+[Debug]
+Cat_ED2k Client=1
+Cat_Local Client Protocol=1
+Cat_Remote Client Protocol=1
+Cat_DownloadQueue=1
+Cat_PartFiles=1
+Cat_ListenSocket=1
+Cat_IPFilter=1
 [ExternalConnect]
 AcceptExternalConnections=1
 ECAddress=127.0.0.1
@@ -128,7 +138,7 @@ while :; do
 		exit 1
 	fi
 	if [ $(((now - start) % 15)) -eq 0 ]; then
-		cmd "show dl" | grep -i "$NAME" || true
+		cmd "show dl" | grep -iA1 "$NAME" || true
 	fi
 	sleep 1
 done

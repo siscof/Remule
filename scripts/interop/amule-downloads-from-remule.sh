@@ -174,6 +174,8 @@ while :; do
 	fi
 	if [ $(((now - start) % 15)) -eq 0 ]; then
 		cmd "show dl" | grep -iA1 "$NAME" || true
+		# Bytes waiting in each socket of the peer connection.
+		ss -tn "( sport = :$REMULE_PORT or dport = :$REMULE_PORT )" 2>/dev/null | sed 's/^/    /' || true
 	fi
 	sleep 1
 done

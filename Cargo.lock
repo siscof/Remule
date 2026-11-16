@@ -3220,6 +3220,7 @@ name = "remule-core"
 version = "0.1.0"
 dependencies = [
  "ed2k-codec",
+ "ed2k-crypto",
  "ed2k-formats",
  "ed2k-hash",
  "ed2k-kad",

@@ -328,3 +328,44 @@ impl SharedFiles {
         Ok(())
     }
 }
+
+impl SharedFiles {
+    /// What the upload session needs to know about a shared file.
+    pub fn shared_info(&self, hash: &Md4Hash) -> Option<ed2k_peer::upload::SharedInfo> {
+        let (f, _) = self.get(hash)?;
+        Some(ed2k_peer::upload::SharedInfo {
+            hash: f.hash,
+            name: f.name.clone(),
+            size: f.size,
+            part_hashes: f.part_hashes.clone(),
+            parts: ed2k_peer::PartStatus::Complete,
+            aich_root: f.aich_hash.as_deref().and_then(|s| s.parse().ok()),
+        })
+    }
+
+    /// Read `range` of a shared file, for an upload (`CUploadDiskIOThread`).
+    /// Blocking.
+    pub fn read_block(&self, hash: &Md4Hash, range: std::ops::Range<u64>) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Some((f, path)) = self.get(hash) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "not shared"));
+        };
+        if range.start > range.end || range.end > f.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "outside the file",
+            ));
+        }
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(range.start))?;
+        let mut buf = vec![0u8; (range.end - range.start) as usize];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl ed2k_peer::upload::Shares for SharedFiles {
+    fn shared(&self, hash: &Md4Hash) -> Option<ed2k_peer::upload::SharedInfo> {
+        self.shared_info(hash)
+    }
+}

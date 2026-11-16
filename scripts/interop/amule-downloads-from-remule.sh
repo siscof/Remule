@@ -26,7 +26,10 @@ SIZE=${SIZE:-24000000}
 TIMEOUT=${TIMEOUT:-180}
 REMULE_PORT=4663
 AMULE_PORT=4662
-SERVER_PORT=4661
+# Not 4661: aMule pings a server's UDP port at TCP + 4, and 4665 is aMule's
+# own server UDP socket (its TCP port + 3). Pinging itself, aMule logs
+# "Unknown Server UDP opcode 96" and stops reading the peer connection.
+SERVER_PORT=4242
 HERE=$(dirname "$(realpath "$0")")
 EC_PORT=4712
 EC_PASS=interop

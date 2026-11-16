@@ -53,7 +53,13 @@ jobs:
   # MIGRATION_PLAN.md 9.M: a stock aMule (Ubuntu's package) downloads a
   # file that remule shares.
   amule-interop:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two builds of stock aMule 2.3.3: Ubuntu 24.04's (wxWidgets 3.2,
+        # Boost.Asio sockets) and 22.04's.
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

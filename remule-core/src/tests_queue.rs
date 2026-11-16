@@ -675,3 +675,129 @@ fn a_peer_with_two_files_gets_one_connection() {
     assert_eq!(connects(q.tick(now)), 1);
     assert_eq!(connects(q.tick(now + Duration::from_secs(1))), 0);
 }
+
+/// Two remule clients over TCP: one shares a file from disk, the other
+/// downloads it from the first. Uploads, the upload queue and secure
+/// ident on one side, the download queue on the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_remule_downloads_from_another() {
+    use std::sync::Mutex;
+
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use tokio::sync::mpsc;
+
+    use crate::downloader::{run, run_with, Command, DownloaderConfig};
+    use crate::shared::{mtime, ScanOptions, SharedFiles};
+    use crate::upload_queue::{UploadConfig, UploadQueue};
+    use crate::uploader::Uploader;
+
+    let dir = TempDir::new("q-share");
+    let content = data(SIZE, 55);
+    let share_dir = dir.0.join("share");
+    std::fs::create_dir_all(&share_dir).unwrap();
+    std::fs::write(share_dir.join("shared.bin"), &content).unwrap();
+
+    // The sharing client.
+    let mut shares = SharedFiles::load(&dir.0.join("config-a")).unwrap();
+    let r = shares.scan(
+        &ScanOptions {
+            dirs: vec![share_dir.clone()],
+            ..Default::default()
+        },
+        1,
+    );
+    for p in &r.to_hash {
+        let h = SharedFiles::hash(p).unwrap();
+        shares.add_hashed(p, &h, mtime(&std::fs::metadata(p).unwrap()), 1);
+    }
+    let h = hashes(&content);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut a_hello = Hello::amule(
+        Md4Hash([0xA1; 16]),
+        ip_id(Ipv4Addr::LOCALHOST),
+        port,
+        "sharer",
+    );
+    a_hello.misc2 = Some(MiscOptions2::amule(0, CryptSettings::default()));
+    let ck = ed2k_formats::cryptkey_dat::CryptKey::generate(&mut StdRng::seed_from_u64(1)).unwrap();
+    let identity = Arc::new(ed2k_peer::secident::Identity {
+        key: ck.private_key().unwrap(),
+        public: ck.public_key().unwrap(),
+    });
+    let uploader = Uploader::new(
+        a_hello.clone(),
+        Some(identity),
+        Arc::new(Mutex::new(shares)),
+        UploadQueue::new(UploadConfig::default()),
+        Some(crate::credits::Credits::load(&dir.0.join("config-a"), 1).unwrap()),
+    );
+    let mut a_cfg = QueueConfig::new(a_hello, dir.0.join("incoming-a"));
+    a_cfg.filter_lan = false;
+    let mut a_dl = DownloaderConfig::new(Arc::new(remule_net::Bandwidth::unlimited()));
+    a_dl.tick = Duration::from_millis(50);
+    let (a_cmd, a_cmd_rx) = mpsc::unbounded_channel();
+    let (a_rep, mut a_reports) = mpsc::unbounded_channel();
+    let sharer = tokio::spawn(run_with(
+        DownloadQueue::new(a_cfg),
+        Some(uploader),
+        a_dl,
+        Some(listener),
+        a_cmd_rx,
+        a_rep,
+    ));
+
+    // The downloading client.
+    let mut cfg = config(&dir);
+    cfg.ours.id = ip_id(Ipv4Addr::new(10, 99, 0, 1));
+    let mut dl = DownloaderConfig::new(Arc::new(remule_net::Bandwidth::unlimited()));
+    dl.tick = Duration::from_millis(50);
+    dl.stop_when_done = true;
+    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (rep, mut reports) = mpsc::unbounded_channel();
+    let pf = PartFile::create(&dir.temp(), "shared.bin", h.ed2k, SIZE).unwrap();
+    cmd.send(Command::AddFile(Box::new(pf))).unwrap();
+    cmd.send(Command::AddSources {
+        file: h.ed2k,
+        sources: vec![Endpoint::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))],
+        origin: Origin::Manual,
+    })
+    .unwrap();
+    let queue = tokio::time::timeout(
+        Duration::from_secs(120),
+        run(DownloadQueue::new(cfg), dl, None, cmd_rx, rep),
+    )
+    .await
+    .expect("download timed out");
+    assert!(queue.all_done());
+    let path = dir.incoming().join("shared.bin");
+    let mut got = Vec::new();
+    while let Ok(r) = reports.try_recv() {
+        got.push(r);
+    }
+    assert!(got.contains(&Report::Completed {
+        file: h.ed2k,
+        path: path.clone()
+    }));
+    assert_eq!(std::fs::read(path).unwrap(), content);
+
+    // The sharer gave a slot, and keeps the credit in clients.met.
+    a_cmd.send(Command::Shutdown).unwrap();
+    let (_, up) = sharer.await.unwrap();
+    let up = up.unwrap();
+    assert!(up.sent_total() >= SIZE, "{}", up.sent_total());
+    let mut started = false;
+    while let Ok(r) = a_reports.try_recv() {
+        started |= matches!(r, Report::UploadStarted { file, .. } if file == h.ed2k);
+    }
+    assert!(started);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let credits = crate::credits::Credits::load(&dir.0.join("config-a"), now).unwrap();
+    assert!(credits
+        .get(&Md4Hash([0x77; 16]))
+        .is_some_and(|c| c.uploaded >= SIZE));
+}

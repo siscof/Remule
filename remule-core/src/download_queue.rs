@@ -230,6 +230,11 @@ pub enum Report {
         file: Md4Hash,
         error: String,
     },
+    /// A peer got an upload slot for a file of ours.
+    UploadStarted {
+        user: Md4Hash,
+        file: Md4Hash,
+    },
 }
 
 /// Where a source stands (`EDownloadState`, simplified).
@@ -774,6 +779,32 @@ impl DownloadQueue {
             }
         }
         out
+    }
+
+    /// Whether `conn` is an incoming connection not yet matched to a source.
+    pub fn is_unmatched_incoming(&self, conn: ConnId) -> bool {
+        self.conns
+            .get(&conn)
+            .is_some_and(|c| c.source.is_none() && c.session.is_none())
+    }
+
+    /// Whether a peer that connected to us with this hello is one of our
+    /// sources calling back (by user hash, else by address).
+    pub fn wants_incoming(&self, hello: &Hello) -> bool {
+        let ip = Ipv4Addr::from(hello.id.to_le_bytes());
+        self.sources.values().any(|s| {
+            s.conn.is_none()
+                && self.files.get(&s.file).is_some_and(|e| !e.done)
+                && (s.endpoint.user_hash == Some(hello.user_hash) || *s.endpoint.addr.ip() == ip)
+        })
+    }
+
+    /// Hand an unmatched incoming connection over to someone else (the
+    /// uploader): the queue forgets it.
+    pub fn forget(&mut self, conn: ConnId) {
+        if self.is_unmatched_incoming(conn) {
+            self.conns.remove(&conn);
+        }
     }
 
     fn source_of(&self, conn: ConnId) -> Option<u64> {

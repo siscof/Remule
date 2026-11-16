@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ed2k_formats::cryptkey_dat::CryptKey;
@@ -26,8 +26,13 @@ use ed2k_server::session::Event as ServerEvent;
 use ed2k_server::{ConnectOptions, LoginInfo, ServerClient};
 use ed2k_types::ed2k::SERVERREASKTIME;
 use ed2k_types::Md4Hash;
+use remule_core::credits::Credits;
 use remule_core::download_queue::{DownloadQueue, Endpoint, Origin, QueueConfig, Report};
 use remule_core::downloader::{self, Command, DownloaderConfig};
+use remule_core::publish::{KadPublish, Publisher};
+use remule_core::shared::{mtime, ScanOptions, SharedFiles};
+use remule_core::upload_queue::{UploadConfig, UploadQueue};
+use remule_core::uploader::Uploader;
 use remule_core::PartFile;
 use remule_net::Bandwidth;
 use tokio::sync::{mpsc, oneshot};
@@ -61,6 +66,14 @@ pub struct DownloadArgs {
     /// KiB/s, 0 for no limit.
     pub max_download: u32,
     pub max_upload: u32,
+    /// Directories to share; finished downloads are shared too.
+    pub share: Vec<PathBuf>,
+    /// Where known.met, known2_64.met and clients.met are kept.
+    pub config: PathBuf,
+    /// Others can connect to our TCP port: publish sources on Kad.
+    pub reachable: bool,
+    /// Take sources on LAN and loopback addresses (aMule's FilterLanIPs off).
+    pub allow_lan: bool,
 }
 
 fn human(n: u64) -> String {
@@ -166,6 +179,9 @@ fn print_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
             )
         }
         Report::FileError { file, error } => format!("{}: ERROR {error}", name(file)),
+        Report::UploadStarted { user, file } => {
+            format!("uploading {} to {user}", name(file))
+        }
     };
     println!("[{:>5}s] {line}", t.as_secs());
 }
@@ -205,19 +221,30 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         );
         files.push(f);
     }
-    if files.is_empty() {
+    let sharing = !a.share.is_empty();
+    if files.is_empty() && !sharing {
         return Err(
-            "nothing to download: give ed2k links, or a temp directory with downloads".into(),
+            "nothing to do: give ed2k links, a temp directory with downloads, or --share".into(),
         );
     }
-    if a.servers.is_empty() && a.kad.is_none() && link_sources.is_empty() {
+    if !files.is_empty() && a.servers.is_empty() && a.kad.is_none() && link_sources.is_empty() {
         return Err("no way to find sources: give --server, --kad or links with sources".into());
     }
+    // What we share: the shared directories and the incoming one.
+    let shares = if sharing {
+        Some(share_files(&a)?)
+    } else {
+        None
+    };
     let wanted: Vec<(Md4Hash, u64)> = files.iter().map(|f| (f.hash(), f.size())).collect();
-    let names: HashMap<Md4Hash, String> = files
+    let mut names: HashMap<Md4Hash, String> = files
         .iter()
         .map(|f| (f.hash(), f.name().to_owned()))
         .collect();
+    if let Some(s) = &shares {
+        let s = s.lock().unwrap_or_else(|e| e.into_inner());
+        names.extend(s.files().into_iter().map(|(f, _)| (f.hash, f.name.clone())));
+    }
     let our_hash = user_hash(&a.temp);
 
     // A server first: it gives us our ID.
@@ -268,12 +295,39 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
     qc.max_connections = a.max_connections;
     qc.our_public_ip = public_ip;
     qc.identity = Some(identity(&a.temp)?);
+    qc.filter_lan = !a.allow_lan;
+    let ours_for_upload = qc.ours.clone();
+    let identity = qc.identity.clone();
     let queue = DownloadQueue::new(qc);
     let mut dc = DownloaderConfig::new(Arc::new(Bandwidth::new(a.max_upload, a.max_download)));
     dc.stop_when_done = true;
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let (rep_tx, mut reports) = mpsc::unbounded_channel();
-    let mut dl = tokio::spawn(downloader::run(queue, dc, listener, cmd_rx, rep_tx));
+    let uploader = match &shares {
+        Some(s) => {
+            let credits = Credits::load(&a.config, unix_now())
+                .map_err(|e| format!("{}: {e}", a.config.display()))?;
+            Some(Uploader::new(
+                ours_for_upload,
+                identity,
+                s.clone(),
+                UploadQueue::new(UploadConfig {
+                    max_upload_kbps: a.max_upload,
+                    ..Default::default()
+                }),
+                Some(credits),
+            ))
+        }
+        None => None,
+    };
+    let mut dl = tokio::spawn(downloader::run_with(
+        queue, uploader, dc, listener, cmd_rx, rep_tx,
+    ));
+    let mut publisher = Publisher::new();
+    if let Some(s) = &shares {
+        publisher.update_keywords(&s.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    let mut next_offer = Instant::now();
     for f in files {
         let _ = cmd.send(Command::AddFile(Box::new(f)));
     }
@@ -294,7 +348,7 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
                 udp_port: a.udp_port,
                 tcp_port: a.tcp_port,
                 user_hash: our_hash,
-                reachable: false,
+                reachable: a.reachable,
             })
             .await?,
         ),
@@ -377,6 +431,41 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
             _ = tick.tick() => {
                 let now = Instant::now();
                 let t = start.elapsed();
+                // Offer what we share (new files as they come).
+                if let (Some(s), Some(sh)) = (&server, &shares) {
+                    if now >= next_offer {
+                        next_offer = now + Duration::from_secs(60);
+                        let files = {
+                            let sh = sh.lock().unwrap_or_else(|e| e.into_inner());
+                            publisher.server_offer(&sh, s.info().tcp_flags, 0, 0)
+                        };
+                        if !files.is_empty() {
+                            println!("[{:>5}s] offering {} files to the server", t.as_secs(), files.len());
+                            let _ = s.offer_files(&files, our_id, a.tcp_port).await;
+                        }
+                    }
+                }
+                // Publish on Kad, when others can reach us.
+                if let (Some(k), Some(sh), true) = (&kad_node, &shares, kad_connected.is_some()) {
+                    let running = k.handle.store_counts().await;
+                    let publishes = {
+                        let mut sh = sh.lock().unwrap_or_else(|e| e.into_inner());
+                        publisher.update_keywords(&sh);
+                        publisher.kad_publish(&mut sh, running, a.reachable, a.tcp_port, 0x03, unix_now().into())
+                    };
+                    for p in publishes {
+                        let r = match p {
+                            KadPublish::Keyword { word, target, files } => {
+                                println!("[{:>5}s] Kad: publishing {} files under {word:?}", t.as_secs(), files.len());
+                                k.handle.store_keyword(target, files).await
+                            }
+                            KadPublish::Source { hash, size, tags } => k.handle.store_source(hash, size, tags).await,
+                        };
+                        if let Err(e) = r {
+                            println!("Kad publish: {e}");
+                        }
+                    }
+                }
                 if let Some(s) = &server {
                     if now >= next_server_ask {
                         next_server_ask = now + SERVERREASKTIME;
@@ -427,13 +516,20 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         }
     }
 
-    let queue = match finished {
+    let (queue, uploader) = match finished {
         Some(q) => q,
         None => {
             let _ = cmd.send(Command::Shutdown);
             dl.await.map_err(|e| e.to_string())?
         }
     };
+    if let Some(up) = &uploader {
+        println!(
+            "uploaded {}, {} waiting in the upload queue",
+            human(up.sent_total()),
+            up.queue().waiting_count()
+        );
+    }
     while let Ok(r) = reports.try_recv() {
         if matches!(r, Report::Completed { .. }) {
             done += 1;
@@ -457,4 +553,46 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         human(queue.stats().received)
     );
     Ok(())
+}
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as u32)
+}
+
+/// Scan the shared directories (and incoming), hashing what known.met does
+/// not know, as aMule does at start-up.
+fn share_files(a: &DownloadArgs) -> Result<Arc<Mutex<SharedFiles>>, String> {
+    let mut s = SharedFiles::load(&a.config).map_err(|e| format!("{}: {e}", a.config.display()))?;
+    let mut dirs = a.share.clone();
+    dirs.push(a.incoming.clone());
+    let r = s.scan(
+        &ScanOptions {
+            dirs,
+            reserved: vec![a.temp.clone(), a.config.clone()],
+            hidden: false,
+        },
+        unix_now(),
+    );
+    for (d, why) in &r.skipped {
+        println!("{}: not shared ({why})", d.display());
+    }
+    for p in &r.to_hash {
+        let date = match std::fs::metadata(p) {
+            Ok(m) => mtime(&m),
+            Err(_) => continue,
+        };
+        match SharedFiles::hash(p) {
+            Ok(h) => {
+                s.add_hashed(p, &h, date, unix_now());
+                println!("hashed {}", p.display());
+            }
+            Err(e) => println!("{}: {e}", p.display()),
+        }
+    }
+    s.save()
+        .map_err(|e| format!("{}: {e}", a.config.display()))?;
+    println!("sharing {} files", s.shared_count());
+    Ok(Arc::new(Mutex::new(s)))
 }

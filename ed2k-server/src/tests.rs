@@ -587,3 +587,103 @@ fn kad_words_and_keywords() {
     want.extend([1, 1, 0, FileTag::Filesize.into()]);
     assert_eq!(d, want);
 }
+
+// ---- OP_OFFERFILES ----
+
+/// Read an offer back: (hash, id, port, tags) per file.
+fn read_offer(p: &Packet) -> Vec<(Md4Hash, u32, u16, Vec<Tag>)> {
+    let mut p = p.clone();
+    if p.protocol == u8::from(Protocol::Packed) {
+        p.unpack(1 << 20).unwrap();
+    }
+    assert_eq!(p.opcode, u8::from(Opcode::OfferFiles));
+    let mut r = ed2k_codec::Reader::new(&p.payload);
+    let n = r.u32().unwrap();
+    (0..n)
+        .map(|_| {
+            let h = r.hash().unwrap();
+            let id = r.u32().unwrap();
+            let port = r.u16().unwrap();
+            let tc = r.u32().unwrap();
+            let tags = (0..tc)
+                .map(|_| Tag::read_ed2k(&mut r, true, true).unwrap())
+                .collect();
+            (h, id, port, tags)
+        })
+        .collect()
+}
+
+fn offered(n: u8, name: &str, size: u64, complete: bool) -> packets::OfferedFile {
+    packets::OfferedFile {
+        hash: Md4Hash([n; 16]),
+        name: name.into(),
+        size,
+        complete,
+        file_type: FileType::of_name(name),
+    }
+}
+
+#[test]
+fn offers_follow_the_server_dialect() {
+    use ed2k_types::ed2k::server_tcp::flags;
+    let files = [
+        offered(1, "a book.epub", 1000, true),
+        offered(2, "disc.iso", 5_000_000_000, false),
+    ];
+    // A modern server: markers, new tags, integer types, large files, packed.
+    let modern = flags::COMPRESSION
+        | flags::NEWTAGS
+        | flags::UNICODE
+        | flags::TYPETAGINTEGER
+        | flags::LARGEFILES;
+    let back = read_offer(&packets::offer_files(&files, modern, 0x0A00_0001, 4662));
+    assert_eq!(back.len(), 2);
+    assert_eq!((back[0].1, back[0].2), (0xFBFB_FBFB, 0xFBFB));
+    assert_eq!((back[1].1, back[1].2), (0xFCFC_FCFC, 0xFCFC));
+    let tag = |tags: &[Tag], t: FileTag| {
+        tags.iter()
+            .find(|x| x.name == ed2k_codec::TagName::Id(t.value()))
+            .cloned()
+    };
+    assert_eq!(
+        tag(&back[0].3, FileTag::Filename).unwrap().as_str(),
+        Some("a book.epub")
+    );
+    assert_eq!(
+        tag(&back[0].3, FileTag::Filesize).unwrap().as_int(),
+        Some(1000)
+    );
+    assert_eq!(
+        tag(&back[0].3, FileTag::Filetype).unwrap().as_int(),
+        Some(5)
+    );
+    // Over 4 GB: the low and high halves; a disc image goes as a program.
+    assert_eq!(
+        tag(&back[1].3, FileTag::Filesize).unwrap().as_int(),
+        Some(5_000_000_000 & 0xFFFF_FFFF)
+    );
+    assert_eq!(
+        tag(&back[1].3, FileTag::FilesizeHi).unwrap().as_int(),
+        Some(1)
+    );
+    assert_eq!(
+        tag(&back[1].3, FileTag::Filetype).unwrap().as_int(),
+        Some(4)
+    );
+
+    // An old server: our address (or zero for a LowID), string types, no large files.
+    let back = read_offer(&packets::offer_files(&files, 0, 0x0A00_0001, 4662));
+    assert_eq!(back.len(), 1);
+    assert_eq!((back[0].1, back[0].2), (0x0A00_0001, 4662));
+    assert_eq!(
+        tag(&back[0].3, FileTag::Filetype).unwrap().as_str(),
+        Some("Doc")
+    );
+    let back = read_offer(&packets::offer_files(&files, 0, 1234, 4662));
+    assert_eq!((back[0].1, back[0].2), (0, 0));
+
+    assert_eq!(packets::offer_limit(0, 0), 200);
+    assert_eq!(packets::offer_limit(1000, 0), 200);
+    assert_eq!(packets::offer_limit(100, 0), 100);
+    assert_eq!(packets::offer_limit(100, 50), 49);
+}

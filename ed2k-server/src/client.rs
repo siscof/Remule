@@ -309,6 +309,19 @@ impl ServerClient {
             .map_err(|_| ClientError::Timeout("the search"))?
     }
 
+    /// Offer shared files (`SendListToServer`); the caller keeps within
+    /// [`packets::offer_limit`].
+    pub async fn offer_files(
+        &self,
+        files: &[packets::OfferedFile],
+        our_id: u32,
+        our_port: u16,
+    ) -> Result<(), ClientError> {
+        let flags = lock(&self.session).info().tcp_flags;
+        self.send(packets::offer_files(files, flags, our_id, our_port))
+            .await
+    }
+
     /// Ask for sources of a file (the answer is an [`Event::FoundSources`]).
     pub async fn get_sources(&self, hash: Md4Hash, size: u64) -> Result<(), ClientError> {
         let obfu = lock(&self.session).info().tcp_flags

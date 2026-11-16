@@ -30,6 +30,27 @@ Pings a server over UDP (its TCP port + 4) for its user and file counts.
 
 Joins Kad from a nodes.dat, keeps a routing table and runs keyword and source searches. Within one search it merges the answers for the same file, then prints them. The node says it is firewalled, so other nodes keep it out of their routing tables. It keeps its Kad ID, the contacts it learned and its index in `--dir` (default `remule-kad`) for the next run. With `--reachable` (when its UDP port can be reached from outside) it stores what others publish to it and answers their searches, as aMule does. It does not publish anything of its own yet.
 
+## remuled: the daemon
+
+Runs the client from an aMule config directory, as `amuled` does:
+- downloads in its `Temp` directory are resumed;
+- the shared folders and `Incoming` are shared and uploaded. Shared folders come from `shareddir.dat`, or from aMule-org's `shareddir-explicit.dat` / `shareddir-recursive.dat`;
+- the first server in `server.met` that logs in is used, high priority first;
+- Kad starts from the `nodes.dat` there.
+
+Nick, ports, limits and directories come from `amule.conf`, the user hash from `preferences.dat`, and the secure-ident key from `cryptkey.dat` (both made if missing). On Ctrl-C (or SIGTERM) it saves `known.met`, `clients.met`, the part files and the Kad state, in aMule's formats and places.
+
+    cargo run --release -p remuled -- [-c ~/.aMule] [--duration SECS]
+
+Stop aMule first: the two must not use one directory at once.
+
+Not yet supported:
+- External Connections, so `amulecmd` and `amulegui` cannot drive it;
+- reconnecting to a server;
+- fetching `server.met` or `nodes.dat`;
+- the IP filter;
+- statistics.
+
 ## remule-gui: remote GUI for amuled
 
 A native (egui) port of `amulegui`. It connects to an aMule daemon over External Connections (aMule 3.3+, SRP login over an encrypted channel), like `amulegui` does.
@@ -43,7 +64,7 @@ To try it without a daemon, run the scripted stand-in, which speaks the real EC 
     cargo run -p remule-ec --features fake-daemon --example fake_amuled -- 4712 secret
     cargo run -p remule-gui -- -h 127.0.0.1 -p 4712 -P secret
 
-Crates: `remule-cli` (the `remule` command), `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-hash` (eD2k and AICH hashing), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol client) and `remule-gui` (the GUI). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
+Crates: `remule-cli` (the `remule` command), `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-hash` (eD2k and AICH hashing), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol client), `remule-gui` (the GUI) and `remuled` (the daemon, and the client `remule download` runs). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
 
 ## License
 

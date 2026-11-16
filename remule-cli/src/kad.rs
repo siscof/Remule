@@ -7,15 +7,12 @@ use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ed2k_formats::nodes_dat::NodesDat;
-use ed2k_kad::driver::{self, KadHandle, Snapshot};
-use ed2k_kad::node::{Config, Event};
-use ed2k_kad::prefs::{self, KadPrefs};
+use ed2k_kad::driver::Snapshot;
+use ed2k_kad::node::Event;
 use ed2k_kad::search::{Found, KeywordResult, SourceResult};
-use ed2k_kad::Kad;
 use ed2k_server::SearchParams;
-use ed2k_types::{Md4Hash, UInt128};
-use rand::Rng;
+use ed2k_types::Md4Hash;
+use remuled::kad::{start, KadNode, KadStart};
 
 /// The files a keyword search found, by hash: the result and how many nodes gave it.
 type FilesFound = HashMap<Md4Hash, (KeywordResult, u32)>;
@@ -40,9 +37,6 @@ pub struct KadArgs {
     /// store and serve it (the port must be reachable from outside).
     pub reachable: bool,
 }
-
-/// The index files in the state directory.
-const INDEX_FILES: [&str; 3] = ["load_index.dat", "key_index.dat", "src_index.dat"];
 
 /// `HASH:SIZE` for `--source`.
 pub fn parse_source(s: &str) -> Result<(Md4Hash, u64), String> {
@@ -151,137 +145,6 @@ fn print_sources(hash: &Md4Hash, found: &[SourceResult]) {
                 String::new()
             }
         );
-    }
-}
-
-fn load_or_make_prefs(dir: &std::path::Path) -> KadPrefs {
-    let path = dir.join(prefs::FILE_NAME);
-    if let Some(p) = std::fs::read(&path).ok().and_then(|b| KadPrefs::read(&b)) {
-        return p;
-    }
-    KadPrefs {
-        public_ip: 0,
-        kad_id: UInt128::new(rand::thread_rng().gen()),
-    }
-}
-
-/// A running Kad node and where its state is kept.
-pub struct KadNode {
-    pub handle: KadHandle,
-    prefs: KadPrefs,
-    dir: PathBuf,
-}
-
-/// How to start a Kad node.
-#[derive(Debug, Clone)]
-pub struct KadStart {
-    /// Where nodes.dat, preferencesKad.dat and the index files are kept.
-    pub dir: PathBuf,
-    /// The nodes.dat to start from (default: DIR/nodes.dat).
-    pub nodes: Option<PathBuf>,
-    pub bootstrap: Vec<SocketAddrV4>,
-    pub udp_port: u16,
-    pub tcp_port: u16,
-    pub user_hash: Md4Hash,
-    pub reachable: bool,
-}
-
-/// Load the state, bind the UDP port and start the node.
-pub async fn start(a: &KadStart) -> Result<KadNode, String> {
-    std::fs::create_dir_all(&a.dir).map_err(|e| format!("{}: {e}", a.dir.display()))?;
-    let prefs = load_or_make_prefs(&a.dir);
-    let nodes_path = a.nodes.clone().unwrap_or_else(|| a.dir.join("nodes.dat"));
-    let nodes = match std::fs::read(&nodes_path) {
-        Ok(b) => Some(NodesDat::read(&b).map_err(|e| format!("{}: {e}", nodes_path.display()))?),
-        Err(e) if a.bootstrap.is_empty() => {
-            return Err(format!(
-                "{}: {e} (give a nodes.dat with --nodes, or --bootstrap IP:PORT)",
-                nodes_path.display()
-            ))
-        }
-        Err(_) => None,
-    };
-    let cfg = Config {
-        kad_id: prefs.kad_id,
-        udp_key_secret: rand::thread_rng().gen(),
-        user_hash: a.user_hash,
-        tcp_port: a.tcp_port,
-        tcp_firewalled: true,
-        udp_firewalled: !a.reachable,
-    };
-    let now = driver::unix_now();
-    let mut kad = Kad::new(cfg, now);
-    for (i, name) in INDEX_FILES.iter().enumerate() {
-        let Ok(b) = std::fs::read(a.dir.join(name)) else {
-            continue;
-        };
-        let r = match i {
-            0 => kad.index.read_load_file(&b, now),
-            1 => kad.index.read_keyword_file(&b, now),
-            _ => kad.index.read_source_file(&b, now),
-        };
-        if let Err(e) = r {
-            println!("{name}: {e} (ignored)");
-        }
-    }
-    let st = kad.index.stats();
-    if st.keywords + st.sources + st.loads > 0 {
-        println!(
-            "index: {} keyword entries, {} sources, {} loads",
-            st.keywords, st.sources, st.loads
-        );
-    }
-    if let Some(n) = &nodes {
-        let taken = kad.load_nodes(n, now);
-        println!(
-            "{}: {} contacts, {} taken into the routing table",
-            nodes_path.display(),
-            n.contacts.len(),
-            taken
-        );
-    }
-    println!(
-        "Kad ID {}",
-        prefs
-            .kad_id
-            .to_be_bytes()
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<String>()
-    );
-    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", a.udp_port))
-        .await
-        .map_err(|e| format!("UDP port {}: {e}", a.udp_port))?;
-    let handle: KadHandle = driver::spawn(kad, socket);
-    for b in &a.bootstrap {
-        handle.bootstrap(*b).await;
-    }
-    Ok(KadNode {
-        handle,
-        prefs,
-        dir: a.dir.clone(),
-    })
-}
-
-impl KadNode {
-    /// Save what was learned, as aMule does on exit.
-    pub async fn save(&self) -> Result<(), String> {
-        match self.handle.nodes().await {
-            Some(n) => {
-                let path = self.dir.join("nodes.dat");
-                std::fs::write(&path, n.write()).map_err(|e| format!("{}: {e}", path.display()))?;
-                println!("wrote {} ({} contacts)", path.display(), n.contacts.len());
-            }
-            None => println!("fewer than 25 contacts: nodes.dat not written"),
-        }
-        if let Some(f) = self.handle.index_files().await {
-            for (name, bytes) in INDEX_FILES.iter().zip([f.load, f.keywords, f.sources]) {
-                let path = self.dir.join(name);
-                std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-        }
-        let path = self.dir.join(prefs::FILE_NAME);
-        std::fs::write(&path, self.prefs.write()).map_err(|e| format!("{}: {e}", path.display()))
     }
 }
 

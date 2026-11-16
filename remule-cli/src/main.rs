@@ -7,7 +7,7 @@
 //!     remule ping IP:PORT
 //!     remule kad [--nodes nodes.dat] [--search TERMS]... [--source HASH:SIZE]... [--duration S]
 //!     remule share DIR... [--config DIR] [--links]
-//!     remule download [LINK]... --temp DIR --incoming DIR [--server IP:PORT]... [--kad DIR]
+//!     remule download [LINK]... --temp DIR --incoming DIR [--server IP:PORT]... [--kad DIR] [--share DIR]...
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -179,6 +179,19 @@ enum Command {
         /// Upload limit in KiB/s (0: none).
         #[arg(long, default_value_t = 0)]
         max_upload: u32,
+        /// Share this directory (repeat for more); finished downloads are shared too,
+        /// and the client keeps running for others to download.
+        #[arg(long)]
+        share: Vec<PathBuf>,
+        /// Where known.met, known2_64.met and clients.met are kept.
+        #[arg(long, default_value = "remule-config")]
+        config: PathBuf,
+        /// Others can connect to the TCP port: publish sources on Kad.
+        #[arg(long)]
+        reachable: bool,
+        /// Take sources on LAN and loopback addresses.
+        #[arg(long)]
+        allow_lan: bool,
     },
     /// Share directories as aMule does: hash new files into known.met and
     /// known2_64.met, and list the shared files.
@@ -349,6 +362,10 @@ fn main() -> ExitCode {
             max_connections,
             max_download,
             max_upload,
+            share,
+            config,
+            reachable,
+            allow_lan,
         } => run_async(download::run(download::DownloadArgs {
             links,
             temp,
@@ -365,6 +382,10 @@ fn main() -> ExitCode {
             max_connections,
             max_download,
             max_upload,
+            share,
+            config,
+            reachable,
+            allow_lan,
         })),
         Command::Share {
             dirs,

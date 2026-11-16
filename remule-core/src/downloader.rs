@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,8 @@ use crate::download_queue::{
     Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report,
 };
 use crate::part_file::PartFile;
+use crate::uploader::Uploader;
+use ed2k_peer::PeerPacket;
 
 /// What the application can tell a running downloader.
 #[derive(Debug)]
@@ -186,12 +188,29 @@ async fn conn_task(
 /// or (with `stop_when_done`) every file completing. Reports go to
 /// `reports` as they happen. Returns the queue, files saved.
 pub async fn run(
+    queue: DownloadQueue,
+    config: DownloaderConfig,
+    listener: Option<TcpListener>,
+    commands: mpsc::UnboundedReceiver<Command>,
+    reports: mpsc::UnboundedSender<Report>,
+) -> DownloadQueue {
+    run_with(queue, None, config, listener, commands, reports)
+        .await
+        .0
+}
+
+/// [`run`], uploading too: peers that connect to us and are not sources of
+/// ours calling back are served by `uploader`, and finished downloads are
+/// shared. With an uploader, `stop_when_done` is ignored: sharing goes on.
+pub async fn run_with(
     mut queue: DownloadQueue,
+    mut uploader: Option<Uploader>,
     config: DownloaderConfig,
     listener: Option<TcpListener>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     reports: mpsc::UnboundedSender<Report>,
-) -> DownloadQueue {
+) -> (DownloadQueue, Option<Uploader>) {
+    let mut incoming_addrs: HashMap<ConnId, SocketAddr> = HashMap::new();
     let (net_tx, mut net_rx) = mpsc::unbounded_channel();
     let mut conns: HashMap<ConnId, ConnHandle> = HashMap::new();
     let conn_cfg = ConnConfig::new(config.bandwidth.clone());
@@ -207,21 +226,55 @@ pub async fn run(
 
     loop {
         let actions = tokio::select! {
-            _ = ticker.tick() => queue.tick(Instant::now()),
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let mut a = queue.tick(now);
+                if let Some(up) = uploader.as_mut() {
+                    a.extend(up.tick(now));
+                }
+                a
+            }
             Some(ev) = net_rx.recv() => {
                 let now = Instant::now();
                 match ev {
                     NetEvent::Connected(c) => queue.connected(c, now),
-                    NetEvent::Packet(c, p) => queue.packet(c, p, now),
+                    NetEvent::Packet(c, p) => match uploader.as_mut() {
+                        Some(up) if up.owns(c) => up.packet(c, p, now),
+                        Some(up) if queue.is_unmatched_incoming(c) => {
+                            // The first packet of a peer that connected to us: a
+                            // source of ours calling back, or someone to serve.
+                            match PeerPacket::parse(p.clone(), Default::default()) {
+                                Ok(PeerPacket::Hello(h)) if !queue.wants_incoming(&h) => {
+                                    queue.forget(c);
+                                    let ip = incoming_addrs
+                                        .get(&c)
+                                        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip());
+                                    up.accept(c, h, ip, now)
+                                }
+                                _ => queue.packet(c, p, now),
+                            }
+                        }
+                        _ => queue.packet(c, p, now),
+                    },
                     NetEvent::Closed(c) => {
                         conns.remove(&c);
-                        queue.closed(c, now)
+                        incoming_addrs.remove(&c);
+                        match uploader.as_mut() {
+                            Some(up) if up.owns(c) => {
+                                up.closed(c);
+                                Vec::new()
+                            }
+                            _ => queue.closed(c, now),
+                        }
                     }
                 }
             }
             accepted = accept(listener.as_ref()) => match accepted {
                 Some(stream) => {
                     let conn = queue.incoming();
+                    if let Ok(a) = stream.peer_addr() {
+                        incoming_addrs.insert(conn, a);
+                    }
                     let hs = Handshake::Incoming {
                         own_hash,
                         max_padding: config.max_padding,
@@ -285,13 +338,24 @@ pub async fn run(
                     }
                 }
                 Action::Report(r) => {
+                    // A finished download is shared at once.
+                    if let (Report::Completed { path, .. }, Some(up)) = (&r, uploader.as_mut()) {
+                        let _ = up.share_completed(path);
+                    }
                     let _ = reports.send(r);
                 }
             }
         }
-        if config.stop_when_done && queue.files().next().is_some() && queue.all_done() {
+        if uploader.is_none()
+            && config.stop_when_done
+            && queue.files().next().is_some()
+            && queue.all_done()
+        {
             break;
         }
+    }
+    if let Some(up) = uploader.as_mut() {
+        let _ = up.save();
     }
 
     for a in queue.shutdown(Instant::now()) {
@@ -302,7 +366,7 @@ pub async fn run(
     for (_, h) in conns.drain() {
         h.task.abort();
     }
-    queue
+    (queue, uploader)
 }
 
 /// The next incoming connection, or never without a listener.

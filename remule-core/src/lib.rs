@@ -11,6 +11,7 @@
 //! * [`shared`]: the shared files, `known.met` and `known2_64.met`
 //!   (`CSharedFileList`, `CKnownFileList`).
 //! * [`upload_queue`]: who gets an upload slot (`CUploadQueue`), without IO.
+//! * [`uploader`]: the upload side of a running client, without IO.
 //! * [`credits`]: upload and download credits, `clients.met`.
 //! * [`publish`]: what to offer to the server and publish on Kad, and when.
 //! * [`downloader`]: the queue on tokio, with peer connections on
@@ -25,6 +26,7 @@ pub mod part_file;
 pub mod publish;
 pub mod shared;
 pub mod upload_queue;
+pub mod uploader;
 
 pub use gap_list::GapList;
 pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, SourceView, Status};

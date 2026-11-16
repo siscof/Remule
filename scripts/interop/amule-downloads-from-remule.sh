@@ -93,7 +93,7 @@ PIDS+=($!)
 # remule shares it and waits; every peer packet is traced to its log.
 REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
 	--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
-	--port "$REMULE_PORT" --allow-lan --duration $((TIMEOUT + 60)) --status-every 15 \
+	--port "$REMULE_PORT" --allow-lan --max-upload "${MAX_UPLOAD:-2048}" --duration $((TIMEOUT + 60)) --status-every 15 \
 	> "$WORK/remule.log" 2>&1 &
 PIDS+=($!)
 

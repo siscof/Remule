@@ -77,7 +77,7 @@ python3 "$HERE/fake_ed2k_server.py" "$IP" "$SERVER_PORT" > "$WORK/server.log" 2>
 PIDS+=($!)
 
 # remule shares it and waits; every peer packet is traced to its log.
-REMULE_TRACE=1 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
+REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
 	--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
 	--port "$REMULE_PORT" --allow-lan --duration $((TIMEOUT + 60)) --status-every 15 \
 	> "$WORK/remule.log" 2>&1 &

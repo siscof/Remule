@@ -126,7 +126,17 @@ async fn conn_task(
     if outgoing {
         let _ = events.send(NetEvent::Connected(conn));
     }
-    let trace = std::env::var_os("REMULE_TRACE").is_some();
+    // REMULE_TRACE: each packet's protocol, opcode and size; =2 also the
+    // payload of packets up to 64 bytes, in hex.
+    let trace_level = std::env::var("REMULE_TRACE").map_or(0, |v| if v == "2" { 2 } else { 1 });
+    let trace = trace_level > 0;
+    let hex = |p: &Packet| -> String {
+        if trace_level < 2 || p.payload.len() > 64 {
+            return String::new();
+        }
+        let h: String = p.payload.iter().map(|b| format!("{b:02x}")).collect();
+        format!(" {h}")
+    };
     let peer = match &how_addr {
         Some(a) => a.to_string(),
         None => format!("conn {conn}"),
@@ -135,10 +145,11 @@ async fn conn_task(
         while let Some(p) = rx.recv().await {
             if trace {
                 eprintln!(
-                    "{peer} <- {:#04x}/{:#04x} {} bytes",
+                    "{peer} <- {:#04x}/{:#04x} {} bytes{}",
                     p.protocol,
                     p.opcode,
-                    p.payload.len()
+                    p.payload.len(),
+                    hex(&p)
                 );
             }
             if writer.send(&p, Priority::Control).await.is_err() {
@@ -166,10 +177,11 @@ async fn conn_task(
             };
             if trace {
                 eprintln!(
-                    "{peer} -> {:#04x}/{:#04x} {} bytes",
+                    "{peer} -> {:#04x}/{:#04x} {} bytes{}",
                     p.protocol,
                     p.opcode,
-                    p.payload.len()
+                    p.payload.len(),
+                    hex(&p)
                 );
             }
             if events.send(NetEvent::Packet(conn, p)).is_err() {

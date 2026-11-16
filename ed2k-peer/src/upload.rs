@@ -118,6 +118,9 @@ pub enum Event {
         part: u16,
         root: AichHash,
     },
+    /// A peer we called back answered our hello and was given its slot
+    /// ([`UploadSession::connect`]).
+    CalledBack,
     /// Its secure identification ended.
     Identified(IdentResult),
     Closed(CloseReason),
@@ -279,6 +282,27 @@ impl UploadSession {
         out.send.push(s.ours.to_hello_answer()?);
         s.peer_said_hello(hello, &mut out);
         Ok((s, out))
+    }
+
+    /// We call back a waiting peer whose turn came (`US_CONNECTING`): send
+    /// the returned hello once connected. When its hello answer arrives
+    /// the slot is given (`OP_ACCEPTUPLOADREQ`, as `ConnectionEstablished`
+    /// does), with [`Event::Handshake`] then [`Event::CalledBack`].
+    pub fn connect(ours: Hello) -> Result<(UploadSession, Packet), ed2k_codec::TagError> {
+        let hello = ours.to_hello()?;
+        let s = UploadSession {
+            ours,
+            state: UploadState::Handshake,
+            peer: None,
+            caps: PeerCaps::default(),
+            file: None,
+            pending: Vec::new(),
+            done: Vec::new(),
+            ident: None,
+            early_ident_state: None,
+            no_compression: false,
+        };
+        Ok((s, hello))
     }
 
     pub fn state(&self) -> UploadState {
@@ -458,6 +482,25 @@ impl UploadSession {
         shares: &dyn Shares,
         out: &mut Output,
     ) -> Result<(), String> {
+        if self.state == UploadState::Handshake {
+            // Calling back: only the hello answer (or an old eMule's
+            // capabilities first) is expected.
+            return match packet {
+                PeerPacket::HelloAnswer(hello) => {
+                    self.peer_said_hello(hello, out);
+                    out.send.push(self.accept());
+                    out.events.push(Event::CalledBack);
+                    Ok(())
+                }
+                p @ PeerPacket::MuleInfo { .. } => {
+                    self.state = UploadState::Idle;
+                    let r = self.dispatch(p, shares, out);
+                    self.state = UploadState::Handshake;
+                    r
+                }
+                _ => Err("no hello answer to our callback".into()),
+            };
+        }
         match packet {
             // An old eMule sends its capabilities separately.
             PeerPacket::MuleInfo {

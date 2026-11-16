@@ -7,9 +7,9 @@
 //! [`downloader`](crate::downloader) runs both.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed2k_codec::Packet;
 use ed2k_crypto::credits::IdentState;
@@ -18,7 +18,7 @@ use ed2k_peer::packets::{self, AichRecovery};
 use ed2k_peer::secident::{IdentConfig, IdentResult, Identity};
 use ed2k_peer::upload::{Event, Output, UploadSession, UploadState};
 use ed2k_peer::{Hello, PeerPacket};
-use ed2k_types::ed2k::PARTSIZE;
+use ed2k_types::ed2k::{CONNECTION_TIMEOUT, PARTSIZE};
 use ed2k_types::Md4Hash;
 
 use crate::credits::Credits;
@@ -31,6 +31,22 @@ struct Peer {
     user_hash: Md4Hash,
     ip: IpAddr,
     ident: IdentState,
+    /// The last packet from it, or when the connection began.
+    last_seen: Instant,
+    /// Our hello, to send once a callback connects.
+    hello: Option<Packet>,
+}
+
+/// Where a waiting peer can be called back.
+#[derive(Debug, Clone, Copy)]
+struct Callback {
+    addr: SocketAddr,
+    obfuscate: bool,
+}
+
+/// A secure ident challenge: anything but zero.
+fn challenge(now: Instant, user: &Md4Hash) -> u32 {
+    (now.elapsed().subsec_nanos() ^ u32::from(user.0[0])) | 1
 }
 
 fn unix_now() -> u32 {
@@ -47,6 +63,11 @@ pub struct Uploader {
     queue: UploadQueue,
     credits: Option<Credits>,
     peers: HashMap<ConnId, Peer>,
+    /// HighID peers by user hash, for calling them back.
+    callbacks: HashMap<Md4Hash, Callback>,
+    /// A connection with no slot and nothing heard for this long is
+    /// closed (`CClientTCPSocket::CheckTimeOut`); the peer keeps its place.
+    idle_timeout: Duration,
     /// Bytes sent, and over the last rate window.
     sent_total: u64,
     window: (Instant, u64),
@@ -79,6 +100,8 @@ impl Uploader {
             queue,
             credits,
             peers: HashMap::new(),
+            callbacks: HashMap::new(),
+            idle_timeout: CONNECTION_TIMEOUT,
             sent_total: 0,
             window: (Instant::now(), 0),
             rate: 0,
@@ -91,6 +114,16 @@ impl Uploader {
 
     pub fn queue(&self) -> &UploadQueue {
         &self.queue
+    }
+
+    pub fn queue_mut(&mut self) -> &mut UploadQueue {
+        &mut self.queue
+    }
+
+    /// How long a connection without a slot may stay silent
+    /// ([`CONNECTION_TIMEOUT`] by default).
+    pub fn set_idle_timeout(&mut self, t: Duration) {
+        self.idle_timeout = t;
     }
 
     pub fn credits_mut(&mut self) -> Option<&mut Credits> {
@@ -117,19 +150,15 @@ impl Uploader {
             return out;
         };
         let mut send = output.send;
-        if let Some(ours) = self.identity.clone() {
-            let cfg = IdentConfig {
-                ours,
-                stored_key: self.credits.as_ref().and_then(|c| c.public_key(&user_hash)),
-                peer_ip: match ip {
-                    IpAddr::V4(v4) => Some(v4),
-                    IpAddr::V6(_) => None,
-                },
-                our_id: self.ours.id,
-                our_public_ip: None,
-            };
-            let challenge = (now.elapsed().subsec_nanos() ^ user_hash.0[0] as u32) | 1;
-            send.extend(session.start_secure_ident(cfg, challenge).send);
+        if let Some(peer) = session.peer().cloned() {
+            self.remember_callback(&peer, ip);
+        }
+        if let Some(cfg) = self.ident_config(&user_hash, ip) {
+            send.extend(
+                session
+                    .start_secure_ident(cfg, challenge(now, &user_hash))
+                    .send,
+            );
         }
         self.peers.insert(
             conn,
@@ -138,6 +167,8 @@ impl Uploader {
                 user_hash,
                 ip,
                 ident: IdentState::NotAvailable,
+                last_seen: now,
+                hello: None,
             },
         );
         self.queue.set_connected(&user_hash, true);
@@ -150,11 +181,59 @@ impl Uploader {
         out
     }
 
+    /// What secure identification needs, when we have a key.
+    fn ident_config(&self, user_hash: &Md4Hash, ip: IpAddr) -> Option<IdentConfig> {
+        Some(IdentConfig {
+            ours: self.identity.clone()?,
+            stored_key: self.credits.as_ref().and_then(|c| c.public_key(user_hash)),
+            peer_ip: match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            },
+            our_id: self.ours.id,
+            our_public_ip: None,
+        })
+    }
+
+    /// Note where a HighID peer listens, to call it back when its turn
+    /// comes; obfuscated when it supports it and either side asks for it.
+    fn remember_callback(&mut self, hello: &Hello, ip: IpAddr) {
+        if hello.id < 0x0100_0000 || hello.port == 0 || ip.is_unspecified() {
+            return;
+        }
+        let theirs = hello.misc2.unwrap_or_default();
+        let ours = self.ours.misc2.unwrap_or_default();
+        self.callbacks.insert(
+            hello.user_hash,
+            Callback {
+                addr: SocketAddr::new(ip, hello.port),
+                obfuscate: theirs.supports_crypt
+                    && (theirs.requires_crypt || theirs.requests_crypt || ours.requests_crypt),
+            },
+        );
+    }
+
+    /// A callback connection of ours is up: say hello.
+    pub fn connected(&mut self, conn: ConnId, now: Instant) -> Vec<Action> {
+        let Some(p) = self.peers.get_mut(&conn) else {
+            return Vec::new();
+        };
+        p.last_seen = now;
+        match p.hello.take() {
+            Some(hello) => vec![Action::Send {
+                conn,
+                packets: vec![hello],
+            }],
+            None => Vec::new(),
+        }
+    }
+
     /// A packet from one of our peers.
     pub fn packet(&mut self, conn: ConnId, packet: Packet, now: Instant) -> Vec<Action> {
         let Some(p) = self.peers.get_mut(&conn) else {
             return Vec::new();
         };
+        p.last_seen = now;
         let parsed = match PeerPacket::parse(packet, p.session.parse_context()) {
             Ok(x) => x,
             Err(_) => return self.drop_peer(conn, true),
@@ -258,6 +337,20 @@ impl Uploader {
                         IdentResult::Failed => IdentState::Failed,
                     };
                 }
+                Event::CalledBack => {
+                    let (user, ip) = (p.user_hash, p.ip);
+                    let file = self.queue.slot_file(&user).unwrap_or(Md4Hash([0; 16]));
+                    self.queue.set_connected(&user, true);
+                    if let Some(cfg) = self.ident_config(&user, ip) {
+                        let p = self.peers.get_mut(&conn).unwrap();
+                        send.extend(
+                            p.session
+                                .start_secure_ident(cfg, challenge(now, &user))
+                                .send,
+                        );
+                    }
+                    out.push(Action::Report(Report::UploadStarted { user, file }));
+                }
                 Event::Closed(_) => close = true,
                 Event::Handshake(_)
                 | Event::FileRequested { .. }
@@ -302,7 +395,10 @@ impl Uploader {
 
     fn drop_peer(&mut self, conn: ConnId, close: bool) -> Vec<Action> {
         if let Some(p) = self.peers.remove(&conn) {
-            self.queue.set_connected(&p.user_hash, false);
+            // It may have another connection (it called while we dialled).
+            if !self.peers.values().any(|o| o.user_hash == p.user_hash) {
+                self.queue.set_connected(&p.user_hash, false);
+            }
         }
         if close {
             vec![Action::Close { conn }]
@@ -316,14 +412,28 @@ impl Uploader {
         self.drop_peer(conn, false);
     }
 
-    /// The periodic work: the upload rate, and free slots filled.
-    pub fn tick(&mut self, now: Instant) -> Vec<Action> {
+    /// The periodic work: the upload rate, idle connections closed, and
+    /// free slots filled, calling back waiting peers that are not
+    /// connected. `new_conn` names a new connection.
+    pub fn tick(&mut self, now: Instant, new_conn: &mut dyn FnMut() -> ConnId) -> Vec<Action> {
         let secs = now.saturating_duration_since(self.window.0).as_secs_f64();
         if secs >= 10.0 {
             self.rate = (self.window.1 as f64 / secs) as u64;
             self.window = (now, 0);
         }
         let mut out = Vec::new();
+        let idle: Vec<ConnId> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| {
+                p.session.state() != UploadState::Uploading
+                    && now.saturating_duration_since(p.last_seen) > self.idle_timeout
+            })
+            .map(|(&c, _)| c)
+            .collect();
+        for conn in idle {
+            out.extend(self.drop_peer(conn, true));
+        }
         for a in self.queue.process(self.rate, now) {
             match a {
                 QueueAction::GiveSlot(user) => {
@@ -344,13 +454,49 @@ impl Uploader {
                         }
                     }
                 }
-                // Calling a peer back is not ported: its turn passes.
-                QueueAction::CallBack(user) | QueueAction::TakeSlot(user) => {
+                QueueAction::CallBack(user) => out.extend(self.call_back(user, now, new_conn)),
+                QueueAction::TakeSlot(user) => {
                     self.queue.ended(&user);
                 }
             }
         }
         out
+    }
+
+    /// `AddUpNextClient` for a peer that is not connected: connect to it;
+    /// the slot is given when it answers our hello. If it cannot be
+    /// reached, the slot ends and it leaves the queue (`AddDeadSource`).
+    fn call_back(
+        &mut self,
+        user: Md4Hash,
+        now: Instant,
+        new_conn: &mut dyn FnMut() -> ConnId,
+    ) -> Vec<Action> {
+        let Some(cb) = self.callbacks.get(&user).copied() else {
+            self.queue.ended(&user);
+            return Vec::new();
+        };
+        let Ok((session, hello)) = UploadSession::connect(self.ours.clone()) else {
+            self.queue.ended(&user);
+            return Vec::new();
+        };
+        let conn = new_conn();
+        self.peers.insert(
+            conn,
+            Peer {
+                session,
+                user_hash: user,
+                ip: cb.addr.ip(),
+                ident: IdentState::NotAvailable,
+                last_seen: now,
+                hello: Some(hello),
+            },
+        );
+        vec![Action::Connect {
+            conn,
+            addr: cb.addr,
+            obfuscate_for: cb.obfuscate.then_some(user),
+        }]
     }
 
     /// Share a file that just completed (hashed here; blocking).

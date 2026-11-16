@@ -230,14 +230,18 @@ pub async fn run_with(
                 let now = Instant::now();
                 let mut a = queue.tick(now);
                 if let Some(up) = uploader.as_mut() {
-                    a.extend(up.tick(now));
+                    a.extend(up.tick(now, &mut || queue.new_conn_id()));
                 }
                 a
             }
             Some(ev) = net_rx.recv() => {
                 let now = Instant::now();
                 match ev {
-                    NetEvent::Connected(c) => queue.connected(c, now),
+                    NetEvent::Connected(c) => match uploader.as_mut() {
+                        // A waiting peer we call back.
+                        Some(up) if up.owns(c) => up.connected(c, now),
+                        _ => queue.connected(c, now),
+                    },
                     NetEvent::Packet(c, p) => match uploader.as_mut() {
                         Some(up) if up.owns(c) => up.packet(c, p, now),
                         Some(up) if queue.is_unmatched_incoming(c) => {

@@ -108,6 +108,16 @@ ECPassword=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
 IpFilterClients=0
 IpFilterServers=0
 EOF
+# Its only server is the fake one. Without a server.met, aMule 2.3.3 fetches
+# one over HTTP at start (addresses.dat), which aborts with wxWidgets 3.2.
+python3 - "$IP" "$SERVER_PORT" "$AMULE_CFG/server.met" <<'PY'
+import socket, struct, sys
+ip, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+# MET_HEADER, one server, no tags.
+data = struct.pack("<BI", 0x0E, 1) + socket.inet_aton(ip) + struct.pack("<HI", port, 0)
+open(path, "wb").write(data)
+PY
+: > "$AMULE_CFG/addresses.dat"
 amuled --config-dir="$AMULE_CFG" > "$WORK/amuled.log" 2>&1 &
 PIDS+=($!)
 
@@ -122,7 +132,6 @@ done
 amuled --version 2>/dev/null | head -1 || true
 
 echo "connecting aMule to the fake server"
-cmd "add ed2k://|server|$IP|$SERVER_PORT|/"
 cmd "connect $IP:$SERVER_PORT"
 connected=0
 for _ in $(seq 1 30); do

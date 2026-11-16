@@ -49,3 +49,21 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # MIGRATION_PLAN.md 9.M: a stock aMule (Ubuntu's package) downloads a
+  # file that remule shares.
+  amule-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install aMule
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y amule-daemon amule-utils
+      - name: Build remule
+        run: cargo build --release -p remule-cli
+      - name: aMule downloads from remule
+        run: bash scripts/interop/amule-downloads-from-remule.sh

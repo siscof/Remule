@@ -62,7 +62,7 @@ jobs:
       - name: Install aMule
         run: |
           sudo apt-get update
-          sudo apt-get install -y amule-daemon amule-utils
+          sudo apt-get install -y amule-daemon amule-utils tcpdump
       - name: Build remule
         run: cargo build --release -p remule-cli
       - name: aMule downloads from remule

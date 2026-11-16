@@ -51,6 +51,11 @@ trap cleanup EXIT
 dump_logs() {
 	echo "----- TCP sockets (Recv-Q / Send-Q) -----"
 	ss -tnpi 2>/dev/null | grep -A1 ":$REMULE_PORT" || true
+	if [ -s "$WORK/cap.pcap" ]; then
+		echo "----- last packets on the wire (port $REMULE_PORT) -----"
+		sudo -n tcpdump -nn -r "$WORK/cap.pcap" 2>/dev/null | tail -60 || true
+		echo "zero windows: $(sudo -n tcpdump -nn -r "$WORK/cap.pcap" 2>/dev/null | grep -c 'win 0,' || true)"
+	fi
 	echo "----- remule log -----"
 	cat "$WORK/remule.log" || true
 	echo "----- fake server -----"
@@ -73,6 +78,13 @@ head -c "$SIZE" /dev/urandom > "$WORK/share/$NAME"
 LINK=$("$REMULE" hash "$WORK/share/$NAME" | grep -m1 '^ed2k://')
 LINK="${LINK}|sources,$IP:$REMULE_PORT|/"
 echo "link: $LINK"
+
+# Headers of the peer connection, to see who stops sending or reading.
+if command -v tcpdump >/dev/null && sudo -n true 2>/dev/null; then
+	sudo -n tcpdump -i any -s 80 -U -w "$WORK/cap.pcap" "tcp port $REMULE_PORT" 2>/dev/null &
+	PIDS+=($!)
+	sleep 1
+fi
 
 # The server aMule logs into.
 python3 "$HERE/fake_ed2k_server.py" "$IP" "$SERVER_PORT" > "$WORK/server.log" 2>&1 &

@@ -5,9 +5,12 @@
 #
 # remule shares a random multi-part file; a stock amuled (the distribution's
 # package, driven with amulecmd) is given its ed2k link with remule as the one
-# source, and must finish it byte for byte. Neither side touches a server or
-# Kad. aMule rejects loopback sources outright (IsGoodIP), so remule is
-# reached on this machine's own LAN address, with FilterLanIPs off.
+# source, and must finish it byte for byte. Nothing touches the real network:
+# stock aMule asks its sources only while connected to eD2k or Kad
+# (CPartFile::Process), so it logs into fake_ed2k_server.py, which gives it
+# a HighID and nothing else. aMule rejects loopback sources outright
+# (IsGoodIP), so remule is reached on this machine's own LAN address, with
+# FilterLanIPs off.
 #
 # Usage: scripts/interop/amule-downloads-from-remule.sh
 # Environment:
@@ -23,6 +26,8 @@ SIZE=${SIZE:-24000000}
 TIMEOUT=${TIMEOUT:-180}
 REMULE_PORT=4663
 AMULE_PORT=4662
+SERVER_PORT=4661
+HERE=$(dirname "$(realpath "$0")")
 EC_PORT=4712
 EC_PASS=interop
 
@@ -46,6 +51,8 @@ trap cleanup EXIT
 dump_logs() {
 	echo "----- remule log -----"
 	cat "$WORK/remule.log" || true
+	echo "----- fake server -----"
+	cat "$WORK/server.log" || true
 	echo "----- amuled output -----"
 	cat "$WORK/amuled.log" || true
 	echo "----- aMule logfile -----"
@@ -65,14 +72,19 @@ LINK=$("$REMULE" hash "$WORK/share/$NAME" | grep -m1 '^ed2k://')
 LINK="${LINK}|sources,$IP:$REMULE_PORT|/"
 echo "link: $LINK"
 
-# remule shares it and waits.
-"$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
+# The server aMule logs into.
+python3 "$HERE/fake_ed2k_server.py" "$IP" "$SERVER_PORT" > "$WORK/server.log" 2>&1 &
+PIDS+=($!)
+
+# remule shares it and waits; every peer packet is traced to its log.
+REMULE_TRACE=1 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
 	--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
 	--port "$REMULE_PORT" --allow-lan --duration $((TIMEOUT + 60)) --status-every 15 \
 	> "$WORK/remule.log" 2>&1 &
 PIDS+=($!)
 
-# A stock aMule, offline: no server, no Kad, no IP filter, LAN sources allowed.
+# A stock aMule: no Kad, no IP filter, LAN sources allowed; it connects to
+# the fake server when told.
 cat > "$AMULE_CFG/amule.conf" <<EOF
 [eMule]
 Nick=interop
@@ -83,21 +95,11 @@ TempDir=$AMULE_CFG/Temp
 IncomingDir=$AMULE_CFG/Incoming
 FilterLanIPs=0
 ConnectToKad=0
-ConnectToED2K=0
+ConnectToED2K=1
 Autoconnect=0
 Reconnect=0
 IPFilterAutoLoad=0
 UPnPEnabled=0
-VerboseDebug=1
-VerboseDebugLogfile=1
-[Debug]
-Cat_ED2k Client=1
-Cat_Local Client Protocol=1
-Cat_Remote Client Protocol=1
-Cat_DownloadQueue=1
-Cat_PartFiles=1
-Cat_ListenSocket=1
-Cat_IPFilter=1
 [ExternalConnect]
 AcceptExternalConnections=1
 ECAddress=127.0.0.1
@@ -118,7 +120,17 @@ for _ in $(seq 1 60); do
 done
 [ "$up" = 1 ] || { echo "amuled did not come up"; dump_logs; exit 1; }
 amuled --version 2>/dev/null | head -1 || true
+
+echo "connecting aMule to the fake server"
+cmd "add ed2k://|server|$IP|$SERVER_PORT|/"
+cmd "connect $IP:$SERVER_PORT"
+connected=0
+for _ in $(seq 1 30); do
+	if cmd status | grep -q "eD2k: Connected"; then connected=1; break; fi
+	sleep 1
+done
 cmd status
+[ "$connected" = 1 ] || { echo "aMule did not log into the fake server"; dump_logs; exit 1; }
 
 echo "adding the link to aMule"
 cmd "add $LINK"

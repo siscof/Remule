@@ -297,6 +297,56 @@ fn a_queued_peer_waits_for_its_slot() {
     assert_eq!(p.sink.data, p.data);
 }
 
+/// A queued peer whose connection went is called back when its turn
+/// comes: our hello, its answer, then the slot (`US_CONNECTING`).
+#[test]
+fn a_waiting_peer_is_called_back_with_its_slot() {
+    let mut p = Pair::new("a.txt", text(300_000), Some(2), 0);
+    assert_eq!(p.up.state(), UploadState::Queued);
+    let parts = p.down.peer_parts().cloned();
+    assert!(parts.is_some());
+    // The connection went; the downloader keeps what it knew.
+    let _ = p.down.closed(&mut p.sink);
+    let _ = p.up.closed();
+
+    let (up, our_hello) = UploadSession::connect(hello(0x22, 0x0200_000A)).unwrap();
+    assert_eq!(up.state(), UploadState::Handshake);
+    p.up = up;
+    let PeerPacket::Hello(h) = wire(our_hello, ParseContext::default()) else {
+        panic!("expected a hello")
+    };
+    let (down, out) =
+        Session::accepted(hello(0x11, 0x0100_000A), h, &p.sink, parts, Instant::now()).unwrap();
+    assert_eq!(down.state(), State::OnQueue);
+    p.down = down;
+    p.up_events.clear();
+    p.deliver_up(out.send);
+    assert!(matches!(p.up_events[0], Event::Handshake(_)));
+    assert!(p.up_events.contains(&Event::CalledBack));
+    assert!(p.sink.done(), "not all received");
+    assert_eq!(p.sink.data, p.data);
+}
+
+#[test]
+fn a_callback_wants_a_hello_answer() {
+    let shares: Vec<SharedInfo> = Vec::new();
+    let (mut up, _) = UploadSession::connect(hello(0x22, 0x0200_000A)).unwrap();
+    // An old eMule's capabilities may come first.
+    let info = crate::hello::MuleInfo::Info(crate::hello::EmuleInfo::amule(4672, 0, None))
+        .to_packet(false)
+        .unwrap();
+    let out = up.handle(wire(info, ParseContext::default()), &shares);
+    assert!(out.events.is_empty());
+    assert_eq!(up.state(), UploadState::Handshake);
+    // Anything else is a protocol error.
+    let out = up.handle(
+        wire(packets::accept_upload_req(), ParseContext::default()),
+        &shares,
+    );
+    assert!(matches!(out.events[..], [Event::Closed(_)]));
+    assert_eq!(up.state(), UploadState::Closed);
+}
+
 #[test]
 fn unknown_files_and_wrong_sizes_are_refused() {
     let data = text(1000);

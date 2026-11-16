@@ -376,3 +376,259 @@ fn a_shared_file_uploads_into_a_part_file() {
     };
     assert_eq!(fs::read(path).unwrap(), content);
 }
+
+/// A peer that downloads from an [`Uploader`](crate::uploader::Uploader):
+/// our download session on a part file, packets through the codec.
+struct Downloader {
+    pf: crate::PartFile,
+    last: Option<u16>,
+    session: Option<ed2k_peer::download::Session>,
+    queued: bool,
+}
+
+impl Downloader {
+    fn view(&mut self) -> crate::SourceView<'_> {
+        crate::SourceView {
+            file: &mut self.pf,
+            last_part: &mut self.last,
+            wants_sources: false,
+        }
+    }
+
+    /// Hand `actions` for `conn` to the session, its answers back to the
+    /// uploader, until both are quiet. Returns the other actions.
+    fn pump(
+        &mut self,
+        up: &mut crate::uploader::Uploader,
+        conn: u64,
+        actions: Vec<crate::download_queue::Action>,
+        now: Instant,
+    ) -> Vec<crate::download_queue::Action> {
+        use crate::download_queue::Action;
+        use ed2k_codec::Packet;
+        use ed2k_peer::download::Event as DownEvent;
+        use ed2k_peer::PeerPacket;
+        let mut todo: VecDeque<Action> = actions.into();
+        let mut rest = Vec::new();
+        while let Some(a) = todo.pop_front() {
+            match a {
+                Action::Send { conn: c, packets } if c == conn => {
+                    for p in packets {
+                        let mut session = self.session.take().expect("a session");
+                        let p = Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap();
+                        let p = PeerPacket::parse(p, session.parse_context()).unwrap();
+                        let out = session.handle(p, &mut self.view(), now);
+                        self.queued |= out
+                            .events
+                            .iter()
+                            .any(|e| matches!(e, DownEvent::Queued { .. }));
+                        self.session = Some(session);
+                        for p in out.send {
+                            let p = Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap();
+                            todo.extend(up.packet(conn, p, now));
+                        }
+                    }
+                }
+                a => rest.push(a),
+            }
+        }
+        rest
+    }
+}
+
+/// Our uploader with two slots, both taken, sharing one file; and a
+/// downloader for it.
+fn callback_setup(dir: &TempDir) -> (crate::uploader::Uploader, Downloader, Vec<u8>, Instant) {
+    use std::sync::{Arc, Mutex};
+
+    use ed2k_peer::hello::{CryptSettings, MiscOptions2};
+    use ed2k_peer::Hello;
+    use ed2k_types::ed2k::PARTSIZE;
+
+    use crate::shared::{mtime, ScanOptions, SharedFiles};
+
+    let size = 2 * PARTSIZE + 4_321;
+    let content = data(size, 31);
+    let src = dir.0.join("share");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("book.txt"), &content).unwrap();
+    let mut shares = SharedFiles::load(&dir.0.join("config")).unwrap();
+    let r = shares.scan(
+        &ScanOptions {
+            dirs: vec![src.clone()],
+            ..Default::default()
+        },
+        1,
+    );
+    let p = &r.to_hash[0];
+    let h = SharedFiles::hash(p).unwrap();
+    shares.add_hashed(p, &h, mtime(&fs::metadata(p).unwrap()), 1);
+
+    let t0 = Instant::now();
+    let mut queue = two_slots();
+    assert_eq!(ask(&mut queue, asker(1), t0), Answer::Slot);
+    assert_eq!(
+        ask(&mut queue, asker(2), t0 + Duration::from_secs(2)),
+        Answer::Slot
+    );
+    let mut ours = Hello::amule(Md4Hash([0x22; 16]), 0x0200_000A, 4662, "sharer");
+    ours.misc2 = Some(MiscOptions2::amule(0, CryptSettings::default()));
+    let up = crate::uploader::Uploader::new(ours, None, Arc::new(Mutex::new(shares)), queue, None);
+    let pf = crate::PartFile::create(&dir.temp(), "book.txt", h.ed2k, size).unwrap();
+    let d = Downloader {
+        pf,
+        last: None,
+        session: None,
+        queued: false,
+    };
+    (up, d, content, t0 + Duration::from_secs(4))
+}
+
+fn downloader_hello() -> ed2k_peer::Hello {
+    use ed2k_peer::hello::{CryptSettings, MiscOptions2};
+    // A HighID at 10.0.0.9, listening on 4711.
+    let mut h = ed2k_peer::Hello::amule(Md4Hash([0x11; 16]), 0x0900_000A, 4711, "getter");
+    h.misc2 = Some(MiscOptions2::amule(0, CryptSettings::default()));
+    h
+}
+
+/// The downloader asks, waits in the queue, and its connection goes idle.
+fn queue_then_go_idle(up: &mut crate::uploader::Uploader, d: &mut Downloader, now: Instant) {
+    use crate::download_queue::Action;
+    use ed2k_codec::Packet;
+    use ed2k_peer::download::Session;
+    use ed2k_peer::PeerPacket;
+
+    let (session, hello) = {
+        let view = d.view();
+        Session::connect(downloader_hello(), &view, now).unwrap()
+    };
+    d.session = Some(session);
+    let p = Packet::parse_tcp(&hello.to_tcp_bytes().unwrap()).unwrap();
+    let PeerPacket::Hello(h) = PeerPacket::parse(p, Default::default()).unwrap() else {
+        panic!()
+    };
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+    let actions = up.accept(1, h, ip, now);
+    let rest = d.pump(up, 1, actions, now);
+    assert!(rest.is_empty(), "{rest:?}");
+    assert!(d.queued, "not queued");
+    assert_eq!(up.queue().waiting_count(), 1);
+
+    // Nothing for CONNECTION_TIMEOUT: closed, its place kept.
+    assert!(up
+        .tick(now + Duration::from_secs(30), &mut || 99)
+        .is_empty());
+    let a = up.tick(now + Duration::from_secs(41), &mut || 99);
+    assert!(matches!(a[..], [Action::Close { conn: 1 }]), "{a:?}");
+    assert!(!up.owns(1));
+    let mut s = d.session.take().unwrap();
+    let _ = s.closed(&mut d.view());
+    d.session = Some(s);
+    assert_eq!(up.queue().waiting_count(), 1);
+}
+
+#[test]
+fn a_waiting_peer_is_called_back_when_a_slot_frees() {
+    use crate::download_queue::{Action, Report};
+    use crate::Completion;
+    use ed2k_codec::Packet;
+    use ed2k_peer::download::Session;
+    use ed2k_peer::PeerPacket;
+    use std::net::SocketAddr;
+
+    let dir = TempDir::new("upload-callback");
+    let (mut up, mut d, content, now) = callback_setup(&dir);
+    queue_then_go_idle(&mut up, &mut d, now);
+    let parts = d.session.as_ref().unwrap().peer_parts().cloned();
+
+    // A slot frees: we dial the peer where it said it listens.
+    up.queue_mut().ended(&Md4Hash([1; 16]));
+    let now = now + Duration::from_secs(45);
+    let a = up.tick(now, &mut || 7);
+    let [Action::Connect {
+        conn: 7,
+        addr,
+        obfuscate_for: None,
+    }] = a[..]
+    else {
+        panic!("{a:?}")
+    };
+    assert_eq!(addr, "10.0.0.9:4711".parse::<SocketAddr>().unwrap());
+    assert!(up.owns(7));
+    assert_eq!(up.queue().slot_count(), 2);
+
+    // Connected: our hello; it takes us for the source it waits on.
+    let a = up.connected(7, now);
+    let [Action::Send {
+        conn: 7,
+        ref packets,
+    }] = a[..]
+    else {
+        panic!("{a:?}")
+    };
+    let p = Packet::parse_tcp(&packets[0].to_tcp_bytes().unwrap()).unwrap();
+    let PeerPacket::Hello(h) = PeerPacket::parse(p, Default::default()).unwrap() else {
+        panic!()
+    };
+    let (session, out) = {
+        let view = d.view();
+        Session::accepted(downloader_hello(), h, &view, parts, now).unwrap()
+    };
+    d.session = Some(session);
+    let mut actions = Vec::new();
+    for p in out.send {
+        let p = Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap();
+        actions.extend(up.packet(7, p, now));
+    }
+    // The hello answer gives it the slot, and the file goes over.
+    let rest = d.pump(&mut up, 7, actions, now);
+    let file = d.pf.hash();
+    assert!(
+        rest.iter().any(|a| matches!(
+            a,
+            Action::Report(Report::UploadStarted { user, file: f })
+                if *user == Md4Hash([0x11; 16]) && *f == file
+        )),
+        "{rest:?}"
+    );
+    assert!(up.sent_total() >= content.len() as u64);
+    assert_eq!(up.queue().waiting_count(), 0);
+    let Completion::Done(path) = d.pf.complete(&dir.incoming()).unwrap() else {
+        panic!("not complete");
+    };
+    assert_eq!(fs::read(path).unwrap(), content);
+}
+
+#[test]
+fn an_unreachable_peer_loses_its_slot() {
+    use crate::download_queue::Action;
+
+    let dir = TempDir::new("upload-callback-fail");
+    let (mut up, mut d, _, now) = callback_setup(&dir);
+    queue_then_go_idle(&mut up, &mut d, now);
+    up.queue_mut().ended(&Md4Hash([1; 16]));
+    let now = now + Duration::from_secs(45);
+    let a = up.tick(now, &mut || 7);
+    assert!(matches!(a[..], [Action::Connect { conn: 7, .. }]));
+    // The connection fails.
+    up.closed(7);
+    assert!(!up.owns(7));
+    assert_eq!(up.queue().slot_count(), 1);
+    assert_eq!(up.queue().waiting_count(), 0);
+
+    // A dial that connects but never answers our hello times out.
+    let dir = TempDir::new("upload-callback-mute");
+    let (mut up, mut d, _, now) = callback_setup(&dir);
+    queue_then_go_idle(&mut up, &mut d, now);
+    up.queue_mut().ended(&Md4Hash([1; 16]));
+    let now = now + Duration::from_secs(45);
+    let _ = up.tick(now, &mut || 7);
+    let _ = up.connected(7, now);
+    let a = up.tick(now + Duration::from_secs(41), &mut || 8);
+    assert!(
+        a.iter().any(|a| matches!(a, Action::Close { conn: 7 })),
+        "{a:?}"
+    );
+    assert_eq!(up.queue().slot_count(), 1);
+}

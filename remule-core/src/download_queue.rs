@@ -354,6 +354,12 @@ impl DownloadQueue {
         &self.config
     }
 
+    /// A connection id for another part of the client (the uploader's
+    /// callbacks), from the same sequence as ours.
+    pub fn new_conn_id(&mut self) -> ConnId {
+        self.id()
+    }
+
     fn id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;

@@ -8,6 +8,7 @@ description = "remule's client core: part files and the download queue, later th
 [dependencies]
 ed2k-formats = { path = "../ed2k-formats" }
 ed2k-codec = { path = "../ed2k-codec" }
+ed2k-crypto = { path = "../ed2k-crypto" }
 ed2k-hash = { path = "../ed2k-hash" }
 ed2k-kad = { path = "../ed2k-kad" }
 ed2k-peer = { path = "../ed2k-peer" }

@@ -78,7 +78,7 @@ pub fn line(s: &Statistics) -> String {
     )
 }
 
-/// The session's statistics on shutdown: [`line`], then uptime, average
+/// The session's statistics on shutdown: [`line()`], then uptime, average
 /// rates and the time since the first transfer.
 pub fn summary(s: &Statistics, now: Instant) -> String {
     let (down, up) = s.average_rates(now);

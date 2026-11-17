@@ -49,3 +49,46 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # MIGRATION_PLAN.md 9.M: a released aMule downloads a file that remule
+  # shares, on Fedora.
+  #
+  # Not Ubuntu's 2.3.3: it can stop reading a peer socket for good. It waits
+  # for readability with async_read_some(null_buffers()) on Boost.Asio's
+  # edge-triggered epoll, and bytes that land before the wait is re-armed
+  # never wake it (fixed upstream in 3.x, amule-org/amule ee5289884). The
+  # stall hit a stock-2.3.3 source as often as remule.
+  amule-interop:
+    strategy:
+      fail-fast: false
+      matrix:
+        # amule: the control, the same aMule as the source instead of remule.
+        source: [remule, amule]
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    timeout-minutes: 20
+    env:
+      AMULE_VERSION: 3.2.0
+    steps:
+      - name: Install tools
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc git curl tar gzip python3 gawk tcpdump iproute hostname \
+            procps-ng util-linux diffutils findutils sudo
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Upstream's static build: one tarball, any distribution.
+      - name: Install aMule
+        run: |
+          curl -fsSL --retry 3 -o /tmp/amule.tar.gz \
+            "https://github.com/amule-org/amule/releases/download/$AMULE_VERSION/aMule-$AMULE_VERSION-Linux-x64-static.tar.gz"
+          mkdir -p /opt/amule
+          tar xzf /tmp/amule.tar.gz -C /opt/amule --strip-components=1
+          echo /opt/amule >> "$GITHUB_PATH"
+      - name: Build remule
+        run: cargo build --release -p remule-cli
+      - name: aMule downloads from remule
+        run: bash scripts/interop/amule-downloads-from-remule.sh
+        env:
+          SOURCE: ${{ matrix.source }}

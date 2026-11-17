@@ -69,6 +69,10 @@ dump_logs() {
 	cat "$WORK/server.log" || true
 	echo "----- amuled output -----"
 	cat "$WORK/amuled.log" || true
+	if [ -n "${SRC_CFG:-}" ]; then
+		echo "----- source aMule logfile -----"
+		grep -v "External connection\|Connecting client: aMulecmd\|Access granted\|New external" "$SRC_CFG/logfile" 2>/dev/null || true
+	fi
 	echo "----- aMule logfile -----"
 	cat "$AMULE_CFG/logfile" 2>/dev/null || true
 	echo "----- aMule temp dir -----"
@@ -130,12 +134,15 @@ EOF
 	: > "$SRC_CFG/addresses.dat"
 	amuled --config-dir="$SRC_CFG" > "$WORK/remule.log" 2>&1 &
 	PIDS+=($!)
-	for _ in $(seq 1 60); do
-		amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | grep -q "$NAME" && break
+	# Ready once it has hashed the file (its log lists the known shared files).
+	for _ in $(seq 1 90); do
+		grep -q "known shared files\|shared files found" "$SRC_CFG/logfile" 2>/dev/null 			&& [ -s "$SRC_CFG/known.met" ] && break
 		sleep 1
 	done
-	echo "source aMule shares:"
-	amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | grep -i "$NAME" || echo "  (not yet)"
+	echo "source aMule:"
+	grep -i "shared\|hash\|ListenSocket\|error" "$SRC_CFG/logfile" 2>/dev/null | head -10 || true
+	ls -la "$SRC_CFG" | sed 's/^/  /'
+	amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | tail -5 | sed 's/^/  /'
 else
 	# remule shares it and waits; every peer packet is traced to its log.
 	REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \

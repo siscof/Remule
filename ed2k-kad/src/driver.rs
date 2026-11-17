@@ -2,7 +2,7 @@
 //! The [`Kad`] node on a tokio UDP socket: one task owns the node and the
 //! socket; the application talks to it through a [`KadHandle`].
 
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use ed2k_codec::Tag;
@@ -27,6 +27,10 @@ pub struct Snapshot {
     pub connected: bool,
     pub searches: usize,
     pub external_port: Option<u16>,
+    /// The TCP firewall check's answer ([`Kad::is_firewalled`]).
+    pub firewalled: bool,
+    /// Our public IP as nodes tell it (unspecified if unknown).
+    pub public_ip: Ipv4Addr,
     pub stats: Stats,
     pub index: IndexStats,
 }
@@ -66,6 +70,7 @@ enum Command {
     ),
     StoreCounts(oneshot::Sender<(usize, usize)>),
     Bootstrap(SocketAddrV4),
+    FirewallAck(Ipv4Addr),
     Snapshot(oneshot::Sender<Snapshot>),
     Nodes(oneshot::Sender<Option<NodesDat>>),
     Index(oneshot::Sender<IndexFiles>),
@@ -158,6 +163,11 @@ impl KadHandle {
         let _ = self.cmd.send(Command::Bootstrap(to)).await;
     }
 
+    /// `OP_KAD_FWTCPCHECK_ACK` came from `ip` over TCP (see [`Kad::firewall_ack`]).
+    pub async fn firewall_ack(&self, ip: Ipv4Addr) {
+        let _ = self.cmd.send(Command::FirewallAck(ip)).await;
+    }
+
     pub async fn snapshot(&self) -> Option<Snapshot> {
         self.ask(Command::Snapshot).await
     }
@@ -191,6 +201,8 @@ fn snapshot(kad: &Kad, now: u64) -> Snapshot {
         connected: kad.is_connected(now),
         searches: kad.searches().count(),
         external_port: kad.external_port,
+        firewalled: kad.is_firewalled(now),
+        public_ip: Ipv4Addr::from(kad.public_ip()),
         stats: kad.stats.clone(),
         index: kad.index.stats(),
     }
@@ -274,6 +286,9 @@ async fn run(
                     Command::Bootstrap(to) => {
                         let d = kad.bootstrap(to, t);
                         send_all(&socket, vec![d]).await;
+                    }
+                    Command::FirewallAck(ip) => {
+                        kad.firewall_ack(ip, t);
                     }
                     Command::Snapshot(tx) => { let _ = tx.send(snapshot(&kad, t)); }
                     Command::Nodes(tx) => { let _ = tx.send(kad.nodes_to_save()); }

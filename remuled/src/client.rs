@@ -38,8 +38,10 @@ use remule_core::uploader::Uploader;
 use remule_core::PartFile;
 use remule_net::Bandwidth;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tokio::task::JoinSet;
+use tracing::{debug, info, warn};
 
+use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
 
@@ -91,7 +93,9 @@ pub struct ClientConfig {
     pub upload: bool,
     /// More directories to share.
     pub share: Vec<PathBuf>,
-    /// Others can connect to our TCP port: publish sources on Kad.
+    /// Assume others can connect to our TCP port (publish sources on Kad)
+    /// before anything says so: a HighID login or Kad's firewall check
+    /// tell while running.
     pub reachable: bool,
     /// Take sources on LAN and loopback addresses (aMule's FilterLanIPs off).
     pub allow_lan: bool,
@@ -169,7 +173,8 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
     let line = match r {
         Report::SourceAdded { .. }
         | Report::SourceDropped { .. }
-        | Report::Queued { rank: None, .. } => return,
+        | Report::Queued { rank: None, .. }
+        | Report::KadFirewallAck { .. } => return,
         Report::Queued {
             addr,
             rank: Some(n),
@@ -204,6 +209,13 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
         }
     };
     info!("[{:>5}s] {line}", t.as_secs());
+}
+
+/// Say so when whether others can reach us changed.
+fn log_reach(t: Duration, was: Reachability, now: Reachability) {
+    if was.reachable() != now.reachable() {
+        info!("[{:>5}s] {}", t.as_secs(), now.describe());
+    }
 }
 
 /// A server connection attempt under way: connect and log in.
@@ -338,6 +350,13 @@ pub async fn run(
         .collect();
     let mut connector = Connector::new(servers, c.obfuscate_server, c.reconnect);
     let mut attempting: Option<Attempting> = None;
+    // Whether others can connect to us: found out as we run.
+    let mut reach = Reachability {
+        assumed: c.reachable,
+        ..Default::default()
+    };
+    // Connections answering other Kad nodes' firewall checks.
+    let mut connect_backs: JoinSet<()> = JoinSet::new();
 
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", c.tcp_port)).await {
         Ok(l) => Some(l),
@@ -346,6 +365,7 @@ pub async fn run(
             None
         }
     };
+    let listening = listener.is_some();
 
     let mut ours = Hello::amule(c.user_hash, our_id, c.tcp_port, c.nick.clone());
     ours.udp_port = 0;
@@ -363,6 +383,7 @@ pub async fn run(
     qc.filter_lan = !c.allow_lan;
     qc.ip_filter = c.ip_filter.clone();
     let ours_for_upload = qc.ours.clone();
+    let ours_for_checks = qc.ours.clone();
     let queue = DownloadQueue::new(qc);
     let mut dc = DownloaderConfig::new(Arc::new(Bandwidth::new(c.max_upload, c.max_download)));
     dc.stop_when_done = c.stop_when_done;
@@ -414,6 +435,7 @@ pub async fn run(
                 tcp_port: c.tcp_port,
                 user_hash: c.user_hash,
                 reachable: c.reachable,
+                listening,
             })
             .await?,
         ),
@@ -455,6 +477,9 @@ pub async fn run(
                         );
                         our_id = li.id;
                         let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
+                        let was = reach;
+                        reach.high_id = !li.low_id;
+                        log_reach(t, was, reach);
                         // A new server: offer everything, and ask it for sources.
                         publisher.server_connected();
                         next_offer = now;
@@ -470,6 +495,9 @@ pub async fn run(
             }
             r = reports.recv() => {
                 let Some(r) = r else { continue };
+                if let (Report::KadFirewallAck { ip }, Some(k)) = (&r, &kad_node) {
+                    k.handle.firewall_ack(*ip).await;
+                }
                 if matches!(r, Report::Completed { .. }) {
                     done += 1;
                 }
@@ -493,6 +521,9 @@ pub async fn run(
                         server = None;
                         our_id = 0;
                         let _ = cmd.send(Command::SetOurId { id: 0, public_ip: None });
+                        let was = reach;
+                        reach.high_id = false;
+                        log_reach(t, was, reach);
                         let next = connector.lost(Instant::now());
                         follow(next, &c, &mut attempting, t);
                     }
@@ -515,6 +546,28 @@ pub async fn run(
                         if let Some(file) = kad_searches.remove(&search) {
                             info!("[{:>5}s] Kad: {answers} source answers for {}", start.elapsed().as_secs(),
                                 names.get(&file).map(String::as_str).unwrap_or("?"));
+                        }
+                    }
+                    Some(KadEvent::Firewalled(f)) => {
+                        let was = reach;
+                        reach.kad_open = !f;
+                        info!("[{:>5}s] Kad: {}", start.elapsed().as_secs(),
+                            if f { "firewalled" } else { "nodes reach our TCP port" });
+                        log_reach(start.elapsed(), was, reach);
+                    }
+                    // Another node's firewall check: connect back, unless the
+                    // IP filter blocks it or enough are running already.
+                    Some(KadEvent::FirewallCheck { tcp, user_hash, connect_options }) => {
+                        while connect_backs.try_join_next().is_some() {}
+                        let blocked = c.ip_filter.as_ref().is_some_and(|f| f.blocks_client(*tcp.ip()));
+                        if !blocked && connect_backs.len() < MAX_CONNECT_BACKS {
+                            let mut hello = ours_for_checks.clone();
+                            hello.id = our_id;
+                            connect_backs.spawn(async move {
+                                if let Err(e) = firewall::connect_back(tcp, user_hash, connect_options, hello).await {
+                                    debug!("Kad firewall check for {tcp}: {e}");
+                                }
+                            });
                         }
                     }
                     Some(_) => {}
@@ -553,7 +606,7 @@ pub async fn run(
                     let publishes = {
                         let mut sh = sh.lock().unwrap_or_else(|e| e.into_inner());
                         publisher.update_keywords(&sh);
-                        publisher.kad_publish(&mut sh, running, c.reachable, c.tcp_port, 0x03, unix_now().into())
+                        publisher.kad_publish(&mut sh, running, reach.reachable(), c.tcp_port, 0x03, unix_now().into())
                     };
                     for p in publishes {
                         let r = match p {

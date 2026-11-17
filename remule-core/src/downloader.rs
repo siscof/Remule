@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ed2k_codec::Packet;
+use ed2k_types::ed2k::client_tcp::Extended;
 use ed2k_types::ed2k::CONNECTION_TIMEOUT;
-use ed2k_types::Md4Hash;
+use ed2k_types::{Md4Hash, Protocol};
 use remule_net::{establish, Bandwidth, ConnConfig, Handshake, Priority};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -228,7 +229,8 @@ pub async fn run_with(
     mut commands: mpsc::UnboundedReceiver<Command>,
     reports: mpsc::UnboundedSender<Report>,
 ) -> (DownloadQueue, Option<Uploader>) {
-    let mut incoming_addrs: HashMap<ConnId, SocketAddr> = HashMap::new();
+    // Where each connection goes (or came from).
+    let mut peer_addrs: HashMap<ConnId, SocketAddr> = HashMap::new();
     let (net_tx, mut net_rx) = mpsc::unbounded_channel();
     let mut conns: HashMap<ConnId, ConnHandle> = HashMap::new();
     let conn_cfg = ConnConfig::new(config.bandwidth.clone());
@@ -260,6 +262,14 @@ pub async fn run_with(
                         Some(up) if up.owns(c) => up.connected(c, now),
                         _ => queue.connected(c, now),
                     },
+                    // `OP_KAD_FWTCPCHECK_ACK`: a Kad node we asked to check our
+                    // firewall got through. Kad's business, on any connection.
+                    NetEvent::Packet(c, p) if is_kad_firewall_ack(&p) => {
+                        if let Some(SocketAddr::V4(a)) = peer_addrs.get(&c) {
+                            let _ = reports.send(Report::KadFirewallAck { ip: *a.ip() });
+                        }
+                        Vec::new()
+                    }
                     NetEvent::Packet(c, p) => match uploader.as_mut() {
                         Some(up) if up.owns(c) => up.packet(c, p, now),
                         Some(up) if queue.is_unmatched_incoming(c) => {
@@ -268,7 +278,7 @@ pub async fn run_with(
                             match PeerPacket::parse(p.clone(), Default::default()) {
                                 Ok(PeerPacket::Hello(h)) if !queue.wants_incoming(&h) => {
                                     queue.forget(c);
-                                    let ip = incoming_addrs
+                                    let ip = peer_addrs
                                         .get(&c)
                                         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip());
                                     up.accept(c, h, ip, now)
@@ -280,7 +290,7 @@ pub async fn run_with(
                     },
                     NetEvent::Closed(c) => {
                         conns.remove(&c);
-                        incoming_addrs.remove(&c);
+                        peer_addrs.remove(&c);
                         match uploader.as_mut() {
                             Some(up) if up.owns(c) => {
                                 up.closed(c);
@@ -301,7 +311,7 @@ pub async fn run_with(
                 Some(stream) => {
                     let conn = queue.incoming();
                     if let Ok(a) = stream.peer_addr() {
-                        incoming_addrs.insert(conn, a);
+                        peer_addrs.insert(conn, a);
                     }
                     let hs = Handshake::Incoming {
                         own_hash,
@@ -353,6 +363,7 @@ pub async fn run_with(
                         },
                         None => Handshake::Plain,
                     };
+                    peer_addrs.insert(conn, addr);
                     spawn(conn, How::Outgoing(addr, hs), &mut conns);
                 }
                 Action::Send { conn, packets } => {
@@ -402,6 +413,11 @@ pub async fn run_with(
         h.task.abort();
     }
     (queue, uploader)
+}
+
+/// `OP_KAD_FWTCPCHECK_ACK` (eMule protocol, no payload).
+fn is_kad_firewall_ack(p: &Packet) -> bool {
+    p.protocol == u8::from(Protocol::Emule) && p.opcode == u8::from(Extended::KadFwTcpCheckAck)
 }
 
 /// The next incoming connection, or never without a listener.

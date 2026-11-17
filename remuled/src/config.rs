@@ -300,7 +300,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         max_upload: prefs.max_upload,
         upload: true,
         share: shared_dirs(dir),
-        // Unknown until a firewall check, which is not ported: assume not.
+        // Not assumed: a HighID login or Kad's firewall check tell as it runs.
         reachable: false,
         allow_lan: !filter_lan,
         ip_filter: Some(ip_filter),

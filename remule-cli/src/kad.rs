@@ -158,6 +158,8 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
         tcp_port: a.port,
         user_hash: ed2k_server::packets::new_user_hash(&mut rand::thread_rng()),
         reachable: a.reachable,
+        // Nothing listens on TCP here: no firewall check.
+        listening: false,
     })
     .await?;
     let mut h = node.handle;
@@ -202,6 +204,8 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
                             print_sources(&hash, &v);
                         }
                     }
+                    // No TCP here: no firewall check either way.
+                    Event::Firewalled(_) | Event::FirewallCheck { .. } => {}
                 }
             }
             _ = tick.tick() => {

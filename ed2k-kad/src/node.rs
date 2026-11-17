@@ -11,6 +11,13 @@
 //! It stores what others publish to it ([`crate::index`]) when it is
 //! reachable, answers searches from that, and keeps flooders out
 //! ([`crate::tracking`]).
+//!
+//! When it takes TCP connections it runs the TCP firewall check
+//! ([`crate::firewall`]): nodes that say hello while a check runs are asked
+//! to connect to our TCP port, and [`Kad::firewall_ack`] counts those that
+//! got through ([`Event::Firewalled`] tells when the answer changes). The
+//! same check asked of us comes out as [`Event::FirewallCheck`], for the
+//! application to connect back.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -24,6 +31,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::contact::{is_good_ip_port, is_lan_ip, Contact, UdpKey};
+use crate::firewall::{PublicIpVote, Recheck, Reply, Requests, RECHECK_INTERVAL};
 use crate::index::{size_of, Entry, Index, KeyEntry};
 use crate::packets::{ContactRecord, Hello, KadPacket, SearchAnswer, SizedTag};
 use crate::routing::{RoutingTable, CONTACT_FILE_LIMIT};
@@ -57,7 +65,11 @@ pub struct Config {
     /// Our user hash (what eD2k-keyed obfuscated packets to us use).
     pub user_hash: Md4Hash,
     pub tcp_port: u16,
-    /// Say we cannot take TCP connections (nothing listens).
+    /// Nothing listens on `tcp_port`: say we are TCP-firewalled, and run no
+    /// firewall checks, ours or others'. Otherwise the application has the
+    /// TCP side: it passes on the acks peers send there
+    /// ([`Kad::firewall_ack`]) and connects back when asked
+    /// ([`Event::FirewallCheck`]).
     pub tcp_firewalled: bool,
     /// Say we cannot take unsolicited UDP: other nodes then keep us out of
     /// their routing tables, which suits a short-lived node.
@@ -84,6 +96,19 @@ pub enum Event {
         search: u32,
         answers: u32,
         requests: u32,
+    },
+    /// The TCP firewall check changed its answer (`CKademlia::IsFirewalled`):
+    /// `false` when other nodes can connect to our TCP port. We start
+    /// firewalled.
+    Firewalled(bool),
+    /// A node asks us to connect to its TCP port (`KADEMLIA_FIREWALLED2_REQ`,
+    /// `CClientList::RequestTCP`): after the hellos, send it
+    /// `OP_KAD_FWTCPCHECK_ACK` there. It has been told its IP already.
+    FirewallCheck {
+        tcp: SocketAddrV4,
+        user_hash: Md4Hash,
+        /// Its connect options: bit 0 crypt supported, 1 requested, 2 required.
+        connect_options: u8,
     },
 }
 
@@ -132,6 +157,15 @@ pub struct Kad {
     tracker: InTracker,
     banned: HashMap<u32, u64>,
     rng: StdRng,
+    /// The TCP firewall check (`CPrefs::m_firewallRecheck`).
+    recheck: Recheck,
+    /// Nodes asked to check it (`CClientList::m_firewallCheckRequests`).
+    fw_requests: Requests,
+    /// Our public IP as nodes tell it (`CPrefs::m_publicIP`).
+    ip_vote: PublicIpVote,
+    next_firewall_check: u64,
+    /// The answer last given as [`Event::Firewalled`].
+    shown_firewalled: bool,
 }
 
 /// aMule-order IP of an address.
@@ -161,6 +195,12 @@ impl Kad {
             tracker: InTracker::default(),
             banned: HashMap::new(),
             rng: StdRng::from_entropy(),
+            // The first check runs from the start.
+            recheck: Recheck::default(),
+            fw_requests: Requests::default(),
+            ip_vote: PublicIpVote::default(),
+            next_firewall_check: now + RECHECK_INTERVAL,
+            shown_firewalled: true,
         }
     }
 
@@ -175,6 +215,66 @@ impl Kad {
 
     pub fn searches(&self) -> impl Iterator<Item = &Search> {
         self.searches.values()
+    }
+
+    // ------------------------------------------------------------ firewall
+
+    /// `CKademlia::IsFirewalled`: other nodes cannot connect to our TCP port
+    /// (or we do not know yet).
+    pub fn is_firewalled(&self, now: u64) -> bool {
+        self.cfg.tcp_firewalled || self.recheck.is_firewalled(now)
+    }
+
+    /// Our public IP as nodes tell it (aMule order; 0 if unknown).
+    pub fn public_ip(&self) -> u32 {
+        self.ip_vote.get()
+    }
+
+    /// The public IP saved with the Kad preferences (`preferencesKad.dat`).
+    pub fn load_public_ip(&mut self, ip: u32) {
+        self.ip_vote.load(ip);
+        self.routing.public_ip = ip;
+    }
+
+    /// `OP_KAD_FWTCPCHECK_ACK` came over a TCP connection from `ip`: a node
+    /// we asked got through to our TCP port. Whether it counted (each node
+    /// asked counts once).
+    pub fn firewall_ack(&mut self, ip: Ipv4Addr, now: u64) -> bool {
+        if !self.fw_requests.take(u32::from(ip), Reply::Reachable, now) {
+            return false;
+        }
+        self.recheck.add_confirmation();
+        true
+    }
+
+    /// `CKademliaUDPListener::FirewalledCheck`: ask a node that said hello
+    /// to check our TCP port, while the check wants answers.
+    fn firewalled_check(
+        &mut self,
+        to: SocketAddrV4,
+        version: u8,
+        key: UdpKey,
+        now: u64,
+        out: &mut Output,
+    ) {
+        if self.cfg.tcp_firewalled || !self.recheck.awaiting_answers() {
+            return;
+        }
+        let p = if version > 6 {
+            KadPacket::Firewalled2Req {
+                tcp_port: self.cfg.tcp_port,
+                user_hash: UInt128::from_be_bytes(self.cfg.user_hash.0),
+                // GetMyConnectOptions(true, false): crypt supported and requested.
+                connect_options: 0x03,
+            }
+        } else {
+            KadPacket::FirewalledReq {
+                tcp_port: self.cfg.tcp_port,
+            }
+        };
+        let d = self.packet(&p, to, version, None, key, now);
+        out.send.push(d);
+        self.fw_requests.add(ip_of(&to), now);
     }
 
     /// Our verify key for `ip` (`GetUDPVerifyKey`).
@@ -335,13 +435,12 @@ impl Kad {
     }
 
     /// `SendMyDetails`
-    fn my_details(&self, target_version: u8, request_ack: bool) -> Hello {
+    fn my_details(&self, target_version: u8, request_ack: bool, now: u64) -> Hello {
         let mut misc = 0;
-        if target_version >= 8
-            && (request_ack || self.cfg.tcp_firewalled || self.cfg.udp_firewalled)
-        {
+        let tcp_firewalled = self.is_firewalled(now);
+        if target_version >= 8 && (request_ack || tcp_firewalled || self.cfg.udp_firewalled) {
             misc = (request_ack as u8) << 2
-                | (self.cfg.tcp_firewalled as u8) << 1
+                | (tcp_firewalled as u8) << 1
                 | self.cfg.udp_firewalled as u8;
         }
         Hello {
@@ -555,13 +654,23 @@ impl Kad {
             }
         }
         for c in self.routing.small_timer(now) {
-            let hello = KadPacket::HelloReq(self.my_details(c.version, false));
+            let hello = KadPacket::HelloReq(self.my_details(c.version, false, now));
             let d = self.send_to_contact(&hello, &c, now);
             out.send.push(d);
         }
         if self.next_consolidate <= now {
             self.next_consolidate = now + 45 * 60;
             self.routing.consolidate(now);
+        }
+        // `RecheckFirewalled`, every hour.
+        if self.next_firewall_check <= now {
+            self.next_firewall_check = now + RECHECK_INTERVAL;
+            self.recheck.start(now);
+        }
+        let firewalled = self.is_firewalled(now);
+        if firewalled != self.shown_firewalled {
+            self.shown_firewalled = firewalled;
+            out.events.push(Event::Firewalled(firewalled));
         }
         if self.next_jump_start <= now {
             self.next_jump_start = now + 1;
@@ -764,10 +873,11 @@ impl Kad {
                 let mut verified = valid_key;
                 let added =
                     self.add_hello_sender(&h, ip, &mut port, sender_key, &mut verified, now);
-                let res = KadPacket::HelloRes(self.my_details(h.version, added && !valid_key));
+                let res = KadPacket::HelloRes(self.my_details(h.version, added && !valid_key, now));
                 let to = SocketAddrV4::new(*from.ip(), port);
                 let d = self.packet(&res, to, h.version, Some(h.id), sender_key, now);
                 out.send.push(d);
+                self.firewalled_check(to, h.version, sender_key, now, out);
             }
             KadPacket::HelloRes(h) => {
                 if !self.was_requested(ip, Opcode::HelloReq, now) {
@@ -784,6 +894,8 @@ impl Kad {
                     let d = self.packet(&ack, to, h.version, None, sender_key, now);
                     out.send.push(d);
                 }
+                let to = SocketAddrV4::new(*from.ip(), port);
+                self.firewalled_check(to, h.version, sender_key, now, out);
             }
             KadPacket::HelloResAck { id } => {
                 if !self.was_requested(ip, Opcode::HelloRes, now) || !valid_key {
@@ -945,7 +1057,58 @@ impl Kad {
                     }
                 }
             }
-            KadPacket::PublishResAck | KadPacket::Other { .. } => {}
+            // `ProcessFirewalled2Request`: tell the node its IP, and have the
+            // application connect to it (`RequestTCP`), not to ourselves.
+            KadPacket::Firewalled2Req {
+                tcp_port,
+                user_hash,
+                connect_options,
+            } => {
+                if self.cfg.tcp_firewalled
+                    || (ip == self.ip_vote.get() && tcp_port == self.cfg.tcp_port)
+                {
+                    return;
+                }
+                let res = KadPacket::FirewalledRes { ip };
+                let d = self.packet(&res, from, 0, None, sender_key, now);
+                out.send.push(d);
+                out.events.push(Event::FirewallCheck {
+                    tcp: SocketAddrV4::new(*from.ip(), tcp_port),
+                    user_hash: Md4Hash(user_hash.to_be_bytes()),
+                    connect_options,
+                });
+            }
+            // `ProcessFirewalledResponse`: a node we asked tells us our IP.
+            KadPacket::FirewalledRes { ip: ours } => {
+                // The check has its answers: a late one would only let its
+                // sender have the last word.
+                if !self.recheck.awaiting_answers() {
+                    return;
+                }
+                if !self.fw_requests.take(ip, Reply::PublicIp, now) {
+                    self.stats.unrequested += 1;
+                    return;
+                }
+                if self.ip_vote.get() != ours {
+                    self.ip_vote.report(ours, ip);
+                    self.routing.public_ip = self.ip_vote.get();
+                }
+                self.recheck.add_answer(now);
+            }
+            // `ProcessFirewalledAckResponse`: the UDP ack of nodes before
+            // version 7 that got through to our TCP port.
+            KadPacket::FirewalledAckRes => {
+                if !self.fw_requests.take(ip, Reply::Reachable, now) {
+                    self.stats.unrequested += 1;
+                    return;
+                }
+                self.recheck.add_confirmation();
+            }
+            // Kad 1 checks (from nodes before version 7) are not answered:
+            // the ack would go back over UDP.
+            KadPacket::FirewalledReq { .. }
+            | KadPacket::PublishResAck
+            | KadPacket::Other { .. } => {}
         }
     }
 }

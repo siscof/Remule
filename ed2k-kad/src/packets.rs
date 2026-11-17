@@ -7,6 +7,7 @@
 use ed2k_codec::packet::kad_unpack_limit;
 use ed2k_codec::tag::{read_kad_list, write_kad_list};
 use ed2k_codec::{Packet, Reader, Tag, TagName, TagValue, Writer};
+use ed2k_types::kad::v1::Opcode as V1;
 use ed2k_types::kad::v2::Opcode;
 use ed2k_types::kad::FindType;
 use ed2k_types::tags::kad as tag;
@@ -170,6 +171,25 @@ pub enum KadPacket {
     Pong {
         port: u16,
     },
+    /// `KADEMLIA_FIREWALLED_REQ` (Kad 1, still sent to nodes before
+    /// version 7): `<tcp port 2>`
+    FirewalledReq {
+        tcp_port: u16,
+    },
+    /// `KADEMLIA_FIREWALLED2_REQ`: `<tcp port 2><user hash 16><connect options 1>`
+    Firewalled2Req {
+        tcp_port: u16,
+        /// The asker's user hash, as `WriteUInt128` writes it.
+        user_hash: UInt128,
+        /// 1 crypt supported, 2 requested, 4 required, 8 direct callback.
+        connect_options: u8,
+    },
+    /// `KADEMLIA_FIREWALLED_RES`: `<the asker's IP 4>`
+    FirewalledRes {
+        ip: u32,
+    },
+    /// `KADEMLIA_FIREWALLED_ACK_RES` (before Kad version 7): (null)
+    FirewalledAckRes,
     /// Anything else (or older): the opcode and payload.
     Other {
         opcode: u8,
@@ -275,6 +295,10 @@ impl KadPacket {
             KadPacket::PublishResAck => Opcode::PublishResAck,
             KadPacket::Ping => Opcode::Ping,
             KadPacket::Pong { .. } => Opcode::Pong,
+            KadPacket::Firewalled2Req { .. } => Opcode::Firewalled2Req,
+            KadPacket::FirewalledReq { .. } => return V1::FirewalledReq.into(),
+            KadPacket::FirewalledRes { .. } => return V1::FirewalledRes.into(),
+            KadPacket::FirewalledAckRes => return V1::FirewalledAckRes.into(),
             KadPacket::Other { opcode, .. } => return *opcode,
         };
         op.into()
@@ -284,7 +308,23 @@ impl KadPacket {
     pub fn payload(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
-            KadPacket::BootstrapReq | KadPacket::Ping | KadPacket::PublishResAck => {}
+            KadPacket::BootstrapReq
+            | KadPacket::Ping
+            | KadPacket::PublishResAck
+            | KadPacket::FirewalledAckRes => {}
+            KadPacket::FirewalledReq { tcp_port } => {
+                w.u16(*tcp_port);
+            }
+            KadPacket::Firewalled2Req {
+                tcp_port,
+                user_hash,
+                connect_options,
+            } => {
+                w.u16(*tcp_port).uint128(*user_hash).u8(*connect_options);
+            }
+            KadPacket::FirewalledRes { ip } => {
+                w.u32(*ip);
+            }
             KadPacket::SearchNotesReq { target, size } => {
                 w.uint128(*target).u64(*size);
             }
@@ -410,6 +450,33 @@ impl KadPacket {
         }
         let mut r = Reader::new(&p.payload);
         let e = |x: ed2k_codec::Error| bad(x.to_string());
+        // The Kad 1 packets of the firewall check (CHECK_PACKET_EXACT_SIZE).
+        let exact = |n: usize| {
+            if p.payload.len() == n {
+                Ok(())
+            } else {
+                Err(bad(format!("{} bytes, not {n}", p.payload.len())))
+            }
+        };
+        match V1::try_from(opcode) {
+            Ok(V1::FirewalledReq) => {
+                exact(2)?;
+                return Ok(KadPacket::FirewalledReq {
+                    tcp_port: r.u16().map_err(e)?,
+                });
+            }
+            Ok(V1::FirewalledRes) => {
+                exact(4)?;
+                return Ok(KadPacket::FirewalledRes {
+                    ip: r.u32().map_err(e)?,
+                });
+            }
+            Ok(V1::FirewalledAckRes) => {
+                exact(0)?;
+                return Ok(KadPacket::FirewalledAckRes);
+            }
+            _ => {}
+        }
         let Ok(op) = Opcode::try_from(opcode) else {
             return Ok(KadPacket::Other {
                 opcode,
@@ -529,6 +596,12 @@ impl KadPacket {
             Opcode::Ping => KadPacket::Ping,
             Opcode::Pong => KadPacket::Pong {
                 port: r.u16().map_err(e)?,
+            },
+            // CHECK_PACKET_MIN_SIZE(19)
+            Opcode::Firewalled2Req => KadPacket::Firewalled2Req {
+                tcp_port: r.u16().map_err(e)?,
+                user_hash: r.uint128().map_err(e)?,
+                connect_options: r.u8().map_err(e)?,
             },
             _ => KadPacket::Other {
                 opcode,

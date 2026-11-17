@@ -5,6 +5,8 @@
 //! * [`config`]: an aMule config directory turned into a client's settings.
 //! * [`client`]: the running client (also behind `remule download`).
 //! * [`kad`]: a Kad node started from, and saved to, aMule's files.
+//! * [`firewall`]: whether others can reach us; answering Kad's firewall
+//!   checks over TCP.
 //! * [`bootstrap`]: `nodes.dat` and server lists fetched over HTTP at start.
 //! * [`http`]: one file over HTTP(S).
 //! * [`server_conn`]: which eD2k server to log into next, and when.
@@ -12,6 +14,7 @@
 pub mod bootstrap;
 pub mod client;
 pub mod config;
+pub mod firewall;
 pub mod http;
 pub mod kad;
 pub mod server_conn;
@@ -20,5 +23,7 @@ pub mod server_conn;
 mod tests;
 #[cfg(test)]
 mod tests_bootstrap;
+#[cfg(test)]
+mod tests_firewall;
 #[cfg(test)]
 mod tests_server_conn;

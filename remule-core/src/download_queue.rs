@@ -239,6 +239,11 @@ pub enum Report {
         user: Md4Hash,
         file: Md4Hash,
     },
+    /// `OP_KAD_FWTCPCHECK_ACK` came from a peer at `ip`: for Kad's firewall
+    /// check (`ed2k_kad::Kad::firewall_ack`). The downloader reports it.
+    KadFirewallAck {
+        ip: Ipv4Addr,
+    },
 }
 
 /// Where a source stands (`EDownloadState`, simplified).

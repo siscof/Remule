@@ -400,7 +400,7 @@ fn the_ip_filter_loads_as_amule_does() {
     let d = TempDir::new("ipfilter");
     let dir = &d.0;
     let mut notes = Vec::new();
-    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes);
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes, &mut Vec::new());
     assert_eq!(f.ban_count(), 0);
     let placeholder = std::fs::read_to_string(dir.join("ipfilter.dat")).unwrap();
     assert!(placeholder.starts_with("# This file is used by aMule to store ipfilter lists"));
@@ -419,31 +419,31 @@ fn the_ip_filter_loads_as_amule_does() {
         "1.0.0.128 - 1.0.0.255 , 200 , friends\n",
     )
     .unwrap();
-    let mut notes = Vec::new();
-    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes);
+    let mut info = Vec::new();
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut Vec::new(), &mut info);
     assert!(f.blocks_client(Ipv4Addr::new(1, 0, 0, 5)));
     assert!(!f.blocks_client(Ipv4Addr::new(1, 0, 0, 200)));
     // 140 is not below the default level, 127.
     assert!(!f.blocks_client(Ipv4Addr::new(2, 0, 0, 1)));
     assert!(f.blocks_server(Ipv4Addr::new(1, 0, 0, 5)));
     assert!(
-        notes.iter().any(|n| n.starts_with("Loaded 2 IP-ranges")
+        info.iter().any(|n| n.starts_with("Loaded 2 IP-ranges")
             && n.ends_with("1 malformed lines were discarded.")),
-        "{notes:?}"
+        "{info:?}"
     );
 
     // A higher level blocks more; clients unfiltered, servers still.
     let conf = ConfFile::parse(
         "[eMule]\nFilterLevel=150\n[ExternalConnect]\nIpFilterClients=0\nIpFilterServers=1\n",
     );
-    let f = config::ip_filter(dir, &conf, &mut Vec::new());
+    let f = config::ip_filter(dir, &conf, &mut Vec::new(), &mut Vec::new());
     assert!(!f.blocks_client(Ipv4Addr::new(2, 0, 0, 1)));
     assert!(f.blocks_server(Ipv4Addr::new(2, 0, 0, 1)));
 
     // A zip is not read, and says so.
     std::fs::write(dir.join("ipfilter.dat"), b"PK\x03\x04rest of a zip").unwrap();
     let mut notes = Vec::new();
-    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes);
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes, &mut Vec::new());
     assert!(!f.blocks_client(Ipv4Addr::new(1, 0, 0, 5)));
     assert!(notes.iter().any(|n| n.contains("packed list")), "{notes:?}");
 }

@@ -72,6 +72,18 @@ async fn main() -> std::process::ExitCode {
         error!("no config directory: give --config-dir");
         return std::process::ExitCode::from(2);
     };
+    // What amuled fetches before the networks start: a nodes.dat, server lists.
+    if dir.is_dir() {
+        let conf = std::fs::read(dir.join("amule.conf"))
+            .map(|b| ed2k_formats::amule_conf::ConfFile::from_bytes(&b))
+            .unwrap_or_else(|_| ed2k_formats::amule_conf::ConfFile::new());
+        let mut notes = Vec::new();
+        let plan = remuled::bootstrap::plan(&dir, &conf, &mut notes);
+        for n in &notes {
+            warn!("{n}");
+        }
+        remuled::bootstrap::run(&dir, &plan).await;
+    }
     let loaded = match remuled::config::load(&dir) {
         Ok(l) => l,
         Err(e) => {
@@ -79,6 +91,9 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    for n in &loaded.info {
+        info!("{n}");
+    }
     for n in &loaded.notes {
         warn!("{n}");
     }

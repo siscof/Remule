@@ -48,6 +48,8 @@ pub struct Loaded {
     pub prefs: Preferences,
     /// Things worth telling the user (missing files, features off).
     pub notes: Vec<String>,
+    /// What was loaded, as aMule logs it.
+    pub info: Vec<String>,
 }
 
 fn read_opt(path: &Path) -> Option<Vec<u8>> {
@@ -156,7 +158,11 @@ const IPFILTER_STATIC_PLACEHOLDER: &str = concat!(
 /// One IP filter list, as `CIPFilterTask::LoadFromFile` reads it: missing
 /// or empty is no ranges; a zip or gzip one is not read (unpacking is not
 /// ported).
-fn load_filter_list(path: &Path, notes: &mut Vec<String>) -> Option<IpFilterFile> {
+fn load_filter_list(
+    path: &Path,
+    notes: &mut Vec<String>,
+    info: &mut Vec<String>,
+) -> Option<IpFilterFile> {
     let bytes = read_opt(path).filter(|b| !b.is_empty())?;
     if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(&[0x1F, 0x8B]) {
         notes.push(format!(
@@ -177,14 +183,19 @@ fn load_filter_list(path: &Path, notes: &mut Vec<String>) -> Option<IpFilterFile
             f.bad_lines()
         ));
     }
-    notes.push(msg);
+    info.push(msg);
     Some(f)
 }
 
 /// The IP filter of a config directory (`CIPFilter`, `CIPFilterTask`):
 /// `ipfilter.dat` then `ipfilter_static.dat`, the later winning where they
 /// overlap; missing files are made with aMule's placeholders.
-pub fn ip_filter(dir: &Path, conf: &ConfFile, notes: &mut Vec<String>) -> Arc<AddressFilter> {
+pub fn ip_filter(
+    dir: &Path,
+    conf: &ConfFile,
+    notes: &mut Vec<String>,
+    info: &mut Vec<String>,
+) -> Arc<AddressFilter> {
     for (name, text) in [
         ("ipfilter.dat", IPFILTER_PLACEHOLDER),
         ("ipfilter_static.dat", IPFILTER_STATIC_PLACEHOLDER),
@@ -198,7 +209,7 @@ pub fn ip_filter(dir: &Path, conf: &ConfFile, notes: &mut Vec<String>) -> Arc<Ad
     }
     let lists: Vec<IpFilterFile> = ["ipfilter.dat", "ipfilter_static.dat"]
         .iter()
-        .filter_map(|n| load_filter_list(&dir.join(n), notes))
+        .filter_map(|n| load_filter_list(&dir.join(n), notes, info))
         .collect();
     let refs: Vec<&IpFilterFile> = lists.iter().collect();
     let int = |key: &str| conf.get(key).and_then(ed2k_formats::amule_conf::parse_long);
@@ -252,7 +263,8 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
     if prefs.connect_to_ed2k && servers.is_empty() {
         notes.push("no servers in server.met: eD2k off".to_owned());
     }
-    let ip_filter = ip_filter(dir, &conf, &mut notes);
+    let mut info = Vec::new();
+    let ip_filter = ip_filter(dir, &conf, &mut notes, &mut info);
     let kad = if prefs.connect_to_kad {
         if dir.join("nodes.dat").is_file() {
             Some(KadSettings {
@@ -260,7 +272,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
                 nodes: None,
             })
         } else {
-            notes.push("no nodes.dat: Kad off (fetching one is not ported yet)".to_owned());
+            notes.push("no nodes.dat (none could be fetched): Kad off".to_owned());
             None
         }
     } else {
@@ -299,5 +311,6 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         client,
         prefs,
         notes,
+        info,
     })
 }

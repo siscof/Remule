@@ -186,7 +186,8 @@ enum Command {
         /// Where known.met, known2_64.met and clients.met are kept.
         #[arg(long, default_value = "remule-config")]
         config: PathBuf,
-        /// Others can connect to the TCP port: publish sources on Kad.
+        /// Others can connect to the TCP port: publish sources on Kad from
+        /// the start (otherwise once a HighID or the Kad firewall check says so).
         #[arg(long)]
         reachable: bool,
         /// Take sources on LAN and loopback addresses.

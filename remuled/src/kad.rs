@@ -47,7 +47,12 @@ pub struct KadStart {
     pub udp_port: u16,
     pub tcp_port: u16,
     pub user_hash: Md4Hash,
+    /// Others can reach our UDP port: store what they publish.
     pub reachable: bool,
+    /// Something listens on `tcp_port`, and will hand the node the firewall
+    /// check acks that come there and connect back when it is asked to:
+    /// the TCP firewall check runs.
+    pub listening: bool,
 }
 
 /// Load the state, bind the UDP port and start the node.
@@ -70,11 +75,12 @@ pub async fn start(a: &KadStart) -> Result<KadNode, String> {
         udp_key_secret: rand::thread_rng().gen(),
         user_hash: a.user_hash,
         tcp_port: a.tcp_port,
-        tcp_firewalled: true,
+        tcp_firewalled: !a.listening,
         udp_firewalled: !a.reachable,
     };
     let now = driver::unix_now();
     let mut kad = Kad::new(cfg, now);
+    kad.load_public_ip(prefs.public_ip);
     for (i, name) in INDEX_FILES.iter().enumerate() {
         let Ok(b) = std::fs::read(a.dir.join(name)) else {
             continue;
@@ -144,7 +150,14 @@ impl KadNode {
                 std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
+        // With our public IP as nodes last told it.
+        let mut p = self.prefs;
+        if let Some(s) = self.handle.snapshot().await {
+            if !s.public_ip.is_unspecified() {
+                p.public_ip = u32::from(s.public_ip);
+            }
+        }
         let path = self.dir.join(prefs::FILE_NAME);
-        std::fs::write(&path, self.prefs.write()).map_err(|e| format!("{}: {e}", path.display()))
+        std::fs::write(&path, p.write()).map_err(|e| format!("{}: {e}", path.display()))
     }
 }

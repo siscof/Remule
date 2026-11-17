@@ -3560,6 +3560,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ed2k-codec",
+ "ed2k-crypto",
  "ed2k-formats",
  "ed2k-hash",
  "ed2k-kad",

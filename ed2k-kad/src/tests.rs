@@ -427,10 +427,40 @@ fn packets_round_trip() {
         },
         KadPacket::Ping,
         KadPacket::Pong { port: 4672 },
+        KadPacket::FirewalledReq { tcp_port: 4662 },
+        KadPacket::Firewalled2Req {
+            tcp_port: 4662,
+            user_hash: id,
+            connect_options: 3,
+        },
+        KadPacket::FirewalledRes { ip: ip(1, 2, 3, 4) },
+        KadPacket::FirewalledAckRes,
     ] {
         let d = p.to_datagram();
         assert_eq!(KadPacket::parse(&d).unwrap(), p, "{p:?}");
     }
+    // The firewall check's packets as aMule writes them.
+    let d = KadPacket::Firewalled2Req {
+        tcp_port: 4662,
+        user_hash: id,
+        connect_options: 3,
+    }
+    .to_datagram();
+    assert_eq!(d.len(), 2 + 19);
+    assert_eq!(&d[..4], [0xE4, 0x53, 0x36, 0x12]);
+    assert_eq!(d[20], 3);
+    assert_eq!(
+        KadPacket::FirewalledRes { ip: ip(1, 2, 3, 4) }.to_datagram(),
+        [0xE4, 0x58, 4, 3, 2, 1]
+    );
+    assert_eq!(KadPacket::FirewalledAckRes.to_datagram(), [0xE4, 0x59]);
+    assert_eq!(
+        KadPacket::FirewalledReq { tcp_port: 1 }.to_datagram(),
+        [0xE4, 0x50, 1, 0]
+    );
+    // Kad 1 sizes are exact.
+    assert!(KadPacket::parse(&[0xE4, 0x58, 4, 3, 2]).is_err());
+    assert!(KadPacket::parse(&[0xE4, 0x59, 0]).is_err());
     // KADEMLIA2_REQ: <count><target as WriteUInt128><receiver>.
     let d = KadPacket::Req {
         count: 2,
@@ -761,7 +791,12 @@ fn answers_hello_req_and_ping_and_ignores_the_unrequested() {
         misc_options: 0,
     });
     let out = net.nodes[0].handle(b, &hello.to_datagram(), 1001);
-    assert_eq!(out.send.len(), 1);
+    // The answer, and (a firewall check running) a check request.
+    assert_eq!(out.send.len(), 2);
+    assert!(matches!(
+        KadPacket::parse(&out.send[1].bytes).unwrap(),
+        KadPacket::Firewalled2Req { .. }
+    ));
     assert!(net.nodes[0].routing.get(ids[1]).is_some());
     // Ping: pong with the port it came from.
     let out = net.nodes[0].handle(b, &KadPacket::Ping.to_datagram(), 1002);
@@ -786,8 +821,166 @@ fn answers_hello_req_and_ping_and_ignores_the_unrequested() {
         misc_options: 1,
     });
     let out = net.nodes[1].handle(a, &fw.to_datagram(), 1004);
-    assert_eq!(out.send.len(), 1);
+    assert_eq!(out.send.len(), 2);
     assert!(net.nodes[1].routing.get(UInt128::new(5)).is_none());
+}
+
+/// A packet `to` receives from `from`, decrypted as it would.
+fn read_as(to: &Kad, from: SocketAddrV4, bytes: &[u8]) -> KadPacket {
+    let plain = if bytes[0] == 0xE4 || bytes[0] == 0xE5 {
+        bytes.to_vec()
+    } else {
+        let own = OwnKeys {
+            user_hash: to.config().user_hash,
+            sender_ip: *from.ip(),
+            kad_id: Some(to.config().kad_id),
+            verify_key: Some(udp::udp_verify_key(to.config().udp_key_secret, *from.ip())),
+        };
+        udp::decrypt_client(bytes, &own).expect("decrypts").payload
+    };
+    KadPacket::parse(&plain).expect("parses")
+}
+
+/// Node `i` says hello to node 0; what node 0 sends back is delivered, and
+/// node `i`'s answers to that too. The events of node `i`.
+fn hello_to_0(net: &mut Net, i: usize) -> Vec<Event> {
+    let hello = KadPacket::HelloReq(Hello {
+        id: net.nodes[i].config().kad_id,
+        tcp_port: 4662,
+        version: 9,
+        udp_port: None,
+        misc_options: 0,
+    });
+    let d = net.nodes[i].send_to_test(&hello, net.addrs[0], 9, None, net.now);
+    net.post(i, vec![d]);
+    net.deliver()
+        .into_iter()
+        .filter(|(n, e)| *n == i && *e != Event::Connected)
+        .map(|(_, e)| e)
+        .collect()
+}
+
+/// The TCP firewall check (`CFirewallRecheck` through the UDP listener):
+/// nodes that say hello are asked to check us and tell us our IP; two that
+/// reach our TCP port make us open; each counts once; an hour later the
+/// check runs again, and with nobody getting through we are firewalled
+/// again.
+#[test]
+fn the_tcp_firewall_check() {
+    use crate::firewall::GRACE;
+    use ed2k_types::kad::KADEMLIAFIREWALLCHECKS;
+
+    let mut rng = StdRng::seed_from_u64(7);
+    let ids: Vec<UInt128> = (0..10).map(|_| UInt128::new(rng.gen())).collect();
+    let mut net = Net::new(&ids, &mut rng);
+    let us = net.addrs[0];
+    let our_hash = net.nodes[0].config().user_hash;
+    assert!(net.nodes[0].is_firewalled(net.now));
+
+    // Node 1 says hello: it is asked, tells us our IP, and asks its
+    // application to connect to our TCP port (crypt supported and requested).
+    let ev = hello_to_0(&mut net, 1);
+    assert_eq!(
+        ev,
+        [Event::FirewallCheck {
+            tcp: SocketAddrV4::new(*us.ip(), 4662),
+            user_hash: our_hash,
+            connect_options: 0x03,
+        }]
+    );
+    assert_eq!(net.nodes[0].public_ip(), u32::from(*us.ip()));
+    assert!(net.nodes[0].is_firewalled(net.now));
+
+    // Three more: the check has its answers.
+    for i in 2..=KADEMLIAFIREWALLCHECKS as usize {
+        assert_eq!(hello_to_0(&mut net, i).len(), 1);
+    }
+    // Once it has them, nobody else is asked.
+    assert!(hello_to_0(&mut net, 5).is_empty());
+
+    // Acks over TCP: an unasked node and a repeat count for nothing.
+    let ip_of = |i: usize| *net.addrs[i].ip();
+    let now = net.now;
+    assert!(!net.nodes[0].firewall_ack(ip_of(6), now));
+    assert!(net.nodes[0].firewall_ack(ip_of(1), now));
+    assert!(!net.nodes[0].firewall_ack(ip_of(1), now));
+    assert!(net.nodes[0].is_firewalled(now));
+    assert!(net.nodes[0].tick(now).events.is_empty());
+    assert!(net.nodes[0].firewall_ack(ip_of(2), now));
+    assert!(!net.nodes[0].is_firewalled(now));
+    assert_eq!(net.nodes[0].tick(now).events, [Event::Firewalled(false)]);
+
+    // Our hellos now say we take TCP connections (misc options: UDP
+    // firewalled only, as node 0 is not).
+    let hello = KadPacket::HelloReq(Hello {
+        id: ids[7],
+        tcp_port: 4662,
+        version: 9,
+        udp_port: None,
+        misc_options: 0,
+    });
+    let out = net.nodes[0].handle(net.addrs[7], &hello.to_datagram(), now);
+    assert_eq!(out.send.len(), 1, "nobody is asked any more");
+    match read_as(&net.nodes[7], us, &out.send[0].bytes) {
+        KadPacket::HelloRes(h) => assert!(!h.tcp_firewalled()),
+        p => panic!("{p:?}"),
+    }
+
+    // A late or unasked IP answer changes nothing.
+    let res = KadPacket::FirewalledRes { ip: 0x0102_0304 };
+    let before = net.nodes[0].stats.unrequested;
+    net.nodes[0].handle(net.addrs[8], &res.to_datagram(), now);
+    assert_eq!(net.nodes[0].public_ip(), u32::from(*us.ip()));
+    assert_eq!(net.nodes[0].stats.unrequested, before);
+
+    // An hour later: a recheck. Open until it has its answers, and firewalled
+    // a grace period after them when nobody got through.
+    net.now += crate::firewall::RECHECK_INTERVAL;
+    assert!(net.nodes[0].tick(net.now).events.is_empty());
+    for i in 1..=KADEMLIAFIREWALLCHECKS as usize {
+        assert_eq!(hello_to_0(&mut net, i).len(), 1);
+        assert!(!net.nodes[0].is_firewalled(net.now));
+    }
+    let answered = net.now;
+    assert!(net.nodes[0].tick(answered + GRACE - 1).events.is_empty());
+    assert_eq!(
+        net.nodes[0].tick(answered + GRACE).events,
+        [Event::Firewalled(true)]
+    );
+}
+
+/// A node that takes no TCP connections neither asks nor answers.
+#[test]
+fn no_firewall_check_without_tcp() {
+    let mut rng = StdRng::seed_from_u64(8);
+    let ids: Vec<UInt128> = (0..2).map(|_| UInt128::new(rng.gen())).collect();
+    let mut net = Net::new(&ids, &mut rng);
+    for n in &mut net.nodes {
+        *n = Kad::new(
+            Config {
+                tcp_firewalled: true,
+                ..n.config().clone()
+            },
+            net.now,
+        );
+    }
+    let hello = KadPacket::HelloReq(Hello {
+        id: ids[1],
+        tcp_port: 4662,
+        version: 9,
+        udp_port: None,
+        misc_options: 0,
+    });
+    let out = net.nodes[0].handle(net.addrs[1], &hello.to_datagram(), net.now);
+    assert_eq!(out.send.len(), 1);
+    let ask = KadPacket::Firewalled2Req {
+        tcp_port: 4662,
+        user_hash: UInt128::new(1),
+        connect_options: 0,
+    };
+    let out = net.nodes[0].handle(net.addrs[1], &ask.to_datagram(), net.now);
+    assert!(out.send.is_empty() && out.events.is_empty());
+    assert!(net.nodes[0].is_firewalled(net.now + 3600));
 }
 
 #[test]

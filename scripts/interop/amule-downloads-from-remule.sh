@@ -86,7 +86,9 @@ echo "this machine: $IP"
 # The file, and its link with remule as the source.
 NAME="remule-interop.bin"
 head -c "$SIZE" /dev/urandom > "$WORK/share/$NAME"
-LINK=$("$REMULE" hash "$WORK/share/$NAME" | grep -m1 '^ed2k://')
+# All of remule's output first: grep -m1 would close the pipe on it.
+HASH_OUT=$("$REMULE" hash "$WORK/share/$NAME")
+LINK=$(printf '%s\n' "$HASH_OUT" | grep -m1 '^ed2k://')
 LINK="${LINK}|sources,$IP:$REMULE_PORT|/"
 echo "link: $LINK"
 
@@ -130,7 +132,9 @@ ECPassword=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
 IpFilterClients=0
 IpFilterServers=0
 EOF
-	echo "$WORK/share" > "$SRC_CFG/shareddir.dat"
+	# Stock 2.3.3 ignored a shareddir.dat written before its first run; it
+	# always shares its Incoming directory.
+	cp "$WORK/share/$NAME" "$SRC_CFG/Incoming/"
 	: > "$SRC_CFG/addresses.dat"
 	amuled --config-dir="$SRC_CFG" > "$WORK/remule.log" 2>&1 &
 	PIDS+=($!)

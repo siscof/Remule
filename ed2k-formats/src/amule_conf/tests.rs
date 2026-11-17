@@ -22,6 +22,8 @@ MaxConnections=500\n\
 MaxConnectionsPerFiveSeconds=50\n\
 ConnectToKad=1\n\
 ConnectToED2K=0\n\
+Autoconnect=1\n\
+Reconnect=0\n\
 TempDir=/home/amule/.aMule/Temp\n\
 IncomingDir=/home/amule/.aMule/Incoming\n\
 ; a comment the user added\r\n\
@@ -63,6 +65,7 @@ fn preferences_read_with_amule_rules() {
     );
     assert_eq!(p.max_connections, Some(500));
     assert_eq!((p.connect_to_kad, p.connect_to_ed2k), (true, false));
+    assert_eq!((p.autoconnect, p.reconnect), (true, false));
     assert_eq!(p.temp_dir.as_deref(), Some("/home/amule/.aMule/Temp"));
     assert!(p.accept_external_connections);
     // An empty ECAddress is read as empty, not as the default: Cfg_Str
@@ -93,7 +96,12 @@ fn defaults_when_keys_are_missing() {
     assert_eq!(p.max_connections, None);
     assert_eq!((p.temp_dir, p.incoming_dir), (None, None));
     assert!(
-        p.connect_to_ed2k && p.connect_to_kad && p.udp_enabled && !p.accept_external_connections
+        p.connect_to_ed2k
+            && p.connect_to_kad
+            && p.autoconnect
+            && p.reconnect
+            && p.udp_enabled
+            && !p.accept_external_connections
     );
 }
 

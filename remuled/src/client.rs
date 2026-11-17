@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use ed2k_peer::hello::{CryptSettings, MiscOptions2};
 use ed2k_peer::secident::Identity;
 use ed2k_peer::Hello;
 use ed2k_server::session::Event as ServerEvent;
-use ed2k_server::{ConnectOptions, LoginInfo, ServerClient};
+use ed2k_server::{ConnectOptions, Login, LoginInfo, ServerClient};
 use ed2k_types::ed2k::SERVERREASKTIME;
 use ed2k_types::Md4Hash;
 use remule_core::credits::Credits;
@@ -39,6 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::kad::{self, KadStart};
+use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
 
 /// Kad source searches are repeated this often (`GetKadSourceReaskTime`).
 const KAD_REASK: Duration = Duration::from_secs(30 * 60);
@@ -70,6 +72,11 @@ pub struct ClientConfig {
     /// Servers to try in turn; the first that logs in is used.
     pub servers: Vec<SocketAddr>,
     pub obfuscate_server: bool,
+    /// Log into a server at start (aMule's `Autoconnect`).
+    pub autoconnect: bool,
+    /// Log in again when the server connection is lost, and try the list
+    /// again 30 s after every server failed (aMule's `Reconnect`).
+    pub reconnect: bool,
     pub kad: Option<KadSettings>,
     pub tcp_port: u16,
     pub udp_port: u16,
@@ -196,6 +203,46 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
     info!("[{:>5}s] {line}", t.as_secs());
 }
 
+/// A server connection attempt under way: connect and log in.
+type Attempting = Pin<Box<dyn Future<Output = Result<(ServerClient, Login), String>> + Send>>;
+
+/// Connect to and log into `a.addr`, within [`ATTEMPT_TIMEOUT`].
+fn attempt(a: Attempt, c: &ClientConfig) -> Attempting {
+    let mut login = LoginInfo::new(c.user_hash, c.tcp_port, c.nick.clone());
+    login.crypt_requested = a.obfuscated;
+    let mut opts = ConnectOptions::new(login);
+    opts.obfuscate = a.obfuscated;
+    opts.session.ask_server_list = false;
+    Box::pin(async move {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, ServerClient::connect(a.addr, opts)).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("no login within {} s", ATTEMPT_TIMEOUT.as_secs())),
+        }
+    })
+}
+
+/// Start what the connector says to do next.
+fn follow(next: Next, c: &ClientConfig, attempting: &mut Option<Attempting>, t: Duration) {
+    match next {
+        Next::Connect(a) => {
+            info!(
+                "[{:>5}s] server {}: connecting{}",
+                t.as_secs(),
+                a.addr,
+                if a.obfuscated { " (obfuscated)" } else { "" }
+            );
+            *attempting = Some(attempt(a, c));
+        }
+        Next::RetryAt(_) => info!(
+            "[{:>5}s] could not log into any server; trying again in {} s",
+            t.as_secs(),
+            RETRY_AFTER.as_secs()
+        ),
+        Next::Idle => {}
+    }
+}
+
 fn unix_now() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,31 +313,12 @@ pub async fn run(
         names.extend(s.files().into_iter().map(|(f, _)| (f.hash, f.name.clone())));
     }
 
-    // A server first: it gives us our ID.
+    // The server connection: our ID comes from its login, and changes with
+    // each new one.
     let mut server: Option<ServerClient> = None;
     let mut our_id = 0u32;
-    let mut public_ip = None;
-    for addr in &c.servers {
-        let mut login = LoginInfo::new(c.user_hash, c.tcp_port, c.nick.clone());
-        login.crypt_requested = c.obfuscate_server;
-        let mut opts = ConnectOptions::new(login);
-        opts.obfuscate = c.obfuscate_server;
-        opts.session.ask_server_list = false;
-        match ServerClient::connect(*addr, opts).await {
-            Ok((s, li)) => {
-                info!(
-                    "server {addr}: logged in, {} {}",
-                    if li.low_id { "LowID" } else { "HighID" },
-                    li.id
-                );
-                our_id = li.id;
-                public_ip = li.public_ip;
-                server = Some(s);
-                break;
-            }
-            Err(e) => warn!("server {addr}: {e}"),
-        }
-    }
+    let mut connector = Connector::new(c.servers.clone(), c.obfuscate_server, c.reconnect);
+    let mut attempting: Option<Attempting> = None;
 
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", c.tcp_port)).await {
         Ok(l) => Some(l),
@@ -312,7 +340,6 @@ pub async fn run(
     ));
     let mut qc = QueueConfig::new(ours, c.incoming.clone());
     qc.max_connections = c.max_connections;
-    qc.our_public_ip = public_ip;
     qc.identity = Some(c.identity.clone());
     qc.filter_lan = !c.allow_lan;
     let ours_for_upload = qc.ours.clone();
@@ -385,9 +412,42 @@ pub async fn run(
     let mut last_status = Instant::now();
     tokio::pin!(shutdown);
     let mut finished = None;
+    if c.autoconnect {
+        let next = connector.start(Instant::now());
+        follow(next, &c, &mut attempting, Duration::ZERO);
+    }
 
     loop {
         tokio::select! {
+            r = async { match &mut attempting { Some(f) => f.await, None => std::future::pending().await } } => {
+                attempting = None;
+                let now = Instant::now();
+                let t = start.elapsed();
+                let addr = connector.connecting().map(|a| a.addr.to_string()).unwrap_or_default();
+                match r {
+                    Ok((s, li)) => {
+                        connector.logged_in();
+                        info!(
+                            "[{:>5}s] server {addr}: logged in, {} {}",
+                            t.as_secs(),
+                            if li.low_id { "LowID" } else { "HighID" },
+                            li.id
+                        );
+                        our_id = li.id;
+                        let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
+                        // A new server: offer everything, and ask it for sources.
+                        publisher.server_connected();
+                        next_offer = now;
+                        next_server_ask = now;
+                        server = Some(s);
+                    }
+                    Err(e) => {
+                        warn!("[{:>5}s] server {addr}: {e}", t.as_secs());
+                        let next = connector.failed(now);
+                        follow(next, &c, &mut attempting, t);
+                    }
+                }
+            }
             r = reports.recv() => {
                 let Some(r) = r else { continue };
                 if matches!(r, Report::Completed { .. }) {
@@ -404,13 +464,17 @@ pub async fn run(
                             names.get(&hash).map(String::as_str).unwrap_or("?"));
                         let _ = cmd.send(Command::AddSources { file: hash, sources: eps, origin: Origin::Server });
                     }
-                    Some(ServerEvent::Closed(why)) => {
-                        warn!("[{:>5}s] server connection closed: {why:?}", start.elapsed().as_secs());
+                    Some(ServerEvent::Closed(_)) | None => {
+                        let t = start.elapsed();
+                        match &ev {
+                            Some(ServerEvent::Closed(why)) => warn!("[{:>5}s] server connection lost: {why:?}", t.as_secs()),
+                            _ => warn!("[{:>5}s] server connection lost", t.as_secs()),
+                        }
                         server = None;
-                    }
-                    None => {
-                        warn!("[{:>5}s] server connection closed", start.elapsed().as_secs());
-                        server = None;
+                        our_id = 0;
+                        let _ = cmd.send(Command::SetOurId { id: 0, public_ip: None });
+                        let next = connector.lost(Instant::now());
+                        follow(next, &c, &mut attempting, t);
                     }
                     _ => {}
                 }
@@ -445,6 +509,10 @@ pub async fn run(
             _ = tick.tick() => {
                 let now = Instant::now();
                 let t = start.elapsed();
+                // Every server failed a while ago: a new sweep.
+                if let Some(next) = connector.poll(now) {
+                    follow(next, &c, &mut attempting, t);
+                }
                 // Offer what we share (new files as they come).
                 if let (Some(s), Some(sh)) = (&server, &shares) {
                     if now >= next_offer {

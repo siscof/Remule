@@ -130,6 +130,12 @@ impl Uploader {
         self.credits.as_mut()
     }
 
+    /// A server login gave us this ID: the hellos of upload connections from
+    /// now on carry it.
+    pub fn set_our_id(&mut self, id: u32) {
+        self.ours.id = id;
+    }
+
     /// Bytes uploaded since start.
     pub fn sent_total(&self) -> u64 {
         self.sent_total

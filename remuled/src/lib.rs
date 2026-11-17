@@ -5,10 +5,14 @@
 //! * [`config`]: an aMule config directory turned into a client's settings.
 //! * [`client`]: the running client (also behind `remule download`).
 //! * [`kad`]: a Kad node started from, and saved to, aMule's files.
+//! * [`server_conn`]: which eD2k server to log into next, and when.
 
 pub mod client;
 pub mod config;
 pub mod kad;
+pub mod server_conn;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_server_conn;

@@ -601,6 +601,8 @@ pub mod keys {
     pub const INCOMING_DIR: &str = "/eMule/IncomingDir";
     pub const CONNECT_TO_ED2K: &str = "/eMule/ConnectToED2K";
     pub const CONNECT_TO_KAD: &str = "/eMule/ConnectToKad";
+    pub const AUTOCONNECT: &str = "/eMule/Autoconnect";
+    pub const RECONNECT: &str = "/eMule/Reconnect";
     pub const ACCEPT_EXTERNAL_CONNECTIONS: &str = "/ExternalConnect/AcceptExternalConnections";
     pub const EC_ADDRESS: &str = "/ExternalConnect/ECAddress";
     pub const EC_PORT: &str = "/ExternalConnect/ECPort";
@@ -639,6 +641,11 @@ pub struct Preferences {
     pub incoming_dir: Option<String>,
     pub connect_to_ed2k: bool,
     pub connect_to_kad: bool,
+    /// Log into a server at start-up.
+    pub autoconnect: bool,
+    /// Log into a server again when the connection is lost, and try the
+    /// list again after every server failed.
+    pub reconnect: bool,
     pub accept_external_connections: bool,
     pub ec_address: String,
     pub ec_port: u32,
@@ -680,6 +687,8 @@ impl Preferences {
             incoming_dir: path(keys::INCOMING_DIR),
             connect_to_ed2k: flag(keys::CONNECT_TO_ED2K, true),
             connect_to_kad: flag(keys::CONNECT_TO_KAD, true),
+            autoconnect: flag(keys::AUTOCONNECT, true),
+            reconnect: flag(keys::RECONNECT, true),
             accept_external_connections: flag(keys::ACCEPT_EXTERNAL_CONNECTIONS, false),
             ec_address: string(keys::EC_ADDRESS, DEFAULT_EC_ADDRESS),
             ec_port: int(keys::EC_PORT, DEFAULT_EC_PORT.into()) as u32,
@@ -721,6 +730,8 @@ impl Preferences {
         }
         conf.set(keys::CONNECT_TO_ED2K, b(self.connect_to_ed2k));
         conf.set(keys::CONNECT_TO_KAD, b(self.connect_to_kad));
+        conf.set(keys::AUTOCONNECT, b(self.autoconnect));
+        conf.set(keys::RECONNECT, b(self.reconnect));
         conf.set(
             keys::ACCEPT_EXTERNAL_CONNECTIONS,
             b(self.accept_external_connections),

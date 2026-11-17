@@ -48,6 +48,12 @@ pub enum Command {
     },
     /// Where each file stands, and the bytes received so far.
     Progress(tokio::sync::oneshot::Sender<(Vec<FileProgress>, QueueStats)>),
+    /// A server login gave us this ID (0 when logged out) and public
+    /// address: the hellos of connections from now on carry them.
+    SetOurId {
+        id: u32,
+        public_ip: Option<std::net::Ipv4Addr>,
+    },
     /// Hang up, save the files, and return the queue.
     Shutdown,
 }
@@ -314,6 +320,13 @@ pub async fn run_with(
                         .collect(),
                     Some(Command::Progress(reply)) => {
                         let _ = reply.send((queue.progress(), queue.stats()));
+                        Vec::new()
+                    }
+                    Some(Command::SetOurId { id, public_ip }) => {
+                        queue.set_our_id(id, public_ip);
+                        if let Some(up) = uploader.as_mut() {
+                            up.set_our_id(id);
+                        }
                         Vec::new()
                     }
                     Some(Command::Shutdown) | None => break,

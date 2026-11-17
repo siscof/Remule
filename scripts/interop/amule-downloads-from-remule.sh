@@ -3,8 +3,8 @@
 #
 # MIGRATION_PLAN.md 9.M: a stock aMule downloads a file from remule.
 #
-# remule shares a random multi-part file; a stock amuled (the distribution's
-# package, driven with amulecmd) is given its ed2k link with remule as the one
+# remule shares a random multi-part file; a released amuled (upstream's
+# static build, driven with amulecmd) is given its ed2k link with remule as the one
 # source, and must finish it byte for byte. Nothing touches the real network:
 # stock aMule asks its sources only while connected to eD2k or Kad
 # (CPartFile::Process), so it logs into fake_ed2k_server.py, which gives it
@@ -35,7 +35,7 @@ EC_PORT=4712
 EC_PASS=interop
 
 for tool in amuled amulecmd; do
-	command -v "$tool" >/dev/null || { echo "missing $tool (install amule-daemon, amule-utils)"; exit 2; }
+	command -v "$tool" >/dev/null || { echo "missing $tool (aMule's release tarball)"; exit 2; }
 done
 [ -x "$REMULE" ] || { echo "missing $REMULE (cargo build --release -p remule-cli)"; exit 2; }
 
@@ -140,7 +140,9 @@ EOF
 	PIDS+=($!)
 	# Ready once it has hashed the file (its log lists the known shared files).
 	for _ in $(seq 1 90); do
-		grep -q "known shared files\|shared files found" "$SRC_CFG/logfile" 2>/dev/null 			&& [ -s "$SRC_CFG/known.met" ] && break
+		# "Found 1 known shared file" in 3.x, "Found 0 known shared files, 1 unknown" in 2.3.3.
+		grep -q "known shared file\|shared files found" "$SRC_CFG/logfile" 2>/dev/null \
+			&& [ -s "$SRC_CFG/known.met" ] && break
 		sleep 1
 	done
 	echo "source aMule:"

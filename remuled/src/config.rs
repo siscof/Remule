@@ -192,6 +192,8 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         identity: load_identity(&dir.join("cryptkey.dat"))?,
         servers,
         obfuscate_server: false,
+        autoconnect: prefs.autoconnect,
+        reconnect: prefs.reconnect,
         kad,
         tcp_port: prefs.tcp_port,
         udp_port: prefs.udp_port,

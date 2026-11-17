@@ -133,6 +133,8 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         identity: client::load_identity(&a.temp.join("cryptkey.dat"))?,
         servers: a.servers.clone(),
         obfuscate_server: a.obfuscate_server,
+        autoconnect: true,
+        reconnect: true,
         kad: a.kad.clone().map(|dir| KadSettings {
             dir,
             nodes: a.kad_nodes.clone(),

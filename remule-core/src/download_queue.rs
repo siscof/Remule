@@ -354,6 +354,14 @@ impl DownloadQueue {
         &self.config
     }
 
+    /// A server login (`CServerConnect::SetClientID`): our ID, which is our
+    /// address for a HighID, and the public address the server saw, for the
+    /// connections made from now on. 0 and `None` when logged out.
+    pub fn set_our_id(&mut self, id: u32, public_ip: Option<Ipv4Addr>) {
+        self.config.ours.id = id;
+        self.config.our_public_ip = public_ip;
+    }
+
     /// A connection id for another part of the client (the uploader's
     /// callbacks), from the same sequence as ours.
     pub fn new_conn_id(&mut self) -> ConnId {

@@ -249,6 +249,8 @@ async fn the_daemon_shares_from_an_amule_directory() {
         identity: client::load_identity(&getter.join("cryptkey.dat")).unwrap(),
         servers: Vec::new(),
         obfuscate_server: false,
+        autoconnect: true,
+        reconnect: true,
         kad: None,
         tcp_port: free_port(),
         udp_port: 0,
@@ -291,4 +293,98 @@ async fn the_daemon_shares_from_an_amule_directory() {
         assert!(amule.join(f).is_file(), "{f} missing");
     }
     assert!(amule.join("Incoming").is_dir() && amule.join("Temp").is_dir());
+}
+
+/// A scripted eD2k server for [`the_daemon_logs_in_again_when_the_server_drops_it`]:
+/// each connection's login is answered with `OP_IDCHANGE`; what arrives is
+/// reported as (connection number, opcode). The first connection is closed
+/// once an `OP_OFFERFILES` came on it.
+async fn dropping_server(
+    listener: tokio::net::TcpListener,
+    seen: tokio::sync::mpsc::UnboundedSender<(usize, u8)>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for n in 0.. {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut head = [0u8; 5];
+                if s.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                let len = u32::from_le_bytes(head[1..5].try_into().unwrap()) as usize;
+                let mut body = vec![0u8; len];
+                if len == 0 || s.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                let _ = seen.send((n, body[0]));
+                match body[0] {
+                    // OP_LOGINREQUEST: a HighID, 127.0.0.1.
+                    0x01 => {
+                        let mut p = vec![0xE3, 5, 0, 0, 0, 0x40];
+                        p.extend_from_slice(&[127, 0, 0, 1]);
+                        if s.write_all(&p).await.is_err() {
+                            return;
+                        }
+                    }
+                    // OP_OFFERFILES on the first connection: hang up.
+                    0x15 if n == 0 => return,
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+/// The server drops the daemon after its login and offer: it logs in again
+/// at once (aMule's `Reconnect`) and offers its files on the new connection
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_logs_in_again_when_the_server_drops_it() {
+    let d = TempDir::new("reconnect");
+    let amule = d.0.join("amule");
+    std::fs::create_dir_all(amule.join("Incoming")).unwrap();
+    std::fs::write(amule.join("Incoming").join("shared.bin"), vec![7u8; 5000]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    std::fs::write(
+        amule.join("amule.conf"),
+        format!(
+            "[eMule]\nNick=daemon\nPort={}\nConnectToKad=0\nConnectToED2K=1\n",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let met = ServerMet {
+        version: 0x0E,
+        servers: vec![server([127, 0, 0, 1], server_port, None)],
+        legacy_counts: false,
+    };
+    std::fs::write(amule.join("server.met"), met.write()).unwrap();
+    let loaded = config::load(&amule).unwrap();
+    assert!(loaded.client.autoconnect && loaded.client.reconnect);
+
+    let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(dropping_server(listener, seen_tx));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(client::run(loaded.client, Vec::new(), Vec::new(), async {
+        let _ = stop_rx.await;
+    }));
+
+    // A login and an offer on each of the two connections.
+    let mut got = Vec::new();
+    let want = [(0, 0x01), (0, 0x15), (1, 0x01), (1, 0x15)];
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !want.iter().all(|w| got.contains(w)) {
+            got.push(seen.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("got only {got:x?}"));
+
+    stop_tx.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
 }

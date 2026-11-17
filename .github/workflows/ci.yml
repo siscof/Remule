@@ -59,6 +59,8 @@ jobs:
         # Two builds of stock aMule 2.3.3: Ubuntu 24.04's (wxWidgets 3.2,
         # Boost.Asio sockets) and 22.04's.
         os: [ubuntu-22.04, ubuntu-24.04]
+        # amule: the control, a stock aMule as the source instead of remule.
+        source: [remule, amule]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -73,3 +75,5 @@ jobs:
         run: cargo build --release -p remule-cli
       - name: aMule downloads from remule
         run: bash scripts/interop/amule-downloads-from-remule.sh
+        env:
+          SOURCE: ${{ matrix.source }}

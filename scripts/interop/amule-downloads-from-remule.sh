@@ -97,12 +97,53 @@ fi
 python3 "$HERE/fake_ed2k_server.py" "$IP" "$SERVER_PORT" > "$WORK/server.log" 2>&1 &
 PIDS+=($!)
 
-# remule shares it and waits; every peer packet is traced to its log.
-REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
-	--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
-	--port "$REMULE_PORT" --allow-lan --max-upload "${MAX_UPLOAD:-1024}" --duration $((TIMEOUT + 60)) --status-every 15 \
-	> "$WORK/remule.log" 2>&1 &
-PIDS+=($!)
+if [ "${SOURCE:-remule}" = "amule" ]; then
+	# The control: a second stock aMule shares the file instead of remule,
+	# on remule's port and at the same upload limit.
+	SRC_CFG="$WORK/amule-source"
+	mkdir -p "$SRC_CFG/Temp" "$SRC_CFG/Incoming"
+	cat > "$SRC_CFG/amule.conf" <<EOF
+[eMule]
+Nick=source
+Port=$REMULE_PORT
+UDPPort=4682
+UDPDisable=1
+TempDir=$SRC_CFG/Temp
+IncomingDir=$SRC_CFG/Incoming
+FilterLanIPs=0
+ConnectToKad=0
+ConnectToED2K=0
+Autoconnect=0
+Reconnect=0
+IPFilterAutoLoad=0
+UPnPEnabled=0
+MaxUpload=${MAX_UPLOAD:-1024}
+[ExternalConnect]
+AcceptExternalConnections=1
+ECAddress=127.0.0.1
+ECPort=4713
+ECPassword=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
+IpFilterClients=0
+IpFilterServers=0
+EOF
+	echo "$WORK/share" > "$SRC_CFG/shareddir.dat"
+	: > "$SRC_CFG/addresses.dat"
+	amuled --config-dir="$SRC_CFG" > "$WORK/remule.log" 2>&1 &
+	PIDS+=($!)
+	for _ in $(seq 1 60); do
+		amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | grep -q "$NAME" && break
+		sleep 1
+	done
+	echo "source aMule shares:"
+	amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | grep -i "$NAME" || echo "  (not yet)"
+else
+	# remule shares it and waits; every peer packet is traced to its log.
+	REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
+		--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
+		--port "$REMULE_PORT" --allow-lan --max-upload "${MAX_UPLOAD:-1024}" --duration $((TIMEOUT + 60)) --status-every 15 \
+		> "$WORK/remule.log" 2>&1 &
+	PIDS+=($!)
+fi
 
 # A stock aMule: no Kad, no IP filter, LAN sources allowed; it connects to
 # the fake server when told.

@@ -8,6 +8,7 @@
 //! * [`bootstrap`]: `nodes.dat` and server lists fetched over HTTP at start.
 //! * [`http`]: one file over HTTP(S).
 //! * [`server_conn`]: which eD2k server to log into next, and when.
+//! * [`stats`]: the transfer statistics in `statistics.dat` and in the log.
 
 pub mod bootstrap;
 pub mod client;
@@ -15,6 +16,7 @@ pub mod config;
 pub mod http;
 pub mod kad;
 pub mod server_conn;
+pub mod stats;
 
 #[cfg(test)]
 mod tests;

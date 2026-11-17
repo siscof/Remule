@@ -8,6 +8,7 @@ use std::time::Duration;
 use ed2k_codec::{Tag, TagValue};
 use ed2k_formats::preferences_dat;
 use ed2k_formats::server_met::{ServerMet, ServerRecord};
+use ed2k_formats::statistics_dat::{self, Totals};
 use ed2k_types::tags::ServerTag;
 use ed2k_types::Md4Hash;
 
@@ -204,9 +205,21 @@ async fn the_daemon_shares_from_an_amule_directory() {
         .collect();
     std::fs::write(shared.join("book.bin"), &content).unwrap();
     let port = free_port();
+    // The totals of older versions in amule.conf are neither read nor
+    // touched, as in today's aMule.
+    let conf = format!(
+        "[eMule]\nNick=daemon\nPort={port}\nConnectToKad=0\nConnectToED2K=0\n\
+         [Statistics]\r\nTotalUploadedBytes=5\nMaxClientVersions=0\n"
+    );
+    std::fs::write(amule.join("amule.conf"), &conf).unwrap();
+    // The totals of earlier sessions, as aMule left them.
+    let before = Totals {
+        sent: 1_000_000,
+        received: 77,
+    };
     std::fs::write(
-        amule.join("amule.conf"),
-        format!("[eMule]\nNick=daemon\nPort={port}\nConnectToKad=0\nConnectToED2K=0\n"),
+        amule.join(statistics_dat::FILE_NAME),
+        statistics_dat::write(&before),
     )
     .unwrap();
     // eMule style: a trailing separator.
@@ -279,10 +292,36 @@ async fn the_daemon_shares_from_an_amule_directory() {
         std::fs::read(getter.join("incoming").join("book.bin")).unwrap(),
         content
     );
+    // The getter's first session: its totals are what it received.
+    assert!(s.received >= content.len() as u64, "{}", s.received);
+    let got = Totals {
+        sent: 0,
+        received: s.received,
+    };
+    assert_eq!(s.totals, got);
+    assert_eq!(
+        statistics_dat::read(&std::fs::read(getter.join("config/statistics.dat")).unwrap()),
+        Ok(got)
+    );
 
     stop_tx.send(()).unwrap();
     let s = daemon.await.unwrap().unwrap();
     assert!(s.uploaded >= content.len() as u64, "{}", s.uploaded);
+    // What it sent is added to the totals in statistics.dat; amule.conf is
+    // left as it was, byte for byte.
+    let after = Totals {
+        sent: before.sent + s.uploaded,
+        received: before.received + s.received,
+    };
+    assert_eq!(s.totals, after);
+    assert_eq!(
+        std::fs::read(amule.join(statistics_dat::FILE_NAME)).unwrap(),
+        statistics_dat::write(&after)
+    );
+    assert_eq!(
+        std::fs::read(amule.join("amule.conf")).unwrap(),
+        conf.as_bytes()
+    );
     // aMule's files, in aMule's directory.
     for f in [
         "known.met",

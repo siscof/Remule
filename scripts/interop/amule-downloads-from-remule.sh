@@ -45,8 +45,12 @@ mkdir -p "$WORK/share" "$AMULE_CFG/Temp" "$AMULE_CFG/Incoming"
 
 PIDS=()
 cleanup() {
+	# tcpdump runs as root: the runner's own kill cannot reach it.
+	[ -n "${TCPDUMP_PID:-}" ] && sudo -n kill "$TCPDUMP_PID" 2>/dev/null
 	for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
-	wait 2>/dev/null || true
+	# Give them a moment, then make sure; never wait on a process that may not end.
+	sleep 1
+	for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null || true; done
 	if [ "${KEEP:-0}" = "1" ]; then echo "kept $WORK"; else rm -rf "$WORK"; fi
 }
 trap cleanup EXIT
@@ -85,7 +89,7 @@ echo "link: $LINK"
 # Headers of the peer connection, to see who stops sending or reading.
 if command -v tcpdump >/dev/null && sudo -n true 2>/dev/null; then
 	sudo -n tcpdump -i any -s 80 -U -w "$WORK/cap.pcap" "tcp port $REMULE_PORT" 2>/dev/null &
-	PIDS+=($!)
+	TCPDUMP_PID=$!
 	sleep 1
 fi
 
@@ -96,7 +100,7 @@ PIDS+=($!)
 # remule shares it and waits; every peer packet is traced to its log.
 REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
 	--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
-	--port "$REMULE_PORT" --allow-lan --max-upload "${MAX_UPLOAD:-0}" --duration $((TIMEOUT + 60)) --status-every 15 \
+	--port "$REMULE_PORT" --allow-lan --max-upload "${MAX_UPLOAD:-1024}" --duration $((TIMEOUT + 60)) --status-every 15 \
 	> "$WORK/remule.log" 2>&1 &
 PIDS+=($!)
 

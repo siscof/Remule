@@ -123,6 +123,9 @@ Autoconnect=0
 Reconnect=0
 IPFilterAutoLoad=0
 UPnPEnabled=0
+GeoIPEnabled=0
+GeoIPAutoUpdate=0
+NewVersionCheck=0
 MaxUpload=${MAX_UPLOAD:-1024}
 [ExternalConnect]
 AcceptExternalConnections=1
@@ -147,7 +150,8 @@ EOF
 	done
 	echo "source aMule:"
 	grep -i "shared\|hash\|ListenSocket\|error" "$SRC_CFG/logfile" 2>/dev/null | head -10 || true
-	ls -la "$SRC_CFG" | sed 's/^/  /'
+	# aMule may be renaming files meanwhile: a listing that fails is not fatal.
+	ls -la "$SRC_CFG" 2>/dev/null | sed 's/^/  /' || true
 	amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | tail -5 | sed 's/^/  /'
 else
 	# remule shares it and waits; every peer packet is traced to its log.
@@ -175,6 +179,9 @@ Autoconnect=0
 Reconnect=0
 IPFilterAutoLoad=0
 UPnPEnabled=0
+GeoIPEnabled=0
+GeoIPAutoUpdate=0
+NewVersionCheck=0
 [ExternalConnect]
 AcceptExternalConnections=1
 ECAddress=127.0.0.1

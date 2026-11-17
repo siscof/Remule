@@ -292,6 +292,12 @@ pub async fn run_with(
                 }
             }
             accepted = accept(listener.as_ref()) => match accepted {
+                // `CListenSocket::OnAccept`: a peer the IP filter blocks is
+                // hung up on before anything is read.
+                Some(stream) if matches!(stream.peer_addr(), Ok(std::net::SocketAddr::V4(a)) if queue.blocks(*a.ip())) => {
+                    drop(stream);
+                    Vec::new()
+                }
                 Some(stream) => {
                     let conn = queue.incoming();
                     if let Ok(a) = stream.peer_addr() {

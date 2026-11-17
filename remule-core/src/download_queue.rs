@@ -31,6 +31,7 @@ use ed2k_peer::{Hello, PartStatus, PeerPacket};
 use ed2k_types::ed2k::MAX_SOURCES_FILE_SOFT;
 use ed2k_types::{AichHash, Md4Hash};
 
+use crate::ip_filter::AddressFilter;
 use crate::part_file::{Completion, FileEvent, PartFile, SourceView};
 
 /// A connection, as the queue and the network layer name it.
@@ -133,6 +134,8 @@ pub struct QueueConfig {
     pub request_obfuscation: bool,
     /// Drop LAN and loopback addresses (`FilterLanIPs`).
     pub filter_lan: bool,
+    /// Sources and incoming peers the IP filter blocks are dropped.
+    pub ip_filter: Option<Arc<AddressFilter>>,
     /// Our key, for secure identification.
     pub identity: Option<Arc<Identity>>,
     pub our_public_ip: Option<Ipv4Addr>,
@@ -151,6 +154,7 @@ impl QueueConfig {
             flush_every: Duration::from_secs(60),
             request_obfuscation: true,
             filter_lan: true,
+            ip_filter: None,
             identity: None,
             our_public_ip: None,
         }
@@ -350,6 +354,14 @@ impl DownloadQueue {
         }
     }
 
+    /// Whether the IP filter blocks this peer (`IsFiltered(ip, false)`).
+    pub fn blocks(&self, ip: Ipv4Addr) -> bool {
+        self.config
+            .ip_filter
+            .as_ref()
+            .is_some_and(|f| f.blocks_client(ip))
+    }
+
     pub fn config(&self) -> &QueueConfig {
         &self.config
     }
@@ -512,6 +524,9 @@ impl DownloadQueue {
             _ => return false,
         }
         if ep.addr.port() == 0 || !is_good_ip(*ep.addr.ip(), self.config.filter_lan) {
+            return false;
+        }
+        if self.blocks(*ep.addr.ip()) {
             return false;
         }
         let our_ip = Ipv4Addr::from(self.config.ours.id.to_le_bytes());

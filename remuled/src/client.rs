@@ -30,6 +30,7 @@ use ed2k_types::Md4Hash;
 use remule_core::credits::Credits;
 use remule_core::download_queue::{DownloadQueue, Endpoint, Origin, QueueConfig, Report};
 use remule_core::downloader::{self, Command, DownloaderConfig};
+use remule_core::ip_filter::AddressFilter;
 use remule_core::publish::{KadPublish, Publisher};
 use remule_core::shared::{mtime, ScanOptions, SharedFiles};
 use remule_core::upload_queue::{UploadConfig, UploadQueue};
@@ -94,6 +95,8 @@ pub struct ClientConfig {
     pub reachable: bool,
     /// Take sources on LAN and loopback addresses (aMule's FilterLanIPs off).
     pub allow_lan: bool,
+    /// Peers and servers it blocks are left alone (`ipfilter.dat`).
+    pub ip_filter: Option<Arc<AddressFilter>>,
     /// Stop once every download is complete (ignored when sharing).
     pub stop_when_done: bool,
     /// Between progress lines.
@@ -317,7 +320,23 @@ pub async fn run(
     // each new one.
     let mut server: Option<ServerClient> = None;
     let mut our_id = 0u32;
-    let mut connector = Connector::new(c.servers.clone(), c.obfuscate_server, c.reconnect);
+    // Servers the IP filter blocks are not tried (`CServerList::AddServer`).
+    let servers: Vec<SocketAddr> = c
+        .servers
+        .iter()
+        .copied()
+        .filter(|a| {
+            let blocked = match (a, &c.ip_filter) {
+                (SocketAddr::V4(v4), Some(f)) => f.blocks_server(*v4.ip()),
+                _ => false,
+            };
+            if blocked {
+                info!("server {a}: blocked by the IP filter");
+            }
+            !blocked
+        })
+        .collect();
+    let mut connector = Connector::new(servers, c.obfuscate_server, c.reconnect);
     let mut attempting: Option<Attempting> = None;
 
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", c.tcp_port)).await {
@@ -342,6 +361,7 @@ pub async fn run(
     qc.max_connections = c.max_connections;
     qc.identity = Some(c.identity.clone());
     qc.filter_lan = !c.allow_lan;
+    qc.ip_filter = c.ip_filter.clone();
     let ours_for_upload = qc.ours.clone();
     let queue = DownloadQueue::new(qc);
     let mut dc = DownloaderConfig::new(Arc::new(Bandwidth::new(c.max_upload, c.max_download)));

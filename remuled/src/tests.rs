@@ -262,6 +262,7 @@ async fn the_daemon_shares_from_an_amule_directory() {
         share: Vec::new(),
         reachable: false,
         allow_lan: true,
+        ip_filter: None,
         stop_when_done: true,
         status_every: Duration::from_secs(3600),
     };
@@ -384,6 +385,129 @@ async fn the_daemon_logs_in_again_when_the_server_drops_it() {
     })
     .await
     .unwrap_or_else(|_| panic!("got only {got:x?}"));
+
+    stop_tx.send(()).unwrap();
+    daemon.await.unwrap().unwrap();
+}
+
+/// The IP filter of an aMule directory: aMule's placeholders when missing,
+/// `ipfilter_static.dat` winning over `ipfilter.dat`, `FilterLevel` and the
+/// client/server switches, a packed list left unread.
+#[test]
+fn the_ip_filter_loads_as_amule_does() {
+    use ed2k_formats::amule_conf::ConfFile;
+
+    let d = TempDir::new("ipfilter");
+    let dir = &d.0;
+    let mut notes = Vec::new();
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes);
+    assert_eq!(f.ban_count(), 0);
+    let placeholder = std::fs::read_to_string(dir.join("ipfilter.dat")).unwrap();
+    assert!(placeholder.starts_with("# This file is used by aMule to store ipfilter lists"));
+    assert!(placeholder.ends_with("overwritten by aMule.\n\n"));
+    let placeholder = std::fs::read_to_string(dir.join("ipfilter_static.dat")).unwrap();
+    assert!(placeholder.ends_with("aMule will not change this file.\n"));
+
+    // Two lists; the static one lifts part of a blocked range.
+    std::fs::write(
+        dir.join("ipfilter.dat"),
+        "1.0.0.0 - 1.0.0.255 , 100 , blocked\n2.0.0.0 - 2.0.0.255 , 140 , mild\nnonsense\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ipfilter_static.dat"),
+        "1.0.0.128 - 1.0.0.255 , 200 , friends\n",
+    )
+    .unwrap();
+    let mut notes = Vec::new();
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes);
+    assert!(f.blocks_client(Ipv4Addr::new(1, 0, 0, 5)));
+    assert!(!f.blocks_client(Ipv4Addr::new(1, 0, 0, 200)));
+    // 140 is not below the default level, 127.
+    assert!(!f.blocks_client(Ipv4Addr::new(2, 0, 0, 1)));
+    assert!(f.blocks_server(Ipv4Addr::new(1, 0, 0, 5)));
+    assert!(
+        notes.iter().any(|n| n.starts_with("Loaded 2 IP-ranges")
+            && n.ends_with("1 malformed lines were discarded.")),
+        "{notes:?}"
+    );
+
+    // A higher level blocks more; clients unfiltered, servers still.
+    let conf = ConfFile::parse(
+        "[eMule]\nFilterLevel=150\n[ExternalConnect]\nIpFilterClients=0\nIpFilterServers=1\n",
+    );
+    let f = config::ip_filter(dir, &conf, &mut Vec::new());
+    assert!(!f.blocks_client(Ipv4Addr::new(2, 0, 0, 1)));
+    assert!(f.blocks_server(Ipv4Addr::new(2, 0, 0, 1)));
+
+    // A zip is not read, and says so.
+    std::fs::write(dir.join("ipfilter.dat"), b"PK\x03\x04rest of a zip").unwrap();
+    let mut notes = Vec::new();
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut notes);
+    assert!(!f.blocks_client(Ipv4Addr::new(1, 0, 0, 5)));
+    assert!(notes.iter().any(|n| n.contains("packed list")), "{notes:?}");
+}
+
+/// With loopback blocked in `ipfilter_static.dat`, the daemon neither logs
+/// into a server on 127.0.0.1 nor talks to a peer connecting from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_keeps_away_from_filtered_addresses() {
+    use tokio::io::AsyncReadExt;
+
+    let d = TempDir::new("ipfilter-run");
+    let amule = d.0.join("amule");
+    std::fs::create_dir_all(&amule).unwrap();
+    let srv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = srv.local_addr().unwrap().port();
+    let port = free_port();
+    std::fs::write(
+        amule.join("amule.conf"),
+        format!("[eMule]\nNick=daemon\nPort={port}\nConnectToKad=0\nConnectToED2K=1\n"),
+    )
+    .unwrap();
+    let met = ServerMet {
+        version: 0x0E,
+        servers: vec![server([127, 0, 0, 1], server_port, None)],
+        legacy_counts: false,
+    };
+    std::fs::write(amule.join("server.met"), met.write()).unwrap();
+    std::fs::write(
+        amule.join("ipfilter_static.dat"),
+        "127.0.0.0 - 127.255.255.255 , 0 , loopback\n",
+    )
+    .unwrap();
+    let loaded = config::load(&amule).unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let daemon = tokio::spawn(client::run(loaded.client, Vec::new(), Vec::new(), async {
+        let _ = stop_rx.await;
+    }));
+
+    // A peer from 127.0.0.1: the connection is accepted, then closed with
+    // nothing sent.
+    let mut tries = 0;
+    let mut peer = loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => break s,
+            Err(_) => {
+                tries += 1;
+                assert!(tries < 100, "the daemon never listened");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut buf))
+        .await
+        .expect("the daemon kept a filtered peer")
+        .unwrap_or(0);
+    assert_eq!(n, 0);
+    // The server on 127.0.0.1 is never tried.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), srv.accept())
+            .await
+            .is_err(),
+        "the daemon connected to a filtered server"
+    );
 
     stop_tx.send(()).unwrap();
     daemon.await.unwrap().unwrap();

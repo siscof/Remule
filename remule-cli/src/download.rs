@@ -149,6 +149,7 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         share: a.share.clone(),
         reachable: a.reachable,
         allow_lan: a.allow_lan,
+        ip_filter: None,
         stop_when_done: true,
         status_every: Duration::from_secs(a.status_every.max(1)),
     };

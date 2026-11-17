@@ -14,20 +14,26 @@
 //! * `nodes.dat`, `preferencesKad.dat` and the Kad index files, kept in
 //!   the directory itself.
 //! * `known.met`, `known2_64.met`, `clients.met`: as the client keeps them.
+//! * `ipfilter.dat`, then `ipfilter_static.dat`: the IP filter, applied
+//!   with `FilterLevel`, `IpFilterClients` and `IpFilterServers`. Missing
+//!   ones are made with aMule's placeholder comments.
 //!
 //! Nothing aMule owns is rewritten except what aMule itself writes as it
 //! runs. aMule must not run on the same directory at the same time.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed2k_formats::amule_conf::{ConfFile, Preferences};
+use ed2k_formats::ipfilter::{IpFilter, IpFilterFile};
 use ed2k_formats::server_met::{
     ServerInfo, ServerMet, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL,
 };
 use ed2k_formats::{preferences_dat, shareddir_dat};
 use ed2k_types::Md4Hash;
 use rand::RngCore;
+use remule_core::ip_filter::{AddressFilter, DEFAULT_LEVEL};
 
 use crate::client::{load_identity, ClientConfig, KadSettings};
 
@@ -130,6 +136,82 @@ pub fn servers(met: &ServerMet) -> Vec<std::net::SocketAddr> {
     v.into_iter().map(|(_, a)| a).collect()
 }
 
+/// `CIPFilter`'s placeholder for `ipfilter.dat` (written with a final
+/// newline by `CTextFile::WriteLine`).
+const IPFILTER_PLACEHOLDER: &str = concat!(
+    "# This file is used by aMule to store ipfilter lists downloaded\n",
+    "# through the auto-update functionality. Do not save ipfilter-\n",
+    "# ranges here that should not be overwritten by aMule.\n",
+    "\n",
+);
+/// And for `ipfilter_static.dat`.
+const IPFILTER_STATIC_PLACEHOLDER: &str = concat!(
+    "# This file is used to store ipfilter-ranges that should\n",
+    "# not be overwritten by aMule. If you wish to keep a custom\n",
+    "# set of ipfilter-ranges that take precedence over ipfilter-\n",
+    "# ranges acquired through the auto-update functionality, then\n",
+    "# place them in this file. aMule will not change this file.\n",
+);
+
+/// One IP filter list, as `CIPFilterTask::LoadFromFile` reads it: missing
+/// or empty is no ranges; a zip or gzip one is not read (unpacking is not
+/// ported).
+fn load_filter_list(path: &Path, notes: &mut Vec<String>) -> Option<IpFilterFile> {
+    let bytes = read_opt(path).filter(|b| !b.is_empty())?;
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(&[0x1F, 0x8B]) {
+        notes.push(format!(
+            "{}: a packed list, not read (unpacking is not ported yet)",
+            path.display()
+        ));
+        return None;
+    }
+    let f = IpFilterFile::parse(&bytes);
+    let mut msg = format!(
+        "Loaded {} IP-ranges from '{}'.",
+        f.range_count(),
+        path.display()
+    );
+    if f.bad_lines() > 0 {
+        msg.push_str(&format!(
+            " {} malformed lines were discarded.",
+            f.bad_lines()
+        ));
+    }
+    notes.push(msg);
+    Some(f)
+}
+
+/// The IP filter of a config directory (`CIPFilter`, `CIPFilterTask`):
+/// `ipfilter.dat` then `ipfilter_static.dat`, the later winning where they
+/// overlap; missing files are made with aMule's placeholders.
+pub fn ip_filter(dir: &Path, conf: &ConfFile, notes: &mut Vec<String>) -> Arc<AddressFilter> {
+    for (name, text) in [
+        ("ipfilter.dat", IPFILTER_PLACEHOLDER),
+        ("ipfilter_static.dat", IPFILTER_STATIC_PLACEHOLDER),
+    ] {
+        let p = dir.join(name);
+        if !p.exists() {
+            if let Err(e) = std::fs::write(&p, text) {
+                notes.push(format!("{}: {e}", p.display()));
+            }
+        }
+    }
+    let lists: Vec<IpFilterFile> = ["ipfilter.dat", "ipfilter_static.dat"]
+        .iter()
+        .filter_map(|n| load_filter_list(&dir.join(n), notes))
+        .collect();
+    let refs: Vec<&IpFilterFile> = lists.iter().collect();
+    let int = |key: &str| conf.get(key).and_then(ed2k_formats::amule_conf::parse_long);
+    let flag = |key: &str| int(key).is_none_or(|v| v != 0);
+    let level = int("/eMule/FilterLevel").map_or(DEFAULT_LEVEL, |v| v.clamp(0, 255) as u32);
+    Arc::new(AddressFilter::new(
+        IpFilter::build(&refs),
+        level,
+        flag("/ExternalConnect/IpFilterClients"),
+        flag("/ExternalConnect/IpFilterServers"),
+    ))
+}
+
 /// Load `dir` as `amuled` would.
 pub fn load(dir: &Path) -> Result<Loaded, String> {
     if !dir.is_dir() {
@@ -170,6 +252,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
     if prefs.connect_to_ed2k && servers.is_empty() {
         notes.push("no servers in server.met: eD2k off".to_owned());
     }
+    let ip_filter = ip_filter(dir, &conf, &mut notes);
     let kad = if prefs.connect_to_kad {
         if dir.join("nodes.dat").is_file() {
             Some(KadSettings {
@@ -208,6 +291,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         // Unknown until a firewall check, which is not ported: assume not.
         reachable: false,
         allow_lan: !filter_lan,
+        ip_filter: Some(ip_filter),
         stop_when_done: false,
         status_every: Duration::from_secs(60),
     };

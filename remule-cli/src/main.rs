@@ -289,6 +289,14 @@ fn default_config_dir() -> Option<PathBuf> {
 }
 
 fn main() -> ExitCode {
+    // The client and Kad log through `tracing`: print their lines as the
+    // tool always has, bare on stdout.
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_level(false)
+        .with_writer(std::io::stdout)
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Command::Hash { files, verbose } => hash_files(&files, verbose),

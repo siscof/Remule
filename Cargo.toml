@@ -13,6 +13,7 @@ members = [
 	'remule-ec',
 	'remule-gui',
 	'remule-net',
+	'remuled',
 ]
 resolver = "2"
 

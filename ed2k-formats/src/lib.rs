@@ -18,6 +18,8 @@
 //! * [`canceled_met`]: `canceled.met` (and `knownhistory.met`), lists of file hashes.
 //! * [`emfriends_met`]: `emfriends.met`, the friends list.
 //! * [`amule_conf`]: `amule.conf`, the preferences (a wxFileConfig INI file).
+//! * [`preferences_dat`]: `preferences.dat`, our user hash.
+//! * [`shareddir_dat`]: `shareddir.dat` and its successors, the shared folders.
 
 pub mod addresses_dat;
 pub mod amule_conf;
@@ -30,4 +32,6 @@ pub mod known2_met;
 pub mod known_met;
 pub mod nodes_dat;
 pub mod part_met;
+pub mod preferences_dat;
 pub mod server_met;
+pub mod shareddir_dat;

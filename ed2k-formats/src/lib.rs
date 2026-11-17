@@ -20,6 +20,7 @@
 //! * [`amule_conf`]: `amule.conf`, the preferences (a wxFileConfig INI file).
 //! * [`preferences_dat`]: `preferences.dat`, our user hash.
 //! * [`shareddir_dat`]: `shareddir.dat` and its successors, the shared folders.
+//! * [`statistics_dat`]: `statistics.dat`, the bytes sent and received over all sessions.
 
 pub mod addresses_dat;
 pub mod amule_conf;
@@ -35,3 +36,4 @@ pub mod part_met;
 pub mod preferences_dat;
 pub mod server_met;
 pub mod shareddir_dat;
+pub mod statistics_dat;

@@ -48,6 +48,9 @@ pub enum Command {
     },
     /// Where each file stands, and the bytes received so far.
     Progress(tokio::sync::oneshot::Sender<(Vec<FileProgress>, QueueStats)>),
+    /// The file data received and sent so far: the session's counts for
+    /// the statistics.
+    Traffic(tokio::sync::oneshot::Sender<crate::statistics::Totals>),
     /// A server login gave us this ID (0 when logged out) and public
     /// address: the hellos of connections from now on carry them.
     SetOurId {
@@ -326,6 +329,13 @@ pub async fn run_with(
                         .collect(),
                     Some(Command::Progress(reply)) => {
                         let _ = reply.send((queue.progress(), queue.stats()));
+                        Vec::new()
+                    }
+                    Some(Command::Traffic(reply)) => {
+                        let _ = reply.send(crate::statistics::Totals {
+                            received: queue.stats().received,
+                            sent: uploader.as_ref().map_or(0, |u| u.sent_total()),
+                        });
                         Vec::new()
                     }
                     Some(Command::SetOurId { id, public_ip }) => {

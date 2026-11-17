@@ -15,6 +15,8 @@
 //! * [`credits`]: upload and download credits, `clients.met`.
 //! * [`ip_filter`]: the IP filter as peers and servers are checked against it.
 //! * [`publish`]: what to offer to the server and publish on Kad, and when.
+//! * [`statistics`]: the bytes sent and received, this session and in all,
+//!   and when to save them (`CStatistics`), without IO.
 //! * [`downloader`]: the queue on tokio, with peer connections on
 //!   `remule-net`.
 
@@ -27,6 +29,7 @@ pub mod ip_filter;
 pub mod part_file;
 pub mod publish;
 pub mod shared;
+pub mod statistics;
 pub mod upload_queue;
 pub mod uploader;
 

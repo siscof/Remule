@@ -33,6 +33,7 @@ use remule_core::downloader::{self, Command, DownloaderConfig};
 use remule_core::ip_filter::AddressFilter;
 use remule_core::publish::{KadPublish, Publisher};
 use remule_core::shared::{mtime, ScanOptions, SharedFiles};
+use remule_core::statistics::{Statistics, Totals};
 use remule_core::upload_queue::{UploadConfig, UploadQueue};
 use remule_core::uploader::Uploader;
 use remule_core::PartFile;
@@ -109,6 +110,8 @@ pub struct Summary {
     pub completed: usize,
     pub received: u64,
     pub uploaded: u64,
+    /// The bytes of every session, this one's included (`statistics.dat`).
+    pub totals: Totals,
 }
 
 pub fn human(n: u64) -> String {
@@ -421,6 +424,12 @@ pub async fn run(
     };
 
     let start = Instant::now();
+    // The totals of earlier sessions, which this one adds to.
+    let (before, note) = crate::stats::load(&c.config);
+    if let Some(n) = note {
+        warn!("{n}");
+    }
+    let mut statistics = Statistics::new(before, start);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut next_status = Duration::ZERO;
     let mut next_server_ask = Instant::now();
@@ -529,6 +538,16 @@ pub async fn run(
             _ = tick.tick() => {
                 let now = Instant::now();
                 let t = start.elapsed();
+                // The session's bytes into the statistics, saved once a minute.
+                let (tx, rx) = oneshot::channel();
+                if cmd.send(Command::Traffic(tx)).is_ok() {
+                    if let Ok(traffic) = rx.await {
+                        statistics.update(traffic, now);
+                    }
+                }
+                if let Some(totals) = statistics.save_due(now) {
+                    crate::stats::save_logged(&c.config, &mut statistics, &totals);
+                }
                 // Every server failed a while ago: a new sweep.
                 if let Some(next) = connector.poll(now) {
                     follow(next, &c, &mut attempting, t);
@@ -609,6 +628,7 @@ pub async fn run(
                                 t.as_secs(), human(rate as u64), human(stats.received), stats.connections);
                         }
                     }
+                    info!("[{:>5}s] {}", t.as_secs(), crate::stats::line(&statistics));
                 }
             }
         }
@@ -654,5 +674,20 @@ pub async fn run(
         "{done} file(s) completed, {} received",
         human(summary.received)
     );
+    // The statistics, with the last bytes counted, saved as aMule does on
+    // shutdown.
+    let now = Instant::now();
+    statistics.update(
+        Totals {
+            sent: summary.uploaded,
+            received: summary.received,
+        },
+        now,
+    );
+    if let Some(totals) = statistics.unsaved() {
+        crate::stats::save_logged(&c.config, &mut statistics, &totals);
+    }
+    summary.totals = statistics.totals();
+    info!("{}", crate::stats::summary(&statistics, now));
     Ok(summary)
 }

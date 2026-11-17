@@ -32,20 +32,10 @@ AMULE_PORT=4662
 SERVER_PORT=4242
 HERE=$(dirname "$(realpath "$0")")
 EC_PORT=4712
-# Every amuled runs on one CPU. Stock 2.3.3 can lose a peer socket's read
-# wakeup: CAsioSocketImpl's m_eventPending and m_readPending are plain bools
-# shared by the Asio thread and the main thread, so on two cores the main
-# thread can see a stale "read pending", block, and leave bytes it buffered
-# with no event to announce them; it never reads that socket again (Recv-Q
-# full, window 0). Seen here with a stock aMule as the source too, at a
-# random point of the file. Fixed upstream after 2.3.3 ("fix(asio): don't
-# lose the read wakeup", amule-org/amule#882); on one core the stale view
-# cannot happen.
-AMULED=(taskset -c 0 amuled)
 EC_PASS=interop
 
-for tool in amuled amulecmd taskset; do
-	command -v "$tool" >/dev/null || { echo "missing $tool (install amule-daemon, amule-utils, util-linux)"; exit 2; }
+for tool in amuled amulecmd; do
+	command -v "$tool" >/dev/null || { echo "missing $tool (install amule-daemon, amule-utils)"; exit 2; }
 done
 [ -x "$REMULE" ] || { echo "missing $REMULE (cargo build --release -p remule-cli)"; exit 2; }
 
@@ -146,7 +136,7 @@ EOF
 	# always shares its Incoming directory.
 	cp "$WORK/share/$NAME" "$SRC_CFG/Incoming/"
 	: > "$SRC_CFG/addresses.dat"
-	"${AMULED[@]}" --config-dir="$SRC_CFG" > "$WORK/remule.log" 2>&1 &
+	amuled --config-dir="$SRC_CFG" > "$WORK/remule.log" 2>&1 &
 	PIDS+=($!)
 	# Ready once it has hashed the file (its log lists the known shared files).
 	for _ in $(seq 1 90); do
@@ -201,7 +191,7 @@ data = struct.pack("<BI", 0x0E, 1) + socket.inet_aton(ip) + struct.pack("<HI", p
 open(path, "wb").write(data)
 PY
 : > "$AMULE_CFG/addresses.dat"
-"${AMULED[@]}" --config-dir="$AMULE_CFG" > "$WORK/amuled.log" 2>&1 &
+amuled --config-dir="$AMULE_CFG" > "$WORK/amuled.log" 2>&1 &
 PIDS+=($!)
 
 cmd() { amulecmd -h 127.0.0.1 -p "$EC_PORT" -P "$EC_PASS" -c "$1" 2>&1; }

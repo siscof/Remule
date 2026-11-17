@@ -476,6 +476,56 @@ fn bad_and_duplicate_sources_are_refused() {
 }
 
 #[test]
+fn sources_the_ip_filter_blocks_are_refused() {
+    use crate::ip_filter::AddressFilter;
+    use ed2k_formats::ipfilter::{IpFilter, IpFilterFile};
+
+    let dir = TempDir::new("q-ipfilter");
+    let now = Instant::now();
+    let ep = |a: [u8; 4]| Endpoint::new(SocketAddrV4::new(Ipv4Addr::from(a), 4662));
+    // Level 100 is blocked at the default 127; level 200 is not.
+    let list = IpFilterFile::parse(
+        b"1.2.3.0 - 1.2.3.255 , 100 , blocked\n5.6.7.0 - 5.6.7.255 , 200 , allowed\n",
+    );
+    let filter = |clients| {
+        let mut c = config(&dir);
+        c.ip_filter = Some(Arc::new(AddressFilter::new(
+            IpFilter::build(&[&list]),
+            127,
+            clients,
+            true,
+        )));
+        let mut q = DownloadQueue::new(c);
+        q.add_file(PartFile::create(&dir.temp(), "x", Md4Hash([5; 16]), 100).unwrap());
+        q
+    };
+    let mut q = filter(true);
+    assert!(q.blocks(Ipv4Addr::new(1, 2, 3, 4)));
+    assert!(q
+        .add_source(Md4Hash([5; 16]), ep([1, 2, 3, 4]), Origin::Server, now)
+        .is_empty());
+    assert_eq!(
+        q.add_source(Md4Hash([5; 16]), ep([5, 6, 7, 8]), Origin::Server, now)
+            .len(),
+        1
+    );
+    assert_eq!(
+        q.add_source(Md4Hash([5; 16]), ep([1, 2, 4, 1]), Origin::Kad, now)
+            .len(),
+        1
+    );
+    assert_eq!(q.source_count(&Md4Hash([5; 16])), 2);
+    // With IpFilterClients off, nothing is blocked.
+    let mut q = filter(false);
+    assert!(!q.blocks(Ipv4Addr::new(1, 2, 3, 4)));
+    assert_eq!(
+        q.add_source(Md4Hash([5; 16]), ep([1, 2, 3, 4]), Origin::Server, now)
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn connections_respect_the_limits() {
     let (dir, _d, h, _) = setup("q-limits");
     let mut c = config(&dir);

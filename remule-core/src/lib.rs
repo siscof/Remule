@@ -13,6 +13,7 @@
 //! * [`upload_queue`]: who gets an upload slot (`CUploadQueue`), without IO.
 //! * [`uploader`]: the upload side of a running client, without IO.
 //! * [`credits`]: upload and download credits, `clients.met`.
+//! * [`ip_filter`]: the IP filter as peers and servers are checked against it.
 //! * [`publish`]: what to offer to the server and publish on Kad, and when.
 //! * [`downloader`]: the queue on tokio, with peer connections on
 //!   `remule-net`.
@@ -22,6 +23,7 @@ pub mod credits;
 pub mod download_queue;
 pub mod downloader;
 pub mod gap_list;
+pub mod ip_filter;
 pub mod part_file;
 pub mod publish;
 pub mod shared;

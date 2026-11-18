@@ -118,13 +118,15 @@ ECAddress=127.0.0.1
 ECPort=$EC_PORT
 ECPassword=$EC_DIGEST
 EOF
-# server.met: version 0x0E, one server, no tags.
+# server.met: version 0x0E, one server with its name (ST_SERVERNAME).
 python3 - "$CFG/server.met" "$SERVER_PORT" <<'EOF'
 import socket, struct, sys
 path, port = sys.argv[1], int(sys.argv[2])
+name = b"remule interop server"
 with open(path, "wb") as f:
     f.write(bytes([0x0E]) + struct.pack("<I", 1))
-    f.write(socket.inet_aton("127.0.0.1") + struct.pack("<HI", port, 0))
+    f.write(socket.inet_aton("127.0.0.1") + struct.pack("<HI", port, 1))
+    f.write(struct.pack("<BHBH", 0x02, 1, 0x01, len(name)) + name)
 EOF
 head -c 300000 /dev/urandom >"$WORK/share/interop shared file.bin"
 printf '%s\n' "$WORK/share" >"$CFG/shareddir.dat"
@@ -149,7 +151,7 @@ echo "remuled is up; $("$AMULECMD" --version 2>&1 | head -1)"
 # --- what a user does ----------------------------------------------------------
 
 # Status: logged into the fake server.
-expect 30 "connected.*(127\.0\.0\.1|remule)|ed2k.*connected" status
+expect 30 "eD2k: Connected to remule interop server 127\.0\.0\.1.* with HighID" status
 # A wrong password is refused.
 "$AMULECMD" -h 127.0.0.1 -p "$EC_PORT" -P wrong -c status >"$WORK/wrong" 2>&1 || true
 grep -Eiq "wrong password|authentication failed|denied" "$WORK/wrong" || {

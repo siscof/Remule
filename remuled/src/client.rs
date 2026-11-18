@@ -47,6 +47,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::ec::{self, Control, DownloadIds, EcSettings, KadStatus, ServerStatus, Status};
+use crate::ec_search;
 use crate::ec_servers::{Effect, ServerList};
 use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
@@ -362,6 +363,51 @@ struct Added {
     size: u64,
     file: Option<PartFile>,
     sources: Vec<Endpoint>,
+    origin: Origin,
+}
+
+/// What a new download changes in the client loop.
+struct Starting<'a> {
+    names: &'a mut HashMap<Md4Hash, String>,
+    paused: &'a mut HashSet<Md4Hash>,
+    wanted: &'a mut Vec<(Md4Hash, u64)>,
+    kad_searches: &'a mut HashMap<u32, Md4Hash>,
+    cmd: &'a mpsc::UnboundedSender<Command>,
+    server: Option<&'a ServerClient>,
+    /// Kad, when connected.
+    kad: Option<&'a ed2k_kad::driver::KadHandle>,
+}
+
+/// Start what [`new_download`] made: the file to the downloader, its
+/// sources, and sources asked for it at once from the server and Kad.
+async fn take_download(add: Added, s: Starting<'_>) {
+    let (hash, size) = (add.hash, add.size);
+    if let Some(f) = add.file {
+        s.names.insert(hash, f.name().to_owned());
+        if f.is_paused() {
+            s.paused.insert(hash);
+        }
+        let _ = s.cmd.send(Command::AddFile(Box::new(f)));
+        s.wanted.push((hash, size));
+    }
+    if !add.sources.is_empty() {
+        let _ = s.cmd.send(Command::AddSources {
+            file: hash,
+            sources: add.sources,
+            origin: add.origin,
+        });
+    }
+    if let Some(server) = s.server {
+        let _ = server.get_sources(hash, size).await;
+    }
+    if let Some(k) = s.kad {
+        match k.search_sources(hash, size).await {
+            Ok(id) => {
+                s.kad_searches.insert(id, hash);
+            }
+            Err(e) => warn!("Kad source search: {e}"),
+        }
+    }
 }
 
 /// `CDownloadQueue::AddLink` for an ed2k file link: a new download in the
@@ -392,23 +438,61 @@ fn add_link(
         }
     };
     let sources = l.sources.iter().map(|a| Endpoint::new(*a)).collect();
-    if wanted.iter().any(|(h, _)| *h == l.hash) {
-        // `IsFileExisting`: already downloading; the link's sources are taken.
-        warn!("You are already trying to download the file '{}'", l.name);
-        return Some(Added {
+    // A link's sources are taken for a download already there.
+    new_download(
+        c,
+        wanted,
+        shares,
+        NewDownload {
+            name: &l.name,
             hash: l.hash,
             size: l.size,
-            file: None,
+            aich: l.aich,
             sources,
+            origin: Origin::Manual,
+            sources_if_downloading: true,
+        },
+    )
+}
+
+/// A download to start, from a link or a search result.
+struct NewDownload<'a> {
+    name: &'a str,
+    hash: Md4Hash,
+    size: u64,
+    aich: Option<ed2k_types::AichHash>,
+    sources: Vec<Endpoint>,
+    origin: Origin,
+    /// Hand the sources on when the file is already being downloaded
+    /// (`AddED2KLink` does, `AddSearchToDownload` does not).
+    sources_if_downloading: bool,
+}
+
+/// `IsFileExisting`, then a new download in the temp directory. `None`
+/// (logged as aMule logs it) when nothing is to be done.
+fn new_download(
+    c: &ClientConfig,
+    wanted: &[(Md4Hash, u64)],
+    shares: Option<&Arc<Mutex<SharedFiles>>>,
+    d: NewDownload<'_>,
+) -> Option<Added> {
+    if wanted.iter().any(|(h, _)| *h == d.hash) {
+        warn!("You are already trying to download the file '{}'", d.name);
+        return d.sources_if_downloading.then_some(Added {
+            hash: d.hash,
+            size: d.size,
+            file: None,
+            sources: d.sources,
+            origin: d.origin,
         });
     }
     if let Some(sh) = shares {
         let sh = sh.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((f, _)) = sh.files().into_iter().find(|(f, _)| f.hash == l.hash) {
-            if l.name != f.name {
+        if let Some((f, _)) = sh.files().into_iter().find(|(f, _)| f.hash == d.hash) {
+            if d.name != f.name {
                 warn!(
                     "You already have the file '{}' (requested as '{}')",
-                    f.name, l.name
+                    f.name, d.name
                 );
             } else {
                 warn!("You already have the file '{}'", f.name);
@@ -416,27 +500,28 @@ fn add_link(
             return None;
         }
     }
-    let mut f = match PartFile::create(&c.temp, &l.name, l.hash, l.size) {
+    let mut f = match PartFile::create(&c.temp, d.name, d.hash, d.size) {
         Ok(f) => f,
         Err(e) => {
-            warn!("{}: {e}", l.name);
+            warn!("{}: {e}", d.name);
             return None;
         }
     };
-    if let Some(root) = l.aich {
+    if let Some(root) = d.aich {
         f.set_aich_root(root);
     }
     info!(
         "new download {} ({}, {})",
-        l.name,
-        human(l.size),
+        d.name,
+        human(d.size),
         f.met_path().display()
     );
     Some(Added {
-        hash: l.hash,
-        size: l.size,
+        hash: d.hash,
+        size: d.size,
         file: Some(f),
-        sources,
+        sources: d.sources,
+        origin: d.origin,
     })
 }
 
@@ -655,6 +740,8 @@ pub async fn run(
     let mut kad_since: Option<u32> = None;
     let mut last_traffic = Totals::default();
     let mut download_ids = DownloadIds::default();
+    // The search external connections run.
+    let mut searches = ec_search::SearchList::default();
     let mut shared_state = crate::ec_shared::SharedState::default();
     let reload_dirs = crate::ec_shared::ReloadDirs {
         dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
@@ -731,6 +818,7 @@ pub async fn run(
             }
             ev = async { match &mut server { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
                 match ev {
+                    Some(ServerEvent::SearchResults { results, .. }) => searches.server_results(results),
                     Some(ServerEvent::FoundSources { hash, sources }) => {
                         let eps: Vec<Endpoint> = sources.iter().filter_map(Endpoint::from_server).collect();
                         info!("[{:>5}s] server: {} sources ({} reachable) for {}",
@@ -770,7 +858,9 @@ pub async fn run(
                             let _ = cmd.send(Command::AddSources { file, sources: vec![ep], origin: Origin::Kad });
                         }
                     }
+                    Some(KadEvent::Found { search, found: Found::Keyword(k) }) => searches.kad_result(search, *k),
                     Some(KadEvent::SearchDone { search, answers, .. }) => {
+                        searches.kad_done(search);
                         if let Some(file) = kad_searches.remove(&search) {
                             info!("[{:>5}s] Kad: {answers} source answers for {}", start.elapsed().as_secs(),
                                 names.get(&file).map(String::as_str).unwrap_or("?"));
@@ -798,7 +888,6 @@ pub async fn run(
                             });
                         }
                     }
-                    Some(_) => {}
                     None => kad_node = None,
                 }
             }
@@ -817,28 +906,11 @@ pub async fn run(
                         let added = add_link(&link, &c, &wanted, shares.as_ref());
                         let taken = added.is_some();
                         if let Some(add) = added {
-                            let (hash, size) = (add.hash, add.size);
-                            if let Some(f) = add.file {
-                                names.insert(hash, f.name().to_owned());
-                                if f.is_paused() {
-                                    paused.insert(hash);
-                                }
-                                let _ = cmd.send(Command::AddFile(Box::new(f)));
-                                wanted.push((hash, size));
-                            }
-                            if !add.sources.is_empty() {
-                                let _ = cmd.send(Command::AddSources { file: hash, sources: add.sources, origin: Origin::Manual });
-                            }
-                            // Sources for it now, from the server and Kad.
-                            if let Some(s) = &server {
-                                let _ = s.get_sources(hash, size).await;
-                            }
-                            if let (Some(k), true) = (&kad_node, kad_connected.is_some()) {
-                                match k.handle.search_sources(hash, size).await {
-                                    Ok(id) => { kad_searches.insert(id, hash); }
-                                    Err(e) => warn!("Kad source search: {e}"),
-                                }
-                            }
+                            take_download(add, Starting {
+                                names: &mut names, paused: &mut paused, wanted: &mut wanted,
+                                kad_searches: &mut kad_searches, cmd: &cmd, server: server.as_ref(),
+                                kad: kad_node.as_ref().filter(|_| kad_connected.is_some()).map(|k| &k.handle),
+                            }).await;
                         }
                         let _ = reply.send(taken);
                         // The EC view shows it at once.
@@ -871,6 +943,38 @@ pub async fn run(
                         }
                         let _ = reply.send(r);
                         tick.reset_immediately();
+                    }
+                    Some(Control::Search { req, reply }) => {
+                        let net = ec_search::Net { server: server.as_ref(), kad: kad_node.as_ref().map(|k| &k.handle) };
+                        let status = |h: &Md4Hash| {
+                            if wanted.iter().any(|(w, _)| w == h) {
+                                ec_search::download_status::QUEUED
+                            } else if shares.as_ref().is_some_and(|s| s.lock().unwrap_or_else(|e| e.into_inner()).files().iter().any(|(f, _)| f.hash == *h)) {
+                                ec_search::download_status::DOWNLOADED
+                            } else {
+                                ec_search::download_status::NEW
+                            }
+                        };
+                        let (packet, todo) = ec_search::serve(&req, &mut searches, net, &status).await;
+                        let started = !todo.is_empty();
+                        for d in todo {
+                            let add = new_download(&c, &wanted, shares.as_ref(), NewDownload {
+                                name: &d.name, hash: d.hash, size: d.size, aich: None,
+                                sources: d.sources.into_iter().map(Endpoint::new).collect(),
+                                origin: Origin::Server, sources_if_downloading: false,
+                            });
+                            if let Some(add) = add {
+                                take_download(add, Starting {
+                                    names: &mut names, paused: &mut paused, wanted: &mut wanted,
+                                    kad_searches: &mut kad_searches, cmd: &cmd, server: server.as_ref(),
+                                    kad: kad_node.as_ref().filter(|_| kad_connected.is_some()).map(|k| &k.handle),
+                                }).await;
+                            }
+                        }
+                        let _ = reply.send(packet);
+                        if started {
+                            tick.reset_immediately();
+                        }
                     }
                     Some(Control::Servers { request, reply }) => {
                         let t = start.elapsed();
@@ -999,6 +1103,7 @@ pub async fn run(
                     crate::stats::save_logged(&c.config, &mut statistics, &totals);
                 }
                 // Every server failed a while ago: a new sweep.
+                searches.poll(now);
                 if let Some(next) = connector.poll(now) {
                     follow(next, &c, &mut attempting, t);
                 }

@@ -12,6 +12,7 @@
 //! * [`server_conn`]: which eD2k server to log into next, and when.
 //! * [`stats`]: the transfer statistics in `statistics.dat` and in the log.
 //! * [`ec`]: external connections, for `amulecmd` and `amulegui`.
+//! * [`ec_search`]: searches over external connections.
 //! * [`ec_servers`]: the server list and the networks over them.
 //! * [`ec_shared`]: shared files over external connections.
 
@@ -19,6 +20,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod config;
 pub mod ec;
+pub mod ec_search;
 pub mod ec_servers;
 pub mod ec_shared;
 pub mod firewall;
@@ -33,6 +35,8 @@ mod tests;
 mod tests_bootstrap;
 #[cfg(test)]
 mod tests_ec;
+#[cfg(test)]
+mod tests_ec_search;
 #[cfg(test)]
 mod tests_ec_servers;
 #[cfg(test)]

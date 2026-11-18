@@ -152,6 +152,7 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         ip_filter: None,
         stop_when_done: true,
         status_every: Duration::from_secs(a.status_every.max(1)),
+        ec: None,
     };
     client::run(c, files, link_sources, stopped(a.duration)).await?;
     Ok(())

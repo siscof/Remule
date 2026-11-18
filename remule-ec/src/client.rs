@@ -153,6 +153,12 @@ impl Client {
         &self.info
     }
 
+    /// The socket, for tests that write to it behind the client's back.
+    #[cfg(test)]
+    pub(crate) fn take_stream_for_tests(&mut self) -> TcpStream {
+        self.stream.try_clone().unwrap()
+    }
+
     fn login(&mut self, opts: &ConnectOptions, local: bool) -> Result<(), Error> {
         let mut srp = srp::Client::start();
         let eph = Ephemeral::generate();

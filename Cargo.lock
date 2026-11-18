@@ -3569,6 +3569,7 @@ dependencies = [
  "ed2k-types",
  "rand 0.8.5",
  "remule-core",
+ "remule-ec",
  "remule-net",
  "reqwest",
  "tokio",

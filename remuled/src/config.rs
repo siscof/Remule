@@ -17,15 +17,19 @@
 //! * `ipfilter.dat`, then `ipfilter_static.dat`: the IP filter, applied
 //!   with `FilterLevel`, `IpFilterClients` and `IpFilterServers`. Missing
 //!   ones are made with aMule's placeholder comments.
+//! * `[ExternalConnect]` in `amule.conf`: whether, where and with what
+//!   password external connections are accepted. A legacy `ECPassword` is
+//!   migrated to `ECPasswordVerifier` in `amule.conf`, as aMule 3.3 does.
 //!
 //! Nothing aMule owns is rewritten except what aMule itself writes as it
 //! runs. aMule must not run on the same directory at the same time.
 
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ed2k_formats::amule_conf::{ConfFile, Preferences};
+use ed2k_formats::amule_conf::{keys, ConfFile, Preferences};
 use ed2k_formats::ipfilter::{IpFilter, IpFilterFile};
 use ed2k_formats::server_met::{
     ServerInfo, ServerMet, PRIORITY_HIGH, PRIORITY_LOW, PRIORITY_NORMAL,
@@ -34,8 +38,11 @@ use ed2k_formats::{preferences_dat, shareddir_dat};
 use ed2k_types::Md4Hash;
 use rand::RngCore;
 use remule_core::ip_filter::{AddressFilter, DEFAULT_LEVEL};
+use remule_ec::server::{Credentials, Limits};
+use remule_ec::srp::{is_password_digest, Verifier};
 
 use crate::client::{load_identity, ClientConfig, KadSettings};
+use crate::ec::EcSettings;
 
 /// Peer connections when `amule.conf` does not say
 /// (`GetRecommendedMaxConnections` on a system without a lower limit).
@@ -264,6 +271,8 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         notes.push("no servers in server.met: eD2k off".to_owned());
     }
     let mut info = Vec::new();
+    let mut conf = conf;
+    let ec = ec_settings(dir, &mut conf, &prefs, &mut notes, &mut info);
     let ip_filter = ip_filter(dir, &conf, &mut notes, &mut info);
     let kad = if prefs.connect_to_kad {
         if dir.join("nodes.dat").is_file() {
@@ -306,11 +315,171 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         ip_filter: Some(ip_filter),
         stop_when_done: false,
         status_every: Duration::from_secs(60),
+        ec,
     };
     Ok(Loaded {
         client,
         prefs,
         notes,
         info,
+    })
+}
+
+/// `amule.conf` written back, through a temporary file as wxFileConfig does.
+fn save_conf(dir: &Path, conf: &ConfFile) -> Result<(), String> {
+    let path = dir.join("amule.conf");
+    let tmp = dir.join("amule.conf.tmp");
+    std::fs::write(&tmp, conf.to_bytes())
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What `ECSRP::LoadCredential` makes of the two EC password keys: the
+/// verifier (`None`: no EC password), or why external connections are off.
+/// A legacy `ECPassword` digest becomes a verifier with a fresh salt,
+/// written to `amule.conf`, and the legacy key is removed; a verifier left
+/// behind by a downgrade that changed the password is replaced the same way.
+pub fn ec_credential(
+    dir: &Path,
+    conf: &mut ConfFile,
+    notes: &mut Vec<String>,
+) -> Result<Option<Verifier>, String> {
+    let legacy = conf
+        .get(keys::EC_PASSWORD_LEGACY)
+        .unwrap_or_default()
+        .to_owned();
+    if !legacy.is_empty() && !is_password_digest(&legacy) {
+        return Err(concat!(
+            "ECPassword contains an invalid or empty-password digest. ",
+            "Run amuled --ec-config to set a new EC password."
+        )
+        .into());
+    }
+    let has_legacy = conf.get(keys::EC_PASSWORD_LEGACY).is_some();
+    // Remove the legacy key (Cleanup), saying so if that cannot be saved.
+    let cleanup = |conf: &mut ConfFile, notes: &mut Vec<String>| {
+        if conf.remove(keys::EC_PASSWORD_LEGACY) && save_conf(dir, conf).is_err() {
+            notes.push(
+                "Could not remove legacy ECPassword; cleanup will be retried on restart.".into(),
+            );
+        }
+    };
+    // A new verifier for the legacy digest (Migrate).
+    let migrate = |conf: &mut ConfFile, notes: &mut Vec<String>| -> Result<Verifier, String> {
+        let v = Verifier::create_random(&legacy).map_err(|_| {
+            "Could not generate ECPasswordVerifier; external connections are disabled.".to_owned()
+        })?;
+        conf.set(keys::EC_PASSWORD_VERIFIER, &v.encode());
+        if save_conf(dir, conf).is_ok() {
+            cleanup(conf, notes);
+        } else {
+            notes.push(
+                concat!(
+                    "Could not persist ECPasswordVerifier; using the legacy ECPassword in ",
+                    "memory for this run. Migration will be retried on restart."
+                )
+                .into(),
+            );
+        }
+        Ok(v)
+    };
+    let Some(stored) = conf.get(keys::EC_PASSWORD_VERIFIER).map(str::to_owned) else {
+        return if legacy.is_empty() {
+            Ok(None)
+        } else {
+            migrate(conf, notes).map(Some)
+        };
+    };
+    let verifier = if stored.is_empty() {
+        None
+    } else {
+        Some(Verifier::decode(&stored).map_err(|_| {
+            "Invalid or unsupported ECPasswordVerifier; refusing external connections.".to_owned()
+        })?)
+    };
+    if has_legacy {
+        // A downgraded core recreates an empty key on any save; only a
+        // non-empty digest can carry a newer password.
+        let matches = match &verifier {
+            _ if legacy.is_empty() => true,
+            Some(v) => v.matches(&legacy),
+            None => false,
+        };
+        if !matches {
+            let v = migrate(conf, notes)?;
+            notes.push(
+                concat!(
+                    "Migrating a changed legacy ECPassword after downgrade; ",
+                    "the previous verifier no longer authenticates this run."
+                )
+                .into(),
+            );
+            return Ok(Some(v));
+        }
+    }
+    cleanup(conf, notes);
+    Ok(verifier)
+}
+
+/// `[ExternalConnect]`: `None` when external connections are off, with the
+/// reason noted as aMule logs it.
+fn ec_settings(
+    dir: &Path,
+    conf: &mut ConfFile,
+    prefs: &Preferences,
+    notes: &mut Vec<String>,
+    info: &mut Vec<String>,
+) -> Option<EcSettings> {
+    // The credential is loaded (and migrated) with the preferences, whether
+    // or not external connections are on.
+    let credential = ec_credential(dir, conf, notes);
+    if !prefs.accept_external_connections {
+        info.push("External connections disabled in config file".into());
+        return None;
+    }
+    let verifier = match credential {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            notes.push("External connections disabled due to empty password!".into());
+            return None;
+        }
+        Err(e) => {
+            notes.push(e);
+            return None;
+        }
+    };
+    let ip = if prefs.ec_address.is_empty() {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        let found = prefs.ec_address.parse().ok().or_else(|| {
+            (prefs.ec_address.as_str(), 0)
+                .to_socket_addrs()
+                .ok()?
+                .find_map(|a| match a {
+                    SocketAddr::V4(v4) => Some(*v4.ip()),
+                    SocketAddr::V6(_) => None,
+                })
+        });
+        found.unwrap_or_else(|| {
+            notes.push(format!(
+                "External connection: could not bind to '{}', listening on 127.0.0.1 only.",
+                prefs.ec_address
+            ));
+            Ipv4Addr::LOCALHOST
+        })
+    };
+    let limit = |key: &str, default: u64| {
+        conf.get(key)
+            .and_then(ed2k_formats::amule_conf::parse_long)
+            .map_or(default, |v| u64::from(v as u32))
+    };
+    Some(EcSettings {
+        addr: SocketAddrV4::new(ip, prefs.ec_port as u16),
+        credentials: Credentials::new(Some(verifier)),
+        limits: Limits {
+            window_seconds: limit("/ExternalConnect/AuthFailureWindowSeconds", 60),
+            threshold: limit("/ExternalConnect/AuthFailureThreshold", 10) as usize,
+            lockout_seconds: limit("/ExternalConnect/AuthLockoutSeconds", 300),
+        },
     })
 }

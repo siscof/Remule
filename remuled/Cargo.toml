@@ -19,6 +19,7 @@ ed2k-server = { path = "../ed2k-server" }
 ed2k-types = { path = "../ed2k-types" }
 rand = "0.8"
 remule-core = { path = "../remule-core" }
+remule-ec = { path = "../remule-ec" }
 remule-net = { path = "../remule-net" }
 # server.met and nodes.dat over HTTPS; rustls, so no OpenSSL to link.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

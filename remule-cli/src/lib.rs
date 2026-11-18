@@ -5,6 +5,5 @@
 pub mod download;
 pub mod inspect;
 pub mod kad;
-pub mod link;
 pub mod server;
 pub mod share;

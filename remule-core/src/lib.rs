@@ -14,6 +14,7 @@
 //! * [`uploader`]: the upload side of a running client, without IO.
 //! * [`credits`]: upload and download credits, `clients.met`.
 //! * [`ip_filter`]: the IP filter as peers and servers are checked against it.
+//! * [`link`]: ed2k file links (`CED2KFileLink`).
 //! * [`publish`]: what to offer to the server and publish on Kad, and when.
 //! * [`statistics`]: the bytes sent and received, this session and in all,
 //!   and when to save them (`CStatistics`), without IO.
@@ -26,6 +27,7 @@ pub mod download_queue;
 pub mod downloader;
 pub mod gap_list;
 pub mod ip_filter;
+pub mod link;
 pub mod part_file;
 pub mod publish;
 pub mod shared;

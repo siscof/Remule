@@ -40,7 +40,7 @@ Runs the client from an aMule config directory, as `amuled` does:
 - a missing `nodes.dat`, and server lists from `addresses.dat`, are fetched over HTTP at start;
 - `ipfilter.dat` and `ipfilter_static.dat` keep it away from filtered peers and servers;
 - transfer totals are kept in `statistics.dat`;
-- with `AcceptExternalConnections` and an EC password, it accepts External Connections on `ECPort` (aMule 3.3's SRP login). So far they can ask for statistics and the connection state, and shut it down.
+- with `AcceptExternalConnections` and an EC password, it accepts External Connections on `ECPort` (aMule 3.3's SRP login). So far they can ask for statistics and the connection state, list the downloads, add ed2k links, pause, resume and cancel downloads, and shut it down.
 
 Nick, ports, limits and directories come from `amule.conf`, the user hash from `preferences.dat`, and the secure-ident key from `cryptkey.dat` (both made if missing). A legacy `ECPassword` in `amule.conf` is replaced by an `ECPasswordVerifier`, as aMule 3.3 does. On Ctrl-C (or SIGTERM) it saves `known.met`, `clients.met`, the part files, the statistics and the Kad state, in aMule's formats and places.
 
@@ -48,7 +48,7 @@ Nick, ports, limits and directories come from `amule.conf`, the user hash from `
 
 Stop aMule first: the two must not use one directory at once.
 
-Not yet supported: the rest of External Connections (downloads, shared files, servers, searches, preferences), so `amulecmd` and `amulegui` can only log in, read the status and shut it down.
+Not yet supported: the rest of External Connections (shared files, servers, searches, preferences, and the incremental updates `amulegui` polls with).
 
 ## remule-gui: remote GUI for amuled
 

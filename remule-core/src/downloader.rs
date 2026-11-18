@@ -58,8 +58,28 @@ pub enum Command {
         id: u32,
         public_ip: Option<std::net::Ipv4Addr>,
     },
+    /// Pause, stop, resume or cancel a download; the reply is false when
+    /// it is not in the queue (or could not be deleted).
+    File {
+        file: Md4Hash,
+        op: FileOp,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Hang up, save the files, and return the queue.
     Shutdown,
+}
+
+/// What [`Command::File`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOp {
+    /// `PauseFile`.
+    Pause,
+    /// `StopFile`.
+    Stop,
+    /// `ResumeFile`.
+    Resume,
+    /// `Delete`: out of the queue, the `.part` and its met removed.
+    Delete,
 }
 
 /// Settings for [`run`].
@@ -354,6 +374,22 @@ pub async fn run_with(
                             up.set_our_id(id);
                         }
                         Vec::new()
+                    }
+                    Some(Command::File { file, op, reply }) => {
+                        let mut out = Vec::new();
+                        let missing = || Err(format!("FileHash not found: {file}"));
+                        let found = |ok: bool| if ok { Ok(()) } else { missing() };
+                        let r = match op {
+                            FileOp::Pause => found(queue.pause(&file, now, &mut out)),
+                            FileOp::Stop => found(queue.stop(&file, now, &mut out)),
+                            FileOp::Resume => found(queue.resume(&file)),
+                            FileOp::Delete => match queue.remove(&file, now, &mut out) {
+                                Some(f) => f.delete().map_err(|e| e.to_string()),
+                                None => missing(),
+                            },
+                        };
+                        let _ = reply.send(r);
+                        out
                     }
                     Some(Command::Shutdown) | None => break,
                 }

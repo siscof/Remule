@@ -5,20 +5,23 @@
 //! A listener on `ECAddress:ECPort`; per connection, the login of
 //! [`remule_ec::server`] and then requests, answered from a [`Status`] the
 //! client refreshes every second. Served so far: `EC_OP_STAT_REQ`,
-//! `EC_OP_GET_CONNSTATE` and `EC_OP_SHUTDOWN`; anything else is answered
-//! `EC_OP_FAILED`, as aMule answers an opcode it does not know.
+//! `EC_OP_GET_CONNSTATE`, `EC_OP_GET_DLOAD_QUEUE`, `EC_OP_ADD_LINK`, the
+//! partfile pause, resume, stop and delete commands, and
+//! `EC_OP_SHUTDOWN`; anything else is answered `EC_OP_FAILED`, as aMule
+//! answers an opcode it does not know.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ed2k_types::UInt128;
+use ed2k_types::{Md4Hash, UInt128};
+use remule_core::downloader::FileOp;
 use remule_ec::codes::*;
 use remule_ec::server::{AuthLimiter, Credentials, Identity, Limits, Received, ServerConn};
 use remule_ec::{Packet, Tag};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 /// How external connections are accepted (`[ExternalConnect]`).
@@ -100,6 +103,120 @@ pub struct Status {
     pub sources: u32,
     pub upload_queue: u32,
     pub banned: u32,
+    /// The download queue, in the client's order.
+    pub downloads: Vec<Download>,
+}
+
+/// `PS_*`, as EC reports a download's state.
+pub mod ps {
+    pub const READY: u8 = 0;
+    pub const EMPTY: u8 = 1;
+    pub const ERROR: u8 = 4;
+    pub const PAUSED: u8 = 7;
+    pub const COMPLETING: u8 = 8;
+    pub const COMPLETE: u8 = 9;
+}
+
+/// One download, as `CEC_PartFile_Tag` tells it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Download {
+    /// Its ID for this daemon process.
+    pub ecid: u32,
+    pub hash: Md4Hash,
+    pub name: String,
+    pub size: u64,
+    pub completed: u64,
+    pub transferred: u64,
+    pub sources: u32,
+    /// Sources sending data.
+    pub transferring: u32,
+    /// `GetStatus()`: [`ps`].
+    pub status: u8,
+    pub stopped: bool,
+    /// Bytes per second over the last second.
+    pub speed: u64,
+    /// `NNN.part.met`'s number.
+    pub part_met_id: u16,
+    /// The temp directory.
+    pub dir: String,
+    /// `EC_TAG_PARTFILE_PRIO`: `PR_*`, plus 10 when automatic.
+    pub priority: u8,
+    /// `EC_TAG_KNOWNFILE_PRIO`, the same way.
+    pub up_priority: u8,
+    pub category: u32,
+    pub last_seen_complete: u32,
+    pub lost_to_corruption: u64,
+}
+
+/// ECIDs for the downloads, and their speeds.
+#[derive(Debug, Default)]
+pub struct DownloadIds {
+    ids: std::collections::HashMap<Md4Hash, u32>,
+    next: u32,
+    last: std::collections::HashMap<Md4Hash, u64>,
+}
+
+impl DownloadIds {
+    /// The downloads as EC tells them; called once a second, so the
+    /// difference in bytes transferred is the speed.
+    pub fn view(
+        &mut self,
+        files: &[remule_core::download_queue::FileProgress],
+        temp: &std::path::Path,
+    ) -> Vec<Download> {
+        use remule_core::part_file::Status as S;
+        let mut last = std::collections::HashMap::new();
+        let out = files
+            .iter()
+            .map(|f| {
+                let ecid = *self.ids.entry(f.hash).or_insert_with(|| {
+                    self.next += 1;
+                    self.next
+                });
+                let speed = f
+                    .transferred
+                    .saturating_sub(*self.last.get(&f.hash).unwrap_or(&f.transferred));
+                last.insert(f.hash, f.transferred);
+                let status = match f.status {
+                    _ if f.done => ps::COMPLETE,
+                    S::Error => ps::ERROR,
+                    S::Completing => ps::COMPLETING,
+                    S::Complete => ps::COMPLETE,
+                    _ if f.paused => ps::PAUSED,
+                    S::Ready => ps::READY,
+                    S::Empty => ps::EMPTY,
+                };
+                let prio = |p: u32, auto: bool| (p as u8).saturating_add(if auto { 10 } else { 0 });
+                Download {
+                    ecid,
+                    hash: f.hash,
+                    name: f.name.clone(),
+                    size: f.size,
+                    completed: f.completed,
+                    transferred: f.transferred,
+                    sources: f.sources as u32,
+                    transferring: f.downloading as u32,
+                    status,
+                    stopped: f.stopped,
+                    speed,
+                    part_met_id: f
+                        .part_met_name
+                        .strip_suffix(".part")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0),
+                    dir: temp.display().to_string(),
+                    priority: prio(f.priority, f.auto_priority),
+                    up_priority: prio(f.up_priority, f.auto_up_priority),
+                    category: f.category,
+                    last_seen_complete: f.last_seen_complete,
+                    lost_to_corruption: f.lost_to_corruption,
+                }
+            })
+            .collect();
+        self.ids.retain(|h, _| last.contains_key(h));
+        self.last = last;
+        out
+    }
 }
 
 impl Status {
@@ -115,9 +232,21 @@ impl Status {
 }
 
 /// What a request asks of the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Control {
     Shutdown,
+    /// `CDownloadQueue::AddLink`, one link: true when it was taken.
+    AddLink {
+        link: String,
+        category: u32,
+        reply: oneshot::Sender<bool>,
+    },
+    /// One partfile command on one download.
+    File {
+        file: Md4Hash,
+        op: FileOp,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 fn detail(req: &Packet) -> u8 {
@@ -266,19 +395,250 @@ fn failed(message: &str) -> Packet {
     Packet::new(EC_OP_FAILED).with(Tag::string(EC_TAG_STRING, message))
 }
 
-/// `ProcessRequest2`, for what is served so far.
-pub fn answer(req: &Packet, s: &Status, shutting_down: bool) -> (Packet, Option<Control>) {
+/// `CEC_PartFile_Tag(file, detail_level)`, and its `CEC_SharedFile_Tag`
+/// base. Upload statistics, comments and media data are not kept yet:
+/// their zeros and blanks are sent, as for a file nobody asked for.
+pub fn partfile_tag(d: &Download, detail: u8) -> Tag {
+    let int = |name: u16, v: u64| Tag::int(name, v);
+    let mut t = Tag::int(EC_TAG_PARTFILE, d.ecid.into());
+    let mut add = |c: Tag| t.children.push(c);
+    // CEC_SharedFile_Tag.
+    for name in [
+        EC_TAG_KNOWNFILE_REQ_COUNT,
+        EC_TAG_KNOWNFILE_REQ_COUNT_ALL,
+        EC_TAG_KNOWNFILE_ACCEPT_COUNT,
+        EC_TAG_KNOWNFILE_ACCEPT_COUNT_ALL,
+        EC_TAG_KNOWNFILE_XFERRED,
+        EC_TAG_KNOWNFILE_XFERRED_ALL,
+    ] {
+        add(int(name, 0));
+    }
+    add(Tag::string(EC_TAG_KNOWNFILE_AICH_MASTERHASH, ""));
+    add(int(EC_TAG_KNOWNFILE_PRIO, d.up_priority.into()));
+    for name in [
+        EC_TAG_KNOWNFILE_COMPLETE_SOURCES_LOW,
+        EC_TAG_KNOWNFILE_COMPLETE_SOURCES_HIGH,
+        EC_TAG_KNOWNFILE_COMPLETE_SOURCES,
+        EC_TAG_KNOWNFILE_ON_QUEUE,
+        EC_TAG_KNOWNFILE_UPLOAD_SPEED,
+        EC_TAG_KNOWNFILE_UPLOADING_COUNT,
+        EC_TAG_KNOWNFILE_LAST_UPLOAD,
+    ] {
+        add(int(name, 0));
+    }
+    add(Tag::empty(EC_TAG_PARTFILE_COMMENTS));
+    add(int(EC_TAG_PARTFILE_KAD_COMMENT_SEARCHING, 0));
+    if detail != EC_DETAIL_UPDATE {
+        add(Tag::string(EC_TAG_PARTFILE_NAME, &d.name));
+        add(Tag::hash(EC_TAG_PARTFILE_HASH, d.hash.0));
+        add(Tag::string(
+            EC_TAG_KNOWNFILE_FILENAME,
+            &format!("{:03}.part", d.part_met_id),
+        ));
+        add(Tag::string(EC_TAG_KNOWNFILE_PATH, &d.dir));
+        add(int(EC_TAG_KNOWNFILE_SHARED_SINCE, 0));
+        add(int(EC_TAG_PARTFILE_SIZE_FULL, d.size));
+        add(Tag::string(EC_TAG_PARTFILE_ED2K_LINK, &ed2k_link(d)));
+        add(Tag::string(EC_TAG_KNOWNFILE_COMMENT, ""));
+        add(int(EC_TAG_KNOWNFILE_RATING, 0));
+    }
+    // CEC_PartFile_Tag.
+    add(int(EC_TAG_PARTFILE_STATUS, d.status.into()));
+    add(int(EC_TAG_PARTFILE_STOPPED, d.stopped.into()));
+    add(int(EC_TAG_PARTFILE_SOURCE_COUNT, d.sources.into()));
+    add(int(EC_TAG_PARTFILE_SOURCE_COUNT_NOT_CURRENT, 0));
+    add(int(
+        EC_TAG_PARTFILE_SOURCE_COUNT_XFER,
+        d.transferring.into(),
+    ));
+    add(int(EC_TAG_PARTFILE_SOURCE_COUNT_A4AF, 0));
+    if d.transferring > 0 || detail != EC_DETAIL_UPDATE {
+        add(int(EC_TAG_PARTFILE_SIZE_XFER, d.transferred));
+        add(int(EC_TAG_PARTFILE_SIZE_DONE, d.completed));
+        add(int(EC_TAG_PARTFILE_SPEED, d.speed));
+    }
+    add(int(EC_TAG_PARTFILE_PRIO, d.priority.into()));
+    add(int(EC_TAG_PARTFILE_CAT, d.category.into()));
+    add(int(
+        EC_TAG_PARTFILE_LAST_SEEN_COMP,
+        d.last_seen_complete.into(),
+    ));
+    add(int(EC_TAG_PARTFILE_LOST_CORRUPTION, d.lost_to_corruption));
+    add(int(EC_TAG_PARTFILE_GAINED_COMPRESSION, 0));
+    add(int(EC_TAG_PARTFILE_SAVED_ICH, 0));
+    add(int(EC_TAG_PARTFILE_A4AFAUTO, 0));
+    if detail != EC_DETAIL_UPDATE {
+        add(int(EC_TAG_PARTFILE_PARTMETID, d.part_met_id.into()));
+        add(Tag::empty(EC_TAG_PARTFILE_A4AF_SOURCES));
+    }
+    t
+}
+
+/// `CreateED2kLink(file, false)`: `ed2k://|file|NAME|SIZE|HASH|/`.
+pub fn ed2k_link(d: &Download) -> String {
+    format!(
+        "ed2k://|file|{}|{}|{}|/",
+        remule_core::part_file::clean_file_name(&d.name),
+        d.size,
+        d.hash
+    )
+}
+
+/// `Get_EC_Response_GetDownloadQueue`: every download, or those asked for
+/// by ECID.
+pub fn download_queue_reply(req: &Packet, s: &Status) -> Packet {
+    let detail = detail(req);
+    let asked: Vec<u64> = req.tags_named(EC_TAG_PARTFILE).map(Tag::as_int).collect();
+    let mut p = Packet::new(EC_OP_DLOAD_QUEUE);
+    for d in &s.downloads {
+        if asked.is_empty() || asked.contains(&u64::from(d.ecid)) {
+            p = p.with(partfile_tag(d, detail));
+        }
+    }
+    p
+}
+
+/// `EC_OP_ADD_LINK`: each tag a link; one reply for all of them.
+async fn add_links(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> Packet {
+    let (mut ok, mut failed_count) = (0, 0);
+    for t in &req.tags {
+        let link = t.as_str();
+        let category = t
+            .child(EC_TAG_PARTFILE_CAT)
+            .map_or(0, |c| c.as_int() as u32);
+        info!("ExternalConn: adding link '{link}'.");
+        let (reply, rx) = oneshot::channel();
+        let taken = control
+            .send(Control::AddLink {
+                link,
+                category,
+                reply,
+            })
+            .is_ok()
+            && rx.await.unwrap_or(false);
+        if taken {
+            ok += 1;
+        } else {
+            failed_count += 1;
+        }
+    }
+    if failed_count == 0 {
+        Packet::new(EC_OP_NOOP)
+    } else if ok == 0 {
+        failed("Invalid link or already on list.")
+    } else {
+        failed(&format!(
+            "{failed_count} of {} links failed (invalid or already on list).",
+            failed_count + ok
+        ))
+    }
+}
+
+/// `Get_EC_Response_PartFile_Cmd`: the command on each download named, in
+/// order, stopping at the first that is not one.
+async fn partfile_cmd(
+    req: &Packet,
+    s: &Status,
+    control: &mpsc::UnboundedSender<Control>,
+) -> Packet {
+    let op = match req.opcode {
+        EC_OP_PARTFILE_PAUSE => FileOp::Pause,
+        EC_OP_PARTFILE_RESUME => FileOp::Resume,
+        EC_OP_PARTFILE_STOP => FileOp::Stop,
+        _ => FileOp::Delete,
+    };
+    let mut response: Option<Packet> = None;
+    for t in &req.tags {
+        if t.name != EC_TAG_PARTFILE || t.ty != EC_TAGTYPE_HASH16 {
+            return failed("Invalid partfile command target.");
+        }
+        let Some(hash) = t.as_hash().map(Md4Hash) else {
+            return failed("Invalid partfile command target.");
+        };
+        let Some(d) = s.downloads.iter().find(|d| d.hash == hash) else {
+            info!("Remote PartFile command failed: FileHash not found: {hash}");
+            return failed(&format!("FileHash not found: {hash}"));
+        };
+        // An older client addresses files by hash only; a GUI adds the ECID
+        // it saw, so a replacement is not acted on.
+        if let Some(id) = t.child(EC_TAG_ECID) {
+            if !id.is_int() || id.as_int() != u64::from(d.ecid) {
+                return failed("The selected download has changed. Refresh and try again.");
+            }
+        }
+        if op == FileOp::Delete {
+            // Finished (or finishing) downloads are skipped, the rest
+            // cancelled.
+            if matches!(d.status, ps::COMPLETING | ps::COMPLETE) {
+                response.get_or_insert_with(|| {
+                    failed(&format!(
+                        "Cannot cancel a hashing or finished download: {}",
+                        d.name
+                    ))
+                });
+                continue;
+            }
+            let name_differs = t
+                .child(EC_TAG_PARTFILE_NAME)
+                .is_some_and(|n| n.ty != EC_TAGTYPE_STRING || n.as_str() != d.name);
+            let dir_differs = t
+                .child(EC_TAG_KNOWNFILE_PATH)
+                .is_some_and(|n| n.ty != EC_TAGTYPE_STRING || n.as_str() != d.dir);
+            if name_differs || dir_differs {
+                return failed(
+                    "The selected download has changed or is completing. Refresh and try again.",
+                );
+            }
+        }
+        let (reply, rx) = oneshot::channel();
+        if control
+            .send(Control::File {
+                file: hash,
+                op,
+                reply,
+            })
+            .is_err()
+        {
+            return failed("Already shutting down.");
+        }
+        if let Ok(Err(e)) = rx.await {
+            return failed(&e);
+        }
+    }
+    response.unwrap_or_else(|| Packet::new(EC_OP_NOOP))
+}
+
+/// What came of a request: the reply, and whether it shut the daemon down.
+pub async fn answer(
+    req: &Packet,
+    s: &Status,
+    shutting_down: bool,
+    control: &mpsc::UnboundedSender<Control>,
+) -> (Packet, bool) {
     match req.opcode {
-        EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), None),
-        EC_OP_SHUTDOWN => (Packet::new(EC_OP_NOOP), Some(Control::Shutdown)),
-        EC_OP_STAT_REQ => (stats_reply(s, detail(req)), None),
+        EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),
+        EC_OP_SHUTDOWN => {
+            let _ = control.send(Control::Shutdown);
+            (Packet::new(EC_OP_NOOP), true)
+        }
+        EC_OP_STAT_REQ => (stats_reply(s, detail(req)), false),
         EC_OP_GET_CONNSTATE => (
             Packet::new(EC_OP_MISC_DATA).with(connstate_tag(s, detail(req))),
-            None,
+            false,
         ),
+        // amulegui's incremental updates come with the update protocol.
+        EC_OP_GET_DLOAD_QUEUE if detail(req) == EC_DETAIL_INC_UPDATE => {
+            (failed("Invalid opcode (wrong protocol version?)"), false)
+        }
+        EC_OP_GET_DLOAD_QUEUE => (download_queue_reply(req, s), false),
+        EC_OP_ADD_LINK => (add_links(req, control).await, false),
+        EC_OP_PARTFILE_PAUSE
+        | EC_OP_PARTFILE_RESUME
+        | EC_OP_PARTFILE_STOP
+        | EC_OP_PARTFILE_DELETE => (partfile_cmd(req, s, control).await, false),
         op => {
             info!("External Connection: invalid opcode received: {op:#x}");
-            (failed("Invalid opcode (wrong protocol version?)"), None)
+            (failed("Invalid opcode (wrong protocol version?)"), false)
         }
     }
 }
@@ -400,11 +760,11 @@ async fn connection(
             Received::Close(why) => return why,
             Received::Request(req) => {
                 let down = sh.shutting_down.load(Ordering::SeqCst);
-                let (reply, ctl) = answer(&req, &status.borrow(), down);
-                if let Some(c) = ctl {
+                let view = status.borrow().clone();
+                let (reply, stops) = answer(&req, &view, down, &control).await;
+                if stops {
                     info!("External Connection: shutdown requested");
                     sh.shutting_down.store(true, Ordering::SeqCst);
-                    let _ = control.send(c);
                 }
                 match conn.frame(&reply) {
                     Ok(f) => f,

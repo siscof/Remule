@@ -8,13 +8,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ed2k_formats::amule_conf::ConfFile;
-use ed2k_types::UInt128;
+use ed2k_types::{Md4Hash, UInt128};
 use remule_ec::codes::*;
 use remule_ec::srp::{password_digest, Verifier};
 use remule_ec::{Client, ConnectOptions, Packet, Tag};
 
 use crate::config;
-use crate::ec::{self, Control, KadStatus, ServerStatus, Status};
+use crate::ec::{self, Control, Download, DownloadIds, KadStatus, ServerStatus, Status};
 
 struct TempDir(PathBuf);
 
@@ -197,6 +197,7 @@ fn busy() -> Status {
         sources: 9,
         upload_queue: 0,
         banned: 0,
+        downloads: Vec::new(),
     }
 }
 
@@ -302,29 +303,312 @@ fn statistics_follow_the_detail_level() {
     assert_eq!(get(&p, EC_TAG_STATS_KAD_IP_ADDRESS), None);
 }
 
-#[test]
-fn requests_are_answered_as_process_request2_does() {
+/// `answer` with a client that does what it is told: links are taken
+/// unless they say "bad", file commands succeed unless they are for 0xEE..
+async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec<String>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let client = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        while let Some(c) = rx.recv().await {
+            match c {
+                Control::Shutdown => seen.push("shutdown".to_string()),
+                Control::AddLink { link, reply, .. } => {
+                    let _ = reply.send(!link.contains("bad"));
+                    seen.push(format!("link {link}"));
+                }
+                Control::File { file, op, reply } => {
+                    let _ = reply.send(if file == Md4Hash([0xEE; 16]) {
+                        Err("disk full".into())
+                    } else {
+                        Ok(())
+                    });
+                    seen.push(format!("{op:?} {file}"));
+                }
+            }
+        }
+        seen
+    });
+    let (r, stops) = ec::answer(&req, s, shutting_down, &tx).await;
+    drop(tx);
+    (r, stops, client.await.unwrap())
+}
+
+#[tokio::test]
+async fn requests_are_answered_as_process_request2_does() {
     let s = busy();
-    let (r, c) = ec::answer(&Packet::new(EC_OP_SHUTDOWN), &s, false);
-    assert_eq!((r.opcode, c), (EC_OP_NOOP, Some(Control::Shutdown)));
-    let (r, c) = ec::answer(&Packet::new(EC_OP_SHUTDOWN), &s, true);
-    assert_eq!((r.opcode, c), (EC_OP_FAILED, None));
+    let (r, stops, seen) = ask(Packet::new(EC_OP_SHUTDOWN), &s, false).await;
+    assert_eq!((r.opcode, stops), (EC_OP_NOOP, true));
+    assert_eq!(seen, ["shutdown"]);
+    let (r, stops, seen) = ask(Packet::new(EC_OP_SHUTDOWN), &s, true).await;
+    assert_eq!((r.opcode, stops), (EC_OP_FAILED, false));
+    assert!(seen.is_empty());
     assert_eq!(r.message().unwrap(), "Already shutting down.");
     // No detail level: FULL.
-    let (r, _) = ec::answer(&Packet::new(EC_OP_STAT_REQ), &s, false);
+    let (r, ..) = ask(Packet::new(EC_OP_STAT_REQ), &s, false).await;
     assert!(r.tag(EC_TAG_STATS_UPTIME_SECONDS).is_some());
-    let (r, _) = ec::answer(
-        &Packet::new(EC_OP_GET_CONNSTATE).with_detail(EC_DETAIL_CMD),
+    let (r, ..) = ask(
+        Packet::new(EC_OP_GET_CONNSTATE).with_detail(EC_DETAIL_CMD),
         &s,
         false,
-    );
+    )
+    .await;
     assert_eq!(r.opcode, EC_OP_MISC_DATA);
     assert_eq!(r.tags[0].name, EC_TAG_CONNSTATE);
-    let (r, _) = ec::answer(&Packet::new(EC_OP_GET_DLOAD_QUEUE), &s, false);
+    let (r, ..) = ask(Packet::new(EC_OP_GET_SERVER_LIST), &s, false).await;
     assert_eq!(r.opcode, EC_OP_FAILED);
     assert_eq!(
         r.message().unwrap(),
         "Invalid opcode (wrong protocol version?)"
+    );
+}
+
+fn download(ecid: u32, hash: u8, status: u8) -> Download {
+    Download {
+        ecid,
+        hash: Md4Hash([hash; 16]),
+        name: format!("file {hash}.iso"),
+        size: 10_000_000,
+        completed: 2_500_000,
+        transferred: 2_600_000,
+        sources: 5,
+        transferring: 0,
+        status,
+        stopped: false,
+        speed: 0,
+        part_met_id: 7,
+        dir: "/tmp/Temp".into(),
+        priority: 11,
+        up_priority: 12,
+        category: 0,
+        last_seen_complete: 0,
+        lost_to_corruption: 0,
+    }
+}
+
+#[test]
+fn downloads_are_told_as_cec_partfile_tag_tells_them() {
+    let d = download(3, 0xAB, ec::ps::EMPTY);
+    let cmd = ec::partfile_tag(&d, EC_DETAIL_CMD);
+    assert_eq!((cmd.name, cmd.as_int()), (EC_TAG_PARTFILE, 3));
+    // What amulecmd's `show dl` reads.
+    assert_eq!(
+        cmd.child(EC_TAG_PARTFILE_HASH).unwrap().as_hash(),
+        Some([0xAB; 16])
+    );
+    assert_eq!(cmd.child_str(EC_TAG_PARTFILE_NAME), "file 171.iso");
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_SIZE_FULL), 10_000_000);
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_SIZE_DONE), 2_500_000);
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_SIZE_XFER), 2_600_000);
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_SOURCE_COUNT), 5);
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_STATUS), 1);
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_PRIO), 11);
+    assert_eq!(cmd.child_int(EC_TAG_KNOWNFILE_PRIO), 12);
+    assert_eq!(cmd.child_int(EC_TAG_PARTFILE_PARTMETID), 7);
+    assert_eq!(cmd.child_str(EC_TAG_KNOWNFILE_FILENAME), "007.part");
+    assert_eq!(cmd.child_str(EC_TAG_KNOWNFILE_PATH), "/tmp/Temp");
+    assert_eq!(
+        cmd.child_str(EC_TAG_PARTFILE_ED2K_LINK),
+        format!("ed2k://|file|file 171.iso|10000000|{}|/", "AB".repeat(16))
+    );
+    // UPDATE: no names, no sizes unless it is transferring, no met ID.
+    let upd = ec::partfile_tag(&d, EC_DETAIL_UPDATE);
+    for gone in [
+        EC_TAG_PARTFILE_NAME,
+        EC_TAG_PARTFILE_HASH,
+        EC_TAG_PARTFILE_SIZE_DONE,
+        EC_TAG_PARTFILE_PARTMETID,
+    ] {
+        assert!(!upd.has(gone), "{gone:#x}");
+    }
+    assert!(upd.has(EC_TAG_PARTFILE_STATUS));
+    let busy = Download {
+        transferring: 2,
+        speed: 4096,
+        ..d.clone()
+    };
+    let upd = ec::partfile_tag(&busy, EC_DETAIL_UPDATE);
+    assert_eq!(upd.child_int(EC_TAG_PARTFILE_SPEED), 4096);
+
+    // The queue: all of them, or those asked for by ECID.
+    let s = Status {
+        downloads: vec![download(1, 1, 0), download(2, 2, 0), download(3, 3, 0)],
+        ..Default::default()
+    };
+    let all = ec::download_queue_reply(&Packet::new(EC_OP_GET_DLOAD_QUEUE), &s);
+    assert_eq!((all.opcode, all.tags.len()), (EC_OP_DLOAD_QUEUE, 3));
+    let some = ec::download_queue_reply(
+        &Packet::new(EC_OP_GET_DLOAD_QUEUE)
+            .with(Tag::int(EC_TAG_PARTFILE, 3))
+            .with(Tag::int(EC_TAG_PARTFILE, 1)),
+        &s,
+    );
+    let ids: Vec<u64> = some.tags.iter().map(Tag::as_int).collect();
+    assert_eq!(ids, [1, 3]);
+}
+
+#[test]
+fn download_ids_and_speeds_last_while_the_download_does() {
+    use remule_core::download_queue::FileProgress;
+    use remule_core::part_file::Status as S;
+    let p = |hash: u8, transferred: u64, status: S, paused: bool, done: bool| FileProgress {
+        hash: Md4Hash([hash; 16]),
+        name: "x".into(),
+        size: 100,
+        completed: 0,
+        sources: 0,
+        queued: 0,
+        connected: 0,
+        downloading: 0,
+        done,
+        paused,
+        stopped: paused,
+        status,
+        transferred,
+        part_met_name: "012.part".into(),
+        priority: 1,
+        auto_priority: true,
+        up_priority: 2,
+        auto_up_priority: false,
+        category: 0,
+        last_seen_complete: 0,
+        lost_to_corruption: 0,
+    };
+    let mut ids = DownloadIds::default();
+    let temp = std::path::Path::new("T");
+    let v = ids.view(
+        &[
+            p(1, 0, S::Empty, false, false),
+            p(2, 50, S::Ready, true, false),
+        ],
+        temp,
+    );
+    assert_eq!((v[0].ecid, v[1].ecid), (1, 2));
+    assert_eq!((v[0].status, v[1].status), (ec::ps::EMPTY, ec::ps::PAUSED));
+    assert_eq!(
+        (v[0].priority, v[0].up_priority, v[0].part_met_id),
+        (11, 2, 12)
+    );
+    assert_eq!(v[1].speed, 0, "no speed on first sight");
+    // A second later: the bytes since are the speed; IDs stay.
+    let v = ids.view(
+        &[
+            p(1, 3000, S::Ready, false, false),
+            p(2, 50, S::Ready, true, false),
+        ],
+        temp,
+    );
+    assert_eq!(
+        (v[0].ecid, v[0].speed, v[0].status),
+        (1, 3000, ec::ps::READY)
+    );
+    // Gone, and back: a new ID. Finished: complete.
+    let v = ids.view(&[p(2, 50, S::Complete, false, true)], temp);
+    assert_eq!((v[0].ecid, v[0].status), (2, ec::ps::COMPLETE));
+    let v = ids.view(&[p(1, 0, S::Empty, false, false)], temp);
+    assert_eq!(v[0].ecid, 3);
+}
+
+#[tokio::test]
+async fn partfile_commands_check_their_targets() {
+    let s = Status {
+        downloads: vec![
+            download(1, 1, ec::ps::EMPTY),
+            download(2, 2, ec::ps::COMPLETE),
+            download(3, 0xEE, ec::ps::READY),
+        ],
+        ..Default::default()
+    };
+    let cmd = |op: u8, tags: Vec<Tag>| {
+        let mut p = Packet::new(op);
+        p.tags = tags;
+        p
+    };
+    let h = |b: u8| Tag::hash(EC_TAG_PARTFILE, [b; 16]);
+    // Each named file, in order.
+    let (r, _, seen) = ask(cmd(EC_OP_PARTFILE_PAUSE, vec![h(1)]), &s, false).await;
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(seen, [format!("Pause {}", "01".repeat(16))]);
+    let (r, _, seen) = ask(cmd(EC_OP_PARTFILE_RESUME, vec![h(1), h(2)]), &s, false).await;
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(seen.len(), 2);
+    // Not a hash, or an unknown one: stop there.
+    let (r, _, seen) = ask(
+        cmd(EC_OP_PARTFILE_STOP, vec![Tag::int(EC_TAG_PARTFILE, 1)]),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(r.message().unwrap(), "Invalid partfile command target.");
+    assert!(seen.is_empty());
+    let (r, _, seen) = ask(cmd(EC_OP_PARTFILE_STOP, vec![h(9), h(1)]), &s, false).await;
+    assert_eq!(
+        r.message().unwrap(),
+        format!("FileHash not found: {}", "09".repeat(16))
+    );
+    assert!(seen.is_empty());
+    // An ECID that does not match: the GUI's view is stale.
+    let (r, ..) = ask(
+        cmd(
+            EC_OP_PARTFILE_PAUSE,
+            vec![h(1).with(Tag::int(EC_TAG_ECID, 2))],
+        ),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(
+        r.message().unwrap(),
+        "The selected download has changed. Refresh and try again."
+    );
+    // Cancelling: a finished one is skipped (and said), the rest go on.
+    let (r, _, seen) = ask(cmd(EC_OP_PARTFILE_DELETE, vec![h(2), h(1)]), &s, false).await;
+    assert_eq!(
+        r.message().unwrap(),
+        "Cannot cancel a hashing or finished download: file 2.iso"
+    );
+    assert_eq!(seen, [format!("Delete {}", "01".repeat(16))]);
+    // ... with the name and folder the client saw, if it says them.
+    let (r, _, seen) = ask(
+        cmd(
+            EC_OP_PARTFILE_DELETE,
+            vec![h(1).with(Tag::string(EC_TAG_PARTFILE_NAME, "other.iso"))],
+        ),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(
+        r.message().unwrap(),
+        "The selected download has changed or is completing. Refresh and try again."
+    );
+    assert!(seen.is_empty());
+    // The client's own failure is the reply.
+    let (r, ..) = ask(cmd(EC_OP_PARTFILE_PAUSE, vec![h(0xEE)]), &s, false).await;
+    assert_eq!(r.message().unwrap(), "disk full");
+
+    // Links: one reply for all.
+    let link = |l: &str| Tag::string(EC_TAG_STRING, l);
+    let (r, _, seen) = ask(
+        cmd(EC_OP_ADD_LINK, vec![link("ed2k://a"), link("ed2k://b")]),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!((r.opcode, seen.len()), (EC_OP_NOOP, 2));
+    let (r, ..) = ask(cmd(EC_OP_ADD_LINK, vec![link("bad")]), &s, false).await;
+    assert_eq!(r.message().unwrap(), "Invalid link or already on list.");
+    let (r, ..) = ask(
+        cmd(
+            EC_OP_ADD_LINK,
+            vec![link("ed2k://a"), link("bad"), link("bad 2")],
+        ),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(
+        r.message().unwrap(),
+        "2 of 3 links failed (invalid or already on list)."
     );
 }
 
@@ -412,4 +696,116 @@ async fn an_ec_client_drives_the_daemon() {
         .unwrap()
         .unwrap();
     assert_eq!(s.completed, 0);
+}
+
+/// Downloads over EC, as `amulecmd` drives them: a link added, listed,
+/// paused, resumed and cancelled, with the files on disk following.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ec_client_adds_pauses_and_cancels_a_download() {
+    let d = TempDir::new("downloads");
+    let (port, ec_port) = (free_port(), free_port());
+    std::fs::write(
+        d.0.join("amule.conf"),
+        format!(
+            "[eMule]\nPort={port}\nConnectToKad=0\nConnectToED2K=0\n\
+             [ExternalConnect]\nAcceptExternalConnections=1\nECPort={ec_port}\n\
+             ECPassword={SECRET}\n"
+        ),
+    )
+    .unwrap();
+    let loaded = config::load(&d.0).unwrap();
+    let temp = loaded.client.temp.clone();
+    let daemon = tokio::spawn(crate::client::run(
+        loaded.client,
+        Vec::new(),
+        Vec::new(),
+        std::future::pending(),
+    ));
+    let mut tries = 0;
+    while tokio::net::TcpStream::connect(("127.0.0.1", ec_port))
+        .await
+        .is_err()
+    {
+        tries += 1;
+        assert!(tries < 100, "the daemon never listened for EC");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let hash = Md4Hash([0x4D; 16]);
+    let temp2 = temp.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
+        let mut ask = |p: Packet| c.request(&p).unwrap();
+        // The queue as `show dl` asks for it, once it says what we expect.
+        let queue_until = |ask: &mut dyn FnMut(Packet) -> Packet, ok: &dyn Fn(&Packet) -> bool| {
+            for _ in 0..50 {
+                let q = ask(Packet::new(EC_OP_GET_DLOAD_QUEUE));
+                if ok(&q) {
+                    return q;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("the queue never got there");
+        };
+        let link = format!("ed2k://|file|Some%20Film.mkv|123456789|{hash}|/");
+        let add = |l: &str| Packet::new(EC_OP_ADD_LINK).with(Tag::string(EC_TAG_STRING, l));
+        assert_eq!(ask(add(&link)).opcode, EC_OP_NOOP);
+        let q = queue_until(&mut ask, &|q| q.tags.len() == 1);
+        let f = &q.tags[0];
+        assert_eq!(f.child_str(EC_TAG_PARTFILE_NAME), "Some Film.mkv");
+        assert_eq!(f.child_int(EC_TAG_PARTFILE_SIZE_FULL), 123_456_789);
+        assert_eq!(
+            f.child_int(EC_TAG_PARTFILE_STATUS),
+            u64::from(ec::ps::EMPTY)
+        );
+        assert_eq!(f.child_int(EC_TAG_PARTFILE_PARTMETID), 1);
+        let met = temp2.join("001.part.met");
+        assert!(met.is_file());
+        // The same file again: taken (it is being downloaded), still one.
+        // A link that is no link, and one in another protocol: refused.
+        assert_eq!(ask(add(&link)).opcode, EC_OP_NOOP);
+        let r = ask(add("ed2k://|file|broken|"));
+        assert_eq!(r.message().unwrap(), "Invalid link or already on list.");
+        let r = ask(add("http://example.org/x"));
+        assert_eq!(r.opcode, EC_OP_FAILED);
+
+        // Paused: so the queue says, and so the met says.
+        let target = || Tag::hash(EC_TAG_PARTFILE, hash.0);
+        assert_eq!(
+            ask(Packet::new(EC_OP_PARTFILE_PAUSE).with(target())).opcode,
+            EC_OP_NOOP
+        );
+        queue_until(&mut ask, &|q| {
+            q.tags[0].child_int(EC_TAG_PARTFILE_STATUS) == u64::from(ec::ps::PAUSED)
+        });
+        assert!(remule_core::PartFile::open(&met).unwrap().is_paused());
+        // Resumed.
+        assert_eq!(
+            ask(Packet::new(EC_OP_PARTFILE_RESUME).with(target())).opcode,
+            EC_OP_NOOP
+        );
+        queue_until(&mut ask, &|q| {
+            q.tags[0].child_int(EC_TAG_PARTFILE_STATUS) == u64::from(ec::ps::EMPTY)
+        });
+        assert!(!remule_core::PartFile::open(&met).unwrap().is_paused());
+        // Cancelled: gone from the queue and the disk.
+        assert_eq!(
+            ask(Packet::new(EC_OP_PARTFILE_DELETE).with(target())).opcode,
+            EC_OP_NOOP
+        );
+        queue_until(&mut ask, &|q| q.tags.is_empty());
+        assert!(!met.exists());
+        assert!(!temp2.join("001.part").exists());
+        // An unknown one now.
+        let r = ask(Packet::new(EC_OP_PARTFILE_PAUSE).with(target()));
+        assert_eq!(r.message().unwrap(), format!("FileHash not found: {hash}"));
+        assert_eq!(ask(Packet::new(EC_OP_SHUTDOWN)).opcode, EC_OP_NOOP);
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
 }

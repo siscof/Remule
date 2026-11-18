@@ -13,7 +13,7 @@
 //! With `REMULE_TRACE` set, every peer packet's protocol, opcode and size
 //! is printed to stderr.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ use ed2k_types::ed2k::SERVERREASKTIME;
 use ed2k_types::Md4Hash;
 use remule_core::credits::Credits;
 use remule_core::download_queue::{DownloadQueue, Endpoint, Origin, QueueConfig, Report};
-use remule_core::downloader::{self, Command, DownloaderConfig};
+use remule_core::downloader::{self, Command, DownloaderConfig, FileOp};
 use remule_core::ip_filter::AddressFilter;
 use remule_core::publish::{KadPublish, Publisher};
 use remule_core::shared::{mtime, ScanOptions, SharedFiles};
@@ -46,7 +46,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::ec::{self, Control, EcSettings, KadStatus, ServerStatus, Status};
+use crate::ec::{self, Control, DownloadIds, EcSettings, KadStatus, ServerStatus, Status};
 use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
@@ -282,9 +282,13 @@ struct EcInputs<'a> {
     statistics: &'a Statistics,
     /// Bytes in the last second.
     rates: Totals,
-    queue: Option<remule_core::download_queue::QueueStats>,
+    queue: Option<(
+        Vec<remule_core::download_queue::FileProgress>,
+        remule_core::download_queue::QueueStats,
+    )>,
     shared: usize,
     now: Instant,
+    download_ids: &'a mut DownloadIds,
 }
 
 /// The client as the EC replies tell it.
@@ -322,7 +326,8 @@ fn ec_status(i: EcInputs<'_>) -> Status {
             ..Default::default()
         },
     });
-    let q = i.queue.unwrap_or_default();
+    let (files, q) = i.queue.unwrap_or_default();
+    let downloads = i.download_ids.view(&files, &i.c.temp);
     Status {
         ed2k_enabled: !i.c.servers.is_empty(),
         kad_enabled: i.c.kad.is_some(),
@@ -345,7 +350,93 @@ fn ec_status(i: EcInputs<'_>) -> Status {
         sources: q.sources as u32,
         upload_queue: 0,
         banned: 0,
+        downloads,
     }
+}
+
+/// What a link added: a new download (or none when it is already being
+/// downloaded), and its sources.
+struct Added {
+    hash: Md4Hash,
+    size: u64,
+    file: Option<PartFile>,
+    sources: Vec<Endpoint>,
+}
+
+/// `CDownloadQueue::AddLink` for an ed2k file link: a new download in the
+/// temp directory, or more sources for one already there. `None` (with the
+/// reason logged as aMule logs it) when the link is not taken.
+fn add_link(
+    link: &str,
+    c: &ClientConfig,
+    wanted: &[(Md4Hash, u64)],
+    shares: Option<&Arc<Mutex<SharedFiles>>>,
+) -> Option<Added> {
+    if !link
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("ed2k://"))
+    {
+        warn!("Unknown protocol of link: {link}");
+        return None;
+    }
+    let mut uri = link.to_owned();
+    if !uri.ends_with('/') {
+        uri.push('/');
+    }
+    let l = match remule_core::link::parse(&uri) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Invalid eD2k link! ERROR: {e}");
+            return None;
+        }
+    };
+    let sources = l.sources.iter().map(|a| Endpoint::new(*a)).collect();
+    if wanted.iter().any(|(h, _)| *h == l.hash) {
+        // `IsFileExisting`: already downloading; the link's sources are taken.
+        warn!("You are already trying to download the file '{}'", l.name);
+        return Some(Added {
+            hash: l.hash,
+            size: l.size,
+            file: None,
+            sources,
+        });
+    }
+    if let Some(sh) = shares {
+        let sh = sh.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((f, _)) = sh.files().into_iter().find(|(f, _)| f.hash == l.hash) {
+            if l.name != f.name {
+                warn!(
+                    "You already have the file '{}' (requested as '{}')",
+                    f.name, l.name
+                );
+            } else {
+                warn!("You already have the file '{}'", f.name);
+            }
+            return None;
+        }
+    }
+    let mut f = match PartFile::create(&c.temp, &l.name, l.hash, l.size) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("{}: {e}", l.name);
+            return None;
+        }
+    };
+    if let Some(root) = l.aich {
+        f.set_aich_root(root);
+    }
+    info!(
+        "new download {} ({}, {})",
+        l.name,
+        human(l.size),
+        f.met_path().display()
+    );
+    Some(Added {
+        hash: l.hash,
+        size: l.size,
+        file: Some(f),
+        sources,
+    })
 }
 
 fn unix_now() -> u32 {
@@ -408,7 +499,13 @@ pub async fn run(
     } else {
         None
     };
-    let wanted: Vec<(Md4Hash, u64)> = files.iter().map(|f| (f.hash(), f.size())).collect();
+    let mut wanted: Vec<(Md4Hash, u64)> = files.iter().map(|f| (f.hash(), f.size())).collect();
+    // Paused or stopped downloads: no sources are asked for them.
+    let mut paused: HashSet<Md4Hash> = files
+        .iter()
+        .filter(|f| f.is_paused())
+        .map(|f| f.hash())
+        .collect();
     let mut names: HashMap<Md4Hash, String> = files
         .iter()
         .map(|f| (f.hash(), f.name().to_owned()))
@@ -554,6 +651,7 @@ pub async fn run(
     let mut server_since: Option<(SocketAddr, u32)> = None;
     let mut kad_since: Option<u32> = None;
     let mut last_traffic = Totals::default();
+    let mut download_ids = DownloadIds::default();
 
     let start = Instant::now();
     // The totals of earlier sessions, which this one adds to.
@@ -707,6 +805,65 @@ pub async fn run(
                         info!("[{:>5}s] shutdown requested over an external connection: saving", start.elapsed().as_secs());
                         break;
                     }
+                    Some(Control::AddLink { link, category: _, reply }) => {
+                        let added = add_link(&link, &c, &wanted, shares.as_ref());
+                        let taken = added.is_some();
+                        if let Some(add) = added {
+                            let (hash, size) = (add.hash, add.size);
+                            if let Some(f) = add.file {
+                                names.insert(hash, f.name().to_owned());
+                                if f.is_paused() {
+                                    paused.insert(hash);
+                                }
+                                let _ = cmd.send(Command::AddFile(Box::new(f)));
+                                wanted.push((hash, size));
+                            }
+                            if !add.sources.is_empty() {
+                                let _ = cmd.send(Command::AddSources { file: hash, sources: add.sources, origin: Origin::Manual });
+                            }
+                            // Sources for it now, from the server and Kad.
+                            if let Some(s) = &server {
+                                let _ = s.get_sources(hash, size).await;
+                            }
+                            if let (Some(k), true) = (&kad_node, kad_connected.is_some()) {
+                                match k.handle.search_sources(hash, size).await {
+                                    Ok(id) => { kad_searches.insert(id, hash); }
+                                    Err(e) => warn!("Kad source search: {e}"),
+                                }
+                            }
+                        }
+                        let _ = reply.send(taken);
+                        // The EC view shows it at once.
+                        tick.reset_immediately();
+                    }
+                    Some(Control::File { file, op, reply }) => {
+                        let (tx, rx) = oneshot::channel();
+                        let r = match cmd.send(Command::File { file, op, reply: tx }) {
+                            Ok(()) => rx.await.unwrap_or_else(|_| Err("Already shutting down.".into())),
+                            Err(_) => Err("Already shutting down.".into()),
+                        };
+                        if r.is_ok() {
+                            let name = names.get(&file).cloned().unwrap_or_else(|| file.to_string());
+                            match op {
+                                FileOp::Pause | FileOp::Stop => { paused.insert(file); }
+                                FileOp::Resume => { paused.remove(&file); }
+                                FileOp::Delete => {
+                                    paused.remove(&file);
+                                    wanted.retain(|(h, _)| *h != file);
+                                    info!("[{:>5}s] {name}: cancelled", start.elapsed().as_secs());
+                                }
+                            }
+                            if op != FileOp::Delete {
+                                info!("[{:>5}s] {name}: {}", start.elapsed().as_secs(), match op {
+                                    FileOp::Pause => "paused",
+                                    FileOp::Stop => "stopped",
+                                    _ => "resumed",
+                                });
+                            }
+                        }
+                        let _ = reply.send(r);
+                        tick.reset_immediately();
+                    }
                     None => ec_control = None,
                 }
             }
@@ -737,10 +894,11 @@ pub async fn run(
                                 queue: {
                                     let (tx, rx) = oneshot::channel();
                                     match cmd.send(Command::Progress(tx)) {
-                                        Ok(()) => rx.await.ok().map(|(_, s)| s),
+                                        Ok(()) => rx.await.ok(),
                                         Err(_) => None,
                                     }
                                 },
+                                download_ids: &mut download_ids,
                                 shared: shares.as_ref().map_or(0, |s| s.lock().unwrap_or_else(|e| e.into_inner()).shared_count()),
                                 now,
                             });
@@ -794,7 +952,7 @@ pub async fn run(
                 if let Some(s) = &server {
                     if now >= next_server_ask {
                         next_server_ask = now + SERVERREASKTIME;
-                        for (h, size) in &wanted {
+                        for (h, size) in wanted.iter().filter(|(h, _)| !paused.contains(h)) {
                             let _ = s.get_sources(*h, *size).await;
                         }
                     }
@@ -802,7 +960,7 @@ pub async fn run(
                 if let (Some(k), Some(at)) = (&kad_node, next_kad_ask) {
                     if now >= at && kad_connected.is_some() {
                         next_kad_ask = Some(now + KAD_REASK);
-                        for (h, size) in &wanted {
+                        for (h, size) in wanted.iter().filter(|(h, _)| !paused.contains(h)) {
                             match k.handle.search_sources(*h, *size).await {
                                 Ok(id) => { kad_searches.insert(id, *h); }
                                 Err(e) => warn!("Kad source search: {e}"),

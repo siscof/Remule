@@ -6,8 +6,8 @@
 //! [`remule_ec::server`] and then requests, answered from a [`Status`] the
 //! client refreshes every second. Served so far: `EC_OP_STAT_REQ`,
 //! `EC_OP_GET_CONNSTATE`, `EC_OP_GET_DLOAD_QUEUE`, `EC_OP_ADD_LINK`, the
-//! partfile pause, resume, stop and delete commands, and
-//! `EC_OP_SHUTDOWN`; anything else is answered `EC_OP_FAILED`, as aMule
+//! partfile pause, resume, stop and delete commands, the search requests
+//! ([`crate::ec_search`]), and `EC_OP_SHUTDOWN`; anything else is answered `EC_OP_FAILED`, as aMule
 //! answers an opcode it does not know.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -246,6 +246,12 @@ pub enum Control {
         file: Md4Hash,
         op: FileOp,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// A search request, answered by the client, which holds the search
+    /// ([`crate::ec_search`]).
+    Search {
+        req: Packet,
+        reply: oneshot::Sender<Packet>,
     },
 }
 
@@ -632,6 +638,9 @@ pub async fn answer(
         }
         EC_OP_GET_DLOAD_QUEUE => (download_queue_reply(req, s), false),
         EC_OP_ADD_LINK => (add_links(req, control).await, false),
+        op if crate::ec_search::is_search(op) => {
+            (crate::ec_search::forward(req, control).await, false)
+        }
         EC_OP_PARTFILE_PAUSE
         | EC_OP_PARTFILE_RESUME
         | EC_OP_PARTFILE_STOP

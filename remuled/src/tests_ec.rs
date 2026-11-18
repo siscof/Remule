@@ -324,6 +324,7 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     });
                     seen.push(format!("{op:?} {file}"));
                 }
+                Control::Search { req, .. } => seen.push(format!("search {:#x}", req.opcode)),
             }
         }
         seen

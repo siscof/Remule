@@ -481,5 +481,7 @@ fn ec_settings(
             threshold: limit("/ExternalConnect/AuthFailureThreshold", 10) as usize,
             lockout_seconds: limit("/ExternalConnect/AuthLockoutSeconds", 300),
         },
+        ed2k: prefs.connect_to_ed2k,
+        kad: prefs.connect_to_kad,
     })
 }

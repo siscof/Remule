@@ -10,6 +10,10 @@
 //! that was up and is lost starts a new sweep at once. With `Reconnect` off,
 //! neither happens.
 //!
+//! A connection to one server the user picked (`ConnectToServer`) is tried
+//! obfuscated, then plain, and nothing else when it fails. The user can
+//! disconnect, and add or remove servers while it runs.
+//!
 //! Not ported: two attempts at a time, failure counts and dropping dead
 //! servers from the list, static-only connecting.
 
@@ -58,6 +62,8 @@ pub struct Connector {
     /// Whether this pass is the obfuscated one.
     obfuscated_pass: bool,
     state: State,
+    /// `singleconnecting`: one server picked, no sweep.
+    single: bool,
 }
 
 impl Connector {
@@ -71,11 +77,36 @@ impl Connector {
             pos: 0,
             obfuscated_pass: obfuscate,
             state: State::Idle,
+            single: false,
+        }
+    }
+
+    /// The servers, in the order they are tried.
+    pub fn servers(&self) -> &[SocketAddr] {
+        &self.servers
+    }
+
+    /// A server added at the end of the list (`CServerList::AddServer`).
+    pub fn add(&mut self, addr: SocketAddr) {
+        if !self.servers.contains(&addr) {
+            self.servers.push(addr);
+        }
+    }
+
+    /// A server taken out of the list; a sweep under way goes on with the
+    /// one after it (`RemoveServer` moving `m_serverpos` on).
+    pub fn remove(&mut self, addr: SocketAddr) {
+        if let Some(i) = self.servers.iter().position(|a| *a == addr) {
+            self.servers.remove(i);
+            if i < self.pos {
+                self.pos -= 1;
+            }
         }
     }
 
     /// `ConnectToAnyServer`: a sweep from the top of the list.
     pub fn start(&mut self, now: Instant) -> Next {
+        self.single = false;
         self.pos = 0;
         self.obfuscated_pass = self.obfuscate;
         if self.servers.is_empty() {
@@ -118,8 +149,53 @@ impl Connector {
     /// [`ATTEMPT_TIMEOUT`]: the next server.
     pub fn failed(&mut self, now: Instant) -> Next {
         match self.state {
+            // One server picked: plain after obfuscated, then nothing.
+            State::Connecting(a) if self.single => {
+                if a.obfuscated {
+                    let a = Attempt {
+                        obfuscated: false,
+                        ..a
+                    };
+                    self.state = State::Connecting(a);
+                    Next::Connect(a)
+                } else {
+                    self.stop();
+                    Next::Idle
+                }
+            }
             State::Connecting(_) => self.try_next(now),
             _ => Next::Idle,
+        }
+    }
+
+    /// `ConnectToServer`: this server alone, obfuscated first when asked.
+    pub fn connect_to(&mut self, addr: SocketAddr) -> Next {
+        self.single = true;
+        let a = Attempt {
+            addr,
+            obfuscated: self.obfuscate,
+        };
+        self.state = State::Connecting(a);
+        Next::Connect(a)
+    }
+
+    /// `StopConnectionTry`: no attempt, no sweep waiting; a connection
+    /// that is up stays up.
+    pub fn stop(&mut self) {
+        self.single = false;
+        if !matches!(self.state, State::Connected(_)) {
+            self.state = State::Idle;
+        }
+    }
+
+    /// `Disconnect`: the user hung up. True if a connection was up; nothing
+    /// follows it, unlike a lost one.
+    pub fn disconnect(&mut self) -> bool {
+        if matches!(self.state, State::Connected(_)) {
+            self.state = State::Idle;
+            true
+        } else {
+            false
         }
     }
 
@@ -127,6 +203,7 @@ impl Connector {
     pub fn logged_in(&mut self) {
         if let State::Connecting(a) = self.state {
             self.state = State::Connected(a);
+            self.single = false;
         }
     }
 

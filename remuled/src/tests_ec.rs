@@ -324,6 +324,10 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     });
                     seen.push(format!("{op:?} {file}"));
                 }
+                Control::Servers { request, reply } => {
+                    let _ = reply.send(Packet::new(EC_OP_NOOP));
+                    seen.push(format!("servers {:#x}", request.opcode));
+                }
             }
         }
         seen
@@ -354,7 +358,7 @@ async fn requests_are_answered_as_process_request2_does() {
     .await;
     assert_eq!(r.opcode, EC_OP_MISC_DATA);
     assert_eq!(r.tags[0].name, EC_TAG_CONNSTATE);
-    let (r, ..) = ask(Packet::new(EC_OP_GET_SERVER_LIST), &s, false).await;
+    let (r, ..) = ask(Packet::new(EC_OP_GET_STATSGRAPHS), &s, false).await;
     assert_eq!(r.opcode, EC_OP_FAILED);
     assert_eq!(
         r.message().unwrap(),

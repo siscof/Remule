@@ -292,6 +292,9 @@ struct FileEntry {
     /// Sources were last asked for (`SetLastAnsweredTimeTimeout`).
     last_sources_asked: Option<Instant>,
     done: bool,
+    /// `m_stopped`: no sources are kept or taken. A file loaded paused is
+    /// stopped, as aMule loads it.
+    stopped: bool,
 }
 
 /// One file's progress.
@@ -309,6 +312,24 @@ pub struct FileProgress {
     pub connected: usize,
     pub downloading: usize,
     pub done: bool,
+    pub paused: bool,
+    /// `IsStopped`.
+    pub stopped: bool,
+    pub status: crate::part_file::Status,
+    /// Bytes received for it, counting those thrown away (`GetTransferred`).
+    pub transferred: u64,
+    /// The `.part.met` file name, without `.met` (`NNN.part`).
+    pub part_met_name: String,
+    /// `PR_*`, and whether it is chosen automatically.
+    pub priority: u32,
+    pub auto_priority: bool,
+    /// The upload priority, as shared while downloading.
+    pub up_priority: u32,
+    pub auto_up_priority: bool,
+    pub category: u32,
+    /// Unix time a complete source was last seen.
+    pub last_seen_complete: u32,
+    pub lost_to_corruption: u64,
 }
 
 /// Download statistics.
@@ -412,9 +433,100 @@ impl DownloadQueue {
                 file,
                 last_sources_asked: None,
                 done: false,
+                stopped: false,
             },
         );
+        let e = self.files.get_mut(&hash).unwrap();
+        e.stopped = e.file.is_paused();
         true
+    }
+
+    /// `PauseFile`: nothing more is asked for the file, its connections
+    /// are closed, and it is saved paused. Its sources are kept. False if
+    /// the file is not here; a completing or complete one is left alone.
+    pub fn pause(&mut self, hash: &Md4Hash, now: Instant, out: &mut Vec<Action>) -> bool {
+        let Some(e) = self.files.get_mut(hash) else {
+            return false;
+        };
+        if e.done
+            || matches!(
+                e.file.status(),
+                crate::part_file::Status::Completing | crate::part_file::Status::Complete
+            )
+        {
+            return true;
+        }
+        e.file.set_paused(true);
+        let _ = e.file.save();
+        self.close_file_conns(*hash, now, out);
+        true
+    }
+
+    /// `StopFile`: paused, and every source dropped.
+    pub fn stop(&mut self, hash: &Md4Hash, now: Instant, out: &mut Vec<Action>) -> bool {
+        if !self.pause(hash, now, out) {
+            return false;
+        }
+        let e = self.files.get_mut(hash).unwrap();
+        if !e.done {
+            e.stopped = true;
+            self.forget_sources(hash);
+        }
+        true
+    }
+
+    /// `ResumeFile`: asked for again, sources taken again, saved.
+    pub fn resume(&mut self, hash: &Md4Hash) -> bool {
+        let Some(e) = self.files.get_mut(hash) else {
+            return false;
+        };
+        if e.done {
+            return true;
+        }
+        e.file.set_paused(false);
+        e.stopped = false;
+        e.last_sources_asked = None;
+        let _ = e.file.save();
+        true
+    }
+
+    /// Take a download out of the queue: its connections closed and its
+    /// sources dropped. The caller deletes it (`CPartFile::Delete`).
+    pub fn remove(
+        &mut self,
+        hash: &Md4Hash,
+        now: Instant,
+        out: &mut Vec<Action>,
+    ) -> Option<PartFile> {
+        if !self.files.contains_key(hash) {
+            return None;
+        }
+        self.close_file_conns(*hash, now, out);
+        self.forget_sources(hash);
+        self.dead.retain(|(f, _), _| f != hash);
+        self.files.remove(hash).map(|e| e.file)
+    }
+
+    /// Whether the file is stopped (`IsStopped`).
+    pub fn is_stopped(&self, hash: &Md4Hash) -> bool {
+        self.files.get(hash).is_some_and(|e| e.stopped)
+    }
+
+    /// `RemoveAllSources`: no dead-list entries, so they can come back.
+    fn forget_sources(&mut self, hash: &Md4Hash) {
+        let ids: Vec<u64> = self
+            .sources
+            .iter()
+            .filter(|(_, s)| &s.file == hash && s.conn.is_none())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            if let Some(s) = self.sources.remove(&id) {
+                if let (Some(parts), Some(e)) = (&s.parts, self.files.get_mut(&s.file)) {
+                    e.file.remove_source(parts);
+                }
+            }
+        }
     }
 
     pub fn file(&self, hash: &Md4Hash) -> Option<&PartFile> {
@@ -485,6 +597,23 @@ impl DownloadQueue {
                         })
                         .count(),
                     done: e.done,
+                    paused: e.file.is_paused(),
+                    stopped: e.stopped,
+                    status: e.file.status(),
+                    transferred: e.file.transferred(),
+                    part_met_name: e
+                        .file
+                        .met_path()
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    priority: e.file.info().down_priority,
+                    auto_priority: e.file.info().auto_down_priority,
+                    up_priority: e.file.info().up_priority,
+                    auto_up_priority: e.file.info().auto_up_priority,
+                    category: e.file.info().category,
+                    last_seen_complete: e.file.info().last_seen_complete,
+                    lost_to_corruption: e.file.lost_to_corruption(),
                 }
             })
             .collect();
@@ -524,8 +653,9 @@ impl DownloadQueue {
         now: Instant,
         out: &mut Vec<Action>,
     ) -> bool {
+        // `CheckAndAddSource`: none for a stopped file.
         match self.files.get(&file) {
-            Some(e) if !e.done => {}
+            Some(e) if !e.done && !e.stopped => {}
             _ => return false,
         }
         if ep.addr.port() == 0 || !is_good_ip(*ep.addr.ip(), self.config.filter_lan) {

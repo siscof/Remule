@@ -851,3 +851,79 @@ async fn one_remule_downloads_from_another() {
         .get(&Md4Hash([0x77; 16]))
         .is_some_and(|c| c.uploaded >= SIZE));
 }
+
+/// `PauseFile`, `StopFile`, `ResumeFile` and cancelling, as the EC
+/// partfile commands use them.
+#[test]
+fn downloads_pause_stop_resume_and_go() {
+    let (dir, d, h, q) = setup("q-pause");
+    let mut w = World::new(q);
+    // A seeder that queues us keeps its connection open.
+    let mut s = seeder_at(1, &d, &h, PartStatus::Complete);
+    s.queue_first = true;
+    let ep = s.endpoint();
+    w.add_seeder(s);
+    w.add_source(h.ed2k, ep);
+    w.tick();
+    assert_eq!(w.q.stats().connections, 1);
+
+    // Paused: hung up, saved paused, nothing more asked; the source kept.
+    let mut out = Vec::new();
+    assert!(w.q.pause(&h.ed2k, w.now, &mut out));
+    assert!(out.iter().any(|a| matches!(a, Action::Close { .. })));
+    w.run(out.into());
+    assert_eq!(w.q.stats().connections, 0);
+    assert_eq!(w.q.source_count(&h.ed2k), 1);
+    let met = w.q.file(&h.ed2k).unwrap().met_path().to_owned();
+    assert!(PartFile::open(&met).unwrap().is_paused());
+    for _ in 0..10 {
+        w.tick();
+    }
+    assert_eq!(w.q.stats().connections, 0);
+    let p = &w.q.progress()[0];
+    assert!(p.paused && !p.stopped);
+
+    // Resumed: asked again, saved unpaused.
+    assert!(w.q.resume(&h.ed2k));
+    assert!(!PartFile::open(&met).unwrap().is_paused());
+    w.tick_until(10, |w| w.q.stats().connections == 1);
+
+    // Stopped: paused, and its sources gone; new ones are refused.
+    let mut out = Vec::new();
+    assert!(w.q.stop(&h.ed2k, w.now, &mut out));
+    w.run(out.into());
+    assert_eq!(w.q.source_count(&h.ed2k), 0);
+    assert!(w.q.is_stopped(&h.ed2k));
+    w.add_source(h.ed2k, ep);
+    assert_eq!(w.q.source_count(&h.ed2k), 0);
+    // Resumed, it takes sources again, at once (no dead-list wait).
+    assert!(w.q.resume(&h.ed2k));
+    w.add_source(h.ed2k, ep);
+    assert_eq!(w.q.source_count(&h.ed2k), 1);
+
+    // A file loaded paused is stopped, as aMule loads it.
+    let mut out = Vec::new();
+    w.q.pause(&h.ed2k, w.now, &mut out);
+    let mut q2 = DownloadQueue::new(config(&dir));
+    assert!(q2.add_file(PartFile::open(&met).unwrap()));
+    assert!(q2.is_stopped(&h.ed2k));
+
+    // Cancelled: out of the queue, its sources and connections gone.
+    assert!(w.q.resume(&h.ed2k));
+    w.tick_until(10, |w| w.q.stats().connections == 1);
+    let mut out = Vec::new();
+    let f = w.q.remove(&h.ed2k, w.now, &mut out).unwrap();
+    w.run(out.into());
+    assert_eq!(f.hash(), h.ed2k);
+    assert!(w.q.file(&h.ed2k).is_none());
+    assert_eq!((w.q.stats().connections, w.q.stats().sources), (0, 0));
+    f.delete().unwrap();
+    assert!(!met.exists());
+    // Unknown files.
+    let other = Md4Hash([9; 16]);
+    let mut out = Vec::new();
+    assert!(!w.q.pause(&other, w.now, &mut out));
+    assert!(!w.q.stop(&other, w.now, &mut out));
+    assert!(!w.q.resume(&other));
+    assert!(w.q.remove(&other, w.now, &mut out).is_none());
+}

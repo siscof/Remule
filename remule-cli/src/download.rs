@@ -18,7 +18,7 @@ use ed2k_types::Md4Hash;
 use remule_core::PartFile;
 use remuled::client::{self, existing_downloads, human, ClientConfig, KadSettings};
 
-use crate::link;
+use remule_core::link;
 
 /// What `remule download` was asked.
 #[derive(Debug, Clone)]

@@ -48,6 +48,7 @@ use tracing::{debug, info, warn};
 
 use crate::ec::{self, Control, DownloadIds, EcSettings, KadStatus, ServerStatus, Status};
 use crate::ec_search;
+use crate::ec_servers::{Effect, ServerList};
 use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
@@ -620,6 +621,8 @@ pub async fn run(
             !blocked
         })
         .collect();
+    // What is known of each, for the EC server list.
+    let mut server_list = ServerList::load(&c.config, &servers);
     let mut connector = Connector::new(servers, c.obfuscate_server, c.reconnect);
     let mut attempting: Option<Attempting> = None;
     // Whether others can connect to us: found out as we run.
@@ -739,6 +742,11 @@ pub async fn run(
     let mut download_ids = DownloadIds::default();
     // The search external connections run.
     let mut searches = ec_search::SearchList::default();
+    let mut shared_state = crate::ec_shared::SharedState::default();
+    let reload_dirs = crate::ec_shared::ReloadDirs {
+        dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
+        reserved: vec![c.temp.clone(), c.config.clone()],
+    };
 
     let start = Instant::now();
     // The totals of earlier sessions, which this one adds to.
@@ -780,7 +788,7 @@ pub async fn run(
                             li.id
                         );
                         our_id = li.id;
-                        server_since = connector.connecting().map(|a| (a.addr, unix_now()));
+                        server_since = connector.connected().map(|a| (a.addr, unix_now()));
                         let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
                         let was = reach;
                         reach.high_id = !li.low_id;
@@ -968,6 +976,86 @@ pub async fn run(
                             tick.reset_immediately();
                         }
                     }
+                    Some(Control::Servers { request, reply }) => {
+                        let t = start.elapsed();
+                        let live = server.as_ref().map(|s| s.info());
+                        let (packet, effects) = crate::ec_servers::handle(&request, &mut crate::ec_servers::Ctx {
+                            list: &mut server_list,
+                            connector: &mut connector,
+                            ed2k: c.ec.as_ref().is_some_and(|e| e.ed2k),
+                            kad: c.ec.as_ref().is_some_and(|e| e.kad),
+                            kad_running: kad_node.is_some(),
+                            kad_connected: kad_node.is_some() && kad_connected.is_some(),
+                            live: live.as_ref(),
+                            ip_filter: c.ip_filter.as_deref(),
+                            filter_lan: !c.allow_lan,
+                            now: Instant::now(),
+                        });
+                        let _ = reply.send(packet);
+                        for e in effects {
+                            match e {
+                                Effect::CancelAttempt => attempting = None,
+                                Effect::Disconnect => {
+                                    info!("[{:>5}s] disconnected from the server", t.as_secs());
+                                    server = None;
+                                    server_since = None;
+                                    our_id = 0;
+                                    let _ = cmd.send(Command::SetOurId { id: 0, public_ip: None });
+                                    let was = reach;
+                                    reach.high_id = false;
+                                    log_reach(t, was, reach);
+                                }
+                                Effect::Follow(next) => follow(next, &c, &mut attempting, t),
+                                Effect::StopKad => {
+                                    if let Some(k) = kad_node.take() {
+                                        if let Err(e) = k.save().await {
+                                            warn!("Kad: {e}");
+                                        }
+                                        info!("[{:>5}s] Kad stopped", t.as_secs());
+                                    }
+                                    kad_connected = None;
+                                    kad_since = None;
+                                    next_kad_ask = None;
+                                    kad_searches.clear();
+                                    let was = reach;
+                                    reach.kad_open = false;
+                                    log_reach(t, was, reach);
+                                }
+                                Effect::StartKad => {
+                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None });
+                                    // The stopped node's socket may still be closing.
+                                    let mut started = Err(String::new());
+                                    for _ in 0..20 {
+                                        started = kad::start(&KadStart {
+                                            dir: k.dir.clone(),
+                                            nodes: k.nodes.clone(),
+                                            bootstrap: Vec::new(),
+                                            udp_port: c.udp_port,
+                                            tcp_port: c.tcp_port,
+                                            user_hash: c.user_hash,
+                                            reachable: c.reachable,
+                                            listening,
+                                        }).await;
+                                        if started.is_ok() {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                    }
+                                    match started {
+                                        Ok(n) => {
+                                            info!("[{:>5}s] Kad started", t.as_secs());
+                                            kad_node = Some(n);
+                                        }
+                                        Err(e) => warn!("Kad: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                        tick.reset_immediately();
+                    }
+                    Some(Control::Shared(req)) => {
+                        shared_state.handle(req, shares.as_ref(), &reload_dirs, &c.config);
+                    }
                     None => ec_control = None,
                 }
             }
@@ -1126,6 +1214,7 @@ pub async fn run(
     if let Some(k) = kad_node {
         k.save().await?;
     }
+    server_list.save_if_changed(&c.config);
     for f in queue.progress() {
         info!(
             "{}: {} of {}{}",

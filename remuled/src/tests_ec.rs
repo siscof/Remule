@@ -325,6 +325,11 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     seen.push(format!("{op:?} {file}"));
                 }
                 Control::Search { req, .. } => seen.push(format!("search {:#x}", req.opcode)),
+                Control::Servers { request, reply } => {
+                    let _ = reply.send(Packet::new(EC_OP_NOOP));
+                    seen.push(format!("servers {:#x}", request.opcode));
+                }
+                Control::Shared(_) => seen.push("shared".to_string()),
             }
         }
         seen
@@ -355,7 +360,7 @@ async fn requests_are_answered_as_process_request2_does() {
     .await;
     assert_eq!(r.opcode, EC_OP_MISC_DATA);
     assert_eq!(r.tags[0].name, EC_TAG_CONNSTATE);
-    let (r, ..) = ask(Packet::new(EC_OP_GET_SERVER_LIST), &s, false).await;
+    let (r, ..) = ask(Packet::new(EC_OP_GET_STATSGRAPHS), &s, false).await;
     assert_eq!(r.opcode, EC_OP_FAILED);
     assert_eq!(
         r.message().unwrap(),
@@ -483,7 +488,9 @@ fn download_ids_and_speeds_last_while_the_download_does() {
         ],
         temp,
     );
-    assert_eq!((v[0].ecid, v[1].ecid), (1, 2));
+    // One counter for every ECID in the process: distinct, never 0.
+    let (one, two) = (v[0].ecid, v[1].ecid);
+    assert!(one != 0 && two != 0 && one != two);
     assert_eq!((v[0].status, v[1].status), (ec::ps::EMPTY, ec::ps::PAUSED));
     assert_eq!(
         (v[0].priority, v[0].up_priority, v[0].part_met_id),
@@ -500,13 +507,13 @@ fn download_ids_and_speeds_last_while_the_download_does() {
     );
     assert_eq!(
         (v[0].ecid, v[0].speed, v[0].status),
-        (1, 3000, ec::ps::READY)
+        (one, 3000, ec::ps::READY)
     );
     // Gone, and back: a new ID. Finished: complete.
     let v = ids.view(&[p(2, 50, S::Complete, false, true)], temp);
-    assert_eq!((v[0].ecid, v[0].status), (2, ec::ps::COMPLETE));
+    assert_eq!((v[0].ecid, v[0].status), (two, ec::ps::COMPLETE));
     let v = ids.view(&[p(1, 0, S::Empty, false, false)], temp);
-    assert_eq!(v[0].ecid, 3);
+    assert!(v[0].ecid != one && v[0].ecid != two);
 }
 
 #[tokio::test]

@@ -109,11 +109,7 @@ fn expand_recursive(root: &Path, out: &mut Vec<PathBuf>) {
 
 /// The shared folders of a config directory, recursive ones expanded.
 pub fn shared_dirs(dir: &Path) -> Vec<PathBuf> {
-    let d = shareddir_dat::intents(
-        read_opt(&dir.join(shareddir_dat::EXPLICIT_FILE_NAME)).as_deref(),
-        read_opt(&dir.join(shareddir_dat::RECURSIVE_FILE_NAME)).as_deref(),
-        read_opt(&dir.join(shareddir_dat::LEGACY_FILE_NAME)).as_deref(),
-    );
+    let d = shared_dir_intents(dir);
     let mut out: Vec<PathBuf> = d.explicit.iter().map(PathBuf::from).collect();
     for r in &d.recursive {
         expand_recursive(Path::new(r), &mut out);
@@ -121,6 +117,16 @@ pub fn shared_dirs(dir: &Path) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     out.retain(|p| seen.insert(p.clone()));
     out
+}
+
+/// The shared folders as configured (`LoadSharedFolderIntents`): the
+/// explicit ones and the recursive roots, unexpanded.
+pub fn shared_dir_intents(dir: &Path) -> shareddir_dat::SharedDirs {
+    shareddir_dat::intents(
+        read_opt(&dir.join(shareddir_dat::EXPLICIT_FILE_NAME)).as_deref(),
+        read_opt(&dir.join(shareddir_dat::RECURSIVE_FILE_NAME)).as_deref(),
+        read_opt(&dir.join(shareddir_dat::LEGACY_FILE_NAME)).as_deref(),
+    )
 }
 
 /// The servers of a `server.met`, high priority first, then normal, then
@@ -481,5 +487,7 @@ fn ec_settings(
             threshold: limit("/ExternalConnect/AuthFailureThreshold", 10) as usize,
             lockout_seconds: limit("/ExternalConnect/AuthLockoutSeconds", 300),
         },
+        ed2k: prefs.connect_to_ed2k,
+        kad: prefs.connect_to_kad,
     })
 }

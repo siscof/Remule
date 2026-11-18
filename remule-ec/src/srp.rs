@@ -277,44 +277,223 @@ impl Client {
     }
 }
 
-/// The daemon's half (`ECSRP::Server`), for the in-process fake daemon the
-/// client tests log in to.
+/// The profile prefix of a stored verifier (`ECSRP::Profile`).
+const VERIFIER_PREFIX: &str = "v1:15:8:1:";
+
+/// What the daemon keeps instead of the password (`ECSRP::Verifier`): a
+/// salt and `v = g^x`, stored as `/ExternalConnect/ECPasswordVerifier`
+/// (EC_SRP.md, "verifier format v1").
+#[derive(Clone, PartialEq, Eq)]
+pub struct Verifier {
+    pub salt: [u8; SALT_LEN],
+    /// `WIDTH` bytes, big-endian.
+    pub value: Vec<u8>,
+}
+
+impl std::fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Verifier(..)")
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str, len: usize) -> Option<Vec<u8>> {
+    if s.len() != 2 * len || !s.is_ascii() {
+        return None;
+    }
+    (0..len)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
+        .collect()
+}
+
+impl Verifier {
+    /// `Verifier::Create`: the verifier of a password digest with this salt.
+    /// Runs the KDF once.
+    pub fn create(digest: &str, salt: [u8; SALT_LEN]) -> Result<Verifier, Error> {
+        if !is_password_digest(digest) {
+            return Err(Error::Auth("invalid EC password digest".into()));
+        }
+        let g = Group::new();
+        let x = derive_x(&unhex_digest(digest)?, &salt)?;
+        let v = Verifier {
+            salt,
+            value: pad(&g.g.modpow(&num(&x[..]), &g.n)),
+        };
+        if !v.valid() {
+            return Err(Error::Auth("could not generate the EC verifier".into()));
+        }
+        Ok(v)
+    }
+
+    /// With a fresh random salt.
+    pub fn create_random(digest: &str) -> Result<Verifier, Error> {
+        Self::create(digest, crate::crypt::random_bytes())
+    }
+
+    /// A verifier no password opens: what a credential the daemon does not
+    /// have is checked against, so it fails as a wrong password does.
+    pub fn dummy() -> Verifier {
+        let g = Group::new();
+        let v = pad(&g.g.modpow(&num(&crate::crypt::random_bytes::<32>()), &g.n));
+        Verifier {
+            salt: crate::crypt::random_bytes(),
+            value: v,
+        }
+    }
+
+    /// `Verifier::Valid`: `1 < v < N`.
+    pub fn valid(&self) -> bool {
+        let v = num(&self.value);
+        self.value.len() == WIDTH && v > BigUint::from(1u32) && v < Group::new().n
+    }
+
+    /// `Verifier::Encode`: `v1:15:8:1:<salt hex>:<v hex>`, lowercase.
+    pub fn encode(&self) -> String {
+        format!("{VERIFIER_PREFIX}{}:{}", hex(&self.salt), hex(&self.value))
+    }
+
+    /// `Verifier::Decode`: either case of hex; anything else fails.
+    pub fn decode(text: &str) -> Result<Verifier, Error> {
+        let bad = || Error::Auth("invalid or unsupported ECPasswordVerifier".into());
+        let rest = text.strip_prefix(VERIFIER_PREFIX).ok_or_else(bad)?;
+        if rest.len() != 2 * SALT_LEN + 1 + 2 * WIDTH || rest.as_bytes()[2 * SALT_LEN] != b':' {
+            return Err(bad());
+        }
+        let salt = unhex(&rest[..2 * SALT_LEN], SALT_LEN).ok_or_else(bad)?;
+        let value = unhex(&rest[2 * SALT_LEN + 1..], WIDTH).ok_or_else(bad)?;
+        let v = Verifier {
+            salt: salt.try_into().map_err(|_| bad())?,
+            value,
+        };
+        if !v.valid() {
+            return Err(Error::Auth("invalid ECPasswordVerifier value".into()));
+        }
+        Ok(v)
+    }
+
+    /// `Verifier::Matches`: whether this digest makes this verifier.
+    pub fn matches(&self, digest: &str) -> bool {
+        let Ok(d) = unhex_digest(digest) else {
+            return false;
+        };
+        let Ok(x) = derive_x(&d, &self.salt) else {
+            return false;
+        };
+        let g = Group::new();
+        let v = pad(&g.g.modpow(&num(&x[..]), &g.n));
+        bool::from(v[..].ct_eq(&self.value[..]))
+    }
+}
+
+/// The daemon's half of one login (`ECSRP::Server`).
+pub struct Server {
+    group: Group,
+    b: Zeroizing<Vec<u8>>,
+    a_pub: Vec<u8>,
+    b_pub: Vec<u8>,
+    verifier: Verifier,
+    credential: u8,
+    transcript: Vec<u8>,
+}
+
+impl Server {
+    /// `Server::Start`: check `A` and the context, and pick `b`. `B` is
+    /// [`Server::public`].
+    pub fn start(
+        v: &Verifier,
+        credential: u8,
+        a_pub: &[u8],
+        transcript: &[u8],
+    ) -> Result<Server, Error> {
+        if !v.valid() {
+            return Err(Error::Auth("invalid SRP verifier".into()));
+        }
+        let group = Group::new();
+        let a = num(a_pub);
+        if a_pub.len() != WIDTH || a == BigUint::from(0u32) || a >= group.n {
+            return Err(Error::Auth("invalid SRP public value".into()));
+        }
+        let b = loop {
+            let b: [u8; 32] = crate::crypt::random_bytes();
+            if b != [0u8; 32] {
+                break b;
+            }
+        };
+        let b_pub =
+            pad(&((&group.k * num(&v.value) + group.g.modpow(&num(&b), &group.n)) % &group.n));
+        scrambling(&group, a_pub, &b_pub)?;
+        context(credential, &v.salt, transcript, a_pub, &b_pub)?;
+        Ok(Server {
+            group,
+            b: Zeroizing::new(b.to_vec()),
+            a_pub: a_pub.to_vec(),
+            b_pub,
+            verifier: v.clone(),
+            credential,
+            transcript: transcript.to_vec(),
+        })
+    }
+
+    /// `B`, for `EC_TAG_SRP_B`.
+    pub fn public(&self) -> &[u8] {
+        &self.b_pub
+    }
+
+    pub fn salt(&self) -> &[u8; SALT_LEN] {
+        &self.verifier.salt
+    }
+
+    /// `Server::Verify`: `Some(M2)` when `m1` proves the credential. One
+    /// use: the exchange is spent either way.
+    pub fn verify(self, m1: &[u8]) -> Option<[u8; 32]> {
+        if m1.len() != 32 {
+            return None;
+        }
+        let g = &self.group;
+        let u = scrambling(g, &self.a_pub, &self.b_pub).ok()?;
+        let v = num(&self.verifier.value);
+        let base = (num(&self.a_pub) * v.modpow(&u, &g.n)) % &g.n;
+        let s = Zeroizing::new(pad(&base.modpow(&num(&self.b), &g.n)));
+        let (exp_m1, m2) = evidence(
+            &s,
+            self.credential,
+            &self.verifier.salt,
+            &self.transcript,
+            &self.a_pub,
+            &self.b_pub,
+        )
+        .ok()?;
+        bool::from(exp_m1[..].ct_eq(m1)).then_some(m2)
+    }
+}
+
+/// The fake daemon's challenge, on [`Server`].
 #[cfg(any(test, feature = "fake-daemon"))]
 pub(crate) mod server {
     use super::*;
 
     pub struct Challenge {
-        group: Group,
-        b: BigUint,
-        v: BigUint,
+        server: Server,
         pub b_pub: Vec<u8>,
     }
 
-    /// Verifier `v = g^x` for a digest, as `amuled --ec-config` stores it.
-    pub fn challenge(digest: &str, salt: &[u8]) -> Challenge {
-        let group = Group::new();
-        let x = derive_x(&unhex_digest(digest).unwrap(), salt).unwrap();
-        let v = group.g.modpow(&num(&x[..]), &group.n);
-        let b = num(&crate::crypt::random_bytes::<32>());
-        let b_pub = pad(&((&group.k * &v + group.g.modpow(&b, &group.n)) % &group.n));
-        Challenge { group, b, v, b_pub }
+    /// A challenge for `digest` with this salt.
+    pub fn challenge(digest: &str, salt: &[u8], a_pub: &[u8], transcript: &[u8]) -> Challenge {
+        let v = Verifier::create(digest, salt.try_into().unwrap()).unwrap();
+        let server = Server::start(&v, 0, a_pub, transcript).unwrap();
+        Challenge {
+            b_pub: server.public().to_vec(),
+            server,
+        }
     }
 
     impl Challenge {
         /// `Some(M2)` when `m1` proves the client knows the password.
-        pub fn verify(
-            &self,
-            a_pub: &[u8],
-            salt: &[u8],
-            transcript: &[u8],
-            m1: &[u8],
-        ) -> Option<[u8; 32]> {
-            let g = &self.group;
-            let u = scrambling(g, a_pub, &self.b_pub).ok()?;
-            let base = (num(a_pub) * self.v.modpow(&u, &g.n)) % &g.n;
-            let s = pad(&base.modpow(&self.b, &g.n));
-            let (exp_m1, m2) = evidence(&s, 0, salt, transcript, a_pub, &self.b_pub).ok()?;
-            bool::from(exp_m1[..].ct_eq(m1)).then_some(m2)
+        pub fn verify(self, m1: &[u8]) -> Option<[u8; 32]> {
+            self.server.verify(m1)
         }
     }
 }

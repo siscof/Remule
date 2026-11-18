@@ -3,7 +3,7 @@ name = "remule-ec"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
-description = "Client side of aMule's External Connection (EC) protocol: codec, SRP login, AEAD transport"
+description = "aMule's External Connection (EC) protocol: codec, SRP login, AEAD transport, client and daemon sides"
 
 [dependencies]
 thiserror = "2"

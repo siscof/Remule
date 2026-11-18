@@ -11,10 +11,12 @@
 //! * [`http`]: one file over HTTP(S).
 //! * [`server_conn`]: which eD2k server to log into next, and when.
 //! * [`stats`]: the transfer statistics in `statistics.dat` and in the log.
+//! * [`ec`]: external connections, for `amulecmd` and `amulegui`.
 
 pub mod bootstrap;
 pub mod client;
 pub mod config;
+pub mod ec;
 pub mod firewall;
 pub mod http;
 pub mod kad;
@@ -25,6 +27,8 @@ pub mod stats;
 mod tests;
 #[cfg(test)]
 mod tests_bootstrap;
+#[cfg(test)]
+mod tests_ec;
 #[cfg(test)]
 mod tests_firewall;
 #[cfg(test)]

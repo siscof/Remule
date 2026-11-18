@@ -269,6 +269,7 @@ async fn the_daemon_runs_the_kad_firewall_check() {
         ip_filter: None,
         stop_when_done: false,
         status_every: Duration::from_secs(3600),
+        ec: None,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let daemon = tokio::spawn(client::run(c, Vec::new(), Vec::new(), async {

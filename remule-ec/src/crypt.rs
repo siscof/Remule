@@ -121,9 +121,8 @@ impl Session {
         Self::new(cipher, ikm, server_nonce, client_nonce, transcript, false)
     }
 
-    /// The daemon's side; only the test fake daemon needs it.
-    #[cfg(any(test, feature = "fake-daemon"))]
-    pub(crate) fn new_server(
+    /// `isServer == true`: the daemon's side.
+    pub fn new_server(
         cipher: u8,
         ikm: &[u8],
         server_nonce: &[u8],

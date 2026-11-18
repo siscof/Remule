@@ -160,7 +160,7 @@ pub fn accept(stream: TcpStream, login: &Login) -> R<Option<Conn>> {
         &server_pub,
     );
     let salt: [u8; 16] = crypt::random_bytes();
-    let challenge = srp::server::challenge(&login.digest, &salt);
+    let challenge = srp::server::challenge(&login.digest, &salt, &a_pub, &transcript);
 
     let salt_pkt = Packet::new(EC_OP_AUTH_SALT)
         .with(Tag::int(EC_TAG_AEAD_CIPHER, u64::from(cipher)))
@@ -188,7 +188,7 @@ pub fn accept(stream: TcpStream, login: &Login) -> R<Option<Conn>> {
         return Err("expected AUTH_PASSWD".into());
     }
     let m1 = field(&passwd, EC_TAG_SRP_M1, 32).map_err(e)?;
-    let Some(mut m2) = challenge.verify(&a_pub, &salt, &transcript, &m1) else {
+    let Some(mut m2) = challenge.verify(&m1) else {
         let fail = Packet::new(EC_OP_AUTH_FAIL)
             .with(Tag::string(
                 EC_TAG_STRING,

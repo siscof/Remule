@@ -6,6 +6,10 @@
 //! What happens is logged with [`tracing`] at `info`, each line prefixed
 //! with the seconds since start.
 //!
+//! With [`ClientConfig::ec`], external connections are accepted too
+//! ([`crate::ec`]): the client refreshes their view of it every second, and
+//! stops when one asks it to.
+//!
 //! With `REMULE_TRACE` set, every peer packet's protocol, opcode and size
 //! is printed to stderr.
 
@@ -38,10 +42,11 @@ use remule_core::upload_queue::{UploadConfig, UploadQueue};
 use remule_core::uploader::Uploader;
 use remule_core::PartFile;
 use remule_net::Bandwidth;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use crate::ec::{self, Control, EcSettings, KadStatus, ServerStatus, Status};
 use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
@@ -106,6 +111,8 @@ pub struct ClientConfig {
     pub stop_when_done: bool,
     /// Between progress lines.
     pub status_every: Duration,
+    /// Accept external connections (`amulecmd`, `amulegui`).
+    pub ec: Option<EcSettings>,
 }
 
 /// How a run ended.
@@ -258,6 +265,86 @@ fn follow(next: Next, c: &ClientConfig, attempting: &mut Option<Attempting>, t: 
             RETRY_AFTER.as_secs()
         ),
         Next::Idle => {}
+    }
+}
+
+/// What the EC view is made from.
+struct EcInputs<'a> {
+    c: &'a ClientConfig,
+    server: Option<(&'a ServerClient, Option<(SocketAddr, u32)>)>,
+    connecting: bool,
+    our_id: u32,
+    kad: Option<(
+        Option<ed2k_kad::driver::Snapshot>,
+        ed2k_types::UInt128,
+        Option<u32>,
+    )>,
+    statistics: &'a Statistics,
+    /// Bytes in the last second.
+    rates: Totals,
+    queue: Option<remule_core::download_queue::QueueStats>,
+    shared: usize,
+    now: Instant,
+}
+
+/// The client as the EC replies tell it.
+fn ec_status(i: EcInputs<'_>) -> Status {
+    let session = i.statistics.session();
+    let totals = i.statistics.totals();
+    let server = i.server.map(|(s, since)| {
+        let info = s.info();
+        ServerStatus {
+            addr: match since {
+                Some((SocketAddr::V4(a), _)) => Some(a),
+                _ => None,
+            },
+            name: info.name.unwrap_or_default(),
+            description: info.description.unwrap_or_default(),
+            version: info.version.unwrap_or_default(),
+            users: info.users,
+            files: info.files,
+            tcp_flags: info.tcp_flags,
+        }
+    });
+    let ed2k_since = i.server.and_then(|(_, s)| s).map(|(_, t)| t);
+    let kad = i.kad.map(|(snap, id, since)| match snap {
+        Some(snap) => KadStatus {
+            connected: snap.connected,
+            firewalled: snap.firewalled,
+            id,
+            public_ip: snap.public_ip,
+            users: snap.estimated_users,
+            nodes: snap.contacts as u32,
+            since: since.filter(|_| snap.connected),
+        },
+        None => KadStatus {
+            id,
+            ..Default::default()
+        },
+    });
+    let q = i.queue.unwrap_or_default();
+    Status {
+        ed2k_enabled: !i.c.servers.is_empty(),
+        kad_enabled: i.c.kad.is_some(),
+        server,
+        connecting: i.connecting,
+        ed2k_id: i.our_id,
+        ed2k_since,
+        kad,
+        ul_speed: i.rates.sent,
+        dl_speed: i.rates.received,
+        ul_limit: i.c.max_upload.saturating_mul(1024),
+        dl_limit: i.c.max_download.saturating_mul(1024),
+        session_sent: session.sent,
+        session_received: session.received,
+        total_sent: totals.sent,
+        total_received: totals.received,
+        uptime: i.statistics.uptime(i.now).as_secs(),
+        shared_files: i.shared as u32,
+        connections: q.connections as u32,
+        sources: q.sources as u32,
+        upload_queue: 0,
+        banned: 0,
     }
 }
 
@@ -445,6 +532,29 @@ pub async fn run(
         None => None,
     };
 
+    // External connections: a view of the client, refreshed every second,
+    // and what they ask of it.
+    let mut ec_view: Option<watch::Sender<Status>> = None;
+    let mut ec_control: Option<mpsc::UnboundedReceiver<Control>> = None;
+    if let Some(e) = &c.ec {
+        if let Some(l) = ec::listen(e).await {
+            let (tx, rx) = watch::channel(Status::default());
+            let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+            let identity = remule_ec::server::Identity {
+                version: concat!("remuled ", env!("CARGO_PKG_VERSION")).into(),
+                session_id: rand::random(),
+            };
+            tokio::spawn(ec::serve(l, e.clone(), identity, rx, ctl_tx));
+            ec_view = Some(tx);
+            ec_control = Some(ctl_rx);
+        }
+    }
+    // For the EC view: the server logged into and since when, when Kad
+    // connected, and the traffic a second ago.
+    let mut server_since: Option<(SocketAddr, u32)> = None;
+    let mut kad_since: Option<u32> = None;
+    let mut last_traffic = Totals::default();
+
     let start = Instant::now();
     // The totals of earlier sessions, which this one adds to.
     let (before, note) = crate::stats::load(&c.config);
@@ -485,6 +595,7 @@ pub async fn run(
                             li.id
                         );
                         our_id = li.id;
+                        server_since = connector.connecting().map(|a| (a.addr, unix_now()));
                         let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
                         let was = reach;
                         reach.high_id = !li.low_id;
@@ -528,6 +639,7 @@ pub async fn run(
                             _ => warn!("[{:>5}s] server connection lost", t.as_secs()),
                         }
                         server = None;
+                        server_since = None;
                         our_id = 0;
                         let _ = cmd.send(Command::SetOurId { id: 0, public_ip: None });
                         let was = reach;
@@ -544,6 +656,7 @@ pub async fn run(
                     Some(KadEvent::Connected) => {
                         info!("[{:>5}s] Kad connected", start.elapsed().as_secs());
                         kad_connected = Some(Instant::now());
+                        kad_since = Some(unix_now());
                         next_kad_ask = Some(Instant::now() + Duration::from_secs(KAD_WARMUP));
                     }
                     Some(KadEvent::Found { search, found: Found::Source(s) }) => {
@@ -588,6 +701,15 @@ pub async fn run(
                 break;
             }
             _ = &mut shutdown => break,
+            ctl = async { match &mut ec_control { Some(r) => r.recv().await, None => std::future::pending().await } } => {
+                match ctl {
+                    Some(Control::Shutdown) => {
+                        info!("[{:>5}s] shutdown requested over an external connection: saving", start.elapsed().as_secs());
+                        break;
+                    }
+                    None => ec_control = None,
+                }
+            }
             _ = tick.tick() => {
                 let now = Instant::now();
                 let t = start.elapsed();
@@ -596,6 +718,35 @@ pub async fn run(
                 if cmd.send(Command::Traffic(tx)).is_ok() {
                     if let Ok(traffic) = rx.await {
                         statistics.update(traffic, now);
+                        if let Some(view) = &ec_view {
+                            let rates = Totals {
+                                sent: traffic.sent.saturating_sub(last_traffic.sent),
+                                received: traffic.received.saturating_sub(last_traffic.received),
+                            };
+                            let status = ec_status(EcInputs {
+                                c: &c,
+                                server: server.as_ref().map(|s| (s, server_since)),
+                                connecting: attempting.is_some(),
+                                our_id,
+                                kad: match &kad_node {
+                                    Some(k) => Some((k.handle.snapshot().await, k.prefs.kad_id, kad_since)),
+                                    None => None,
+                                },
+                                statistics: &statistics,
+                                rates,
+                                queue: {
+                                    let (tx, rx) = oneshot::channel();
+                                    match cmd.send(Command::Progress(tx)) {
+                                        Ok(()) => rx.await.ok().map(|(_, s)| s),
+                                        Err(_) => None,
+                                    }
+                                },
+                                shared: shares.as_ref().map_or(0, |s| s.lock().unwrap_or_else(|e| e.into_inner()).shared_count()),
+                                now,
+                            });
+                            view.send_replace(status);
+                        }
+                        last_traffic = traffic;
                     }
                 }
                 if let Some(totals) = statistics.save_due(now) {

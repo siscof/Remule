@@ -35,21 +35,20 @@ Joins Kad from a nodes.dat, keeps a routing table and runs keyword and source se
 Runs the client from an aMule config directory, as `amuled` does:
 - downloads in its `Temp` directory are resumed;
 - the shared folders and `Incoming` are shared and uploaded. Shared folders come from `shareddir.dat`, or from aMule-org's `shareddir-explicit.dat` / `shareddir-recursive.dat`;
-- the first server in `server.met` that logs in is used, high priority first;
-- Kad starts from the `nodes.dat` there.
+- the first server in `server.met` that logs in is used, high priority first, and it logs in again when the connection is lost;
+- Kad starts from the `nodes.dat` there;
+- a missing `nodes.dat`, and server lists from `addresses.dat`, are fetched over HTTP at start;
+- `ipfilter.dat` and `ipfilter_static.dat` keep it away from filtered peers and servers;
+- transfer totals are kept in `statistics.dat`;
+- with `AcceptExternalConnections` and an EC password, it accepts External Connections on `ECPort` (aMule 3.3's SRP login). So far they can ask for statistics and the connection state, and shut it down.
 
-Nick, ports, limits and directories come from `amule.conf`, the user hash from `preferences.dat`, and the secure-ident key from `cryptkey.dat` (both made if missing). On Ctrl-C (or SIGTERM) it saves `known.met`, `clients.met`, the part files and the Kad state, in aMule's formats and places.
+Nick, ports, limits and directories come from `amule.conf`, the user hash from `preferences.dat`, and the secure-ident key from `cryptkey.dat` (both made if missing). A legacy `ECPassword` in `amule.conf` is replaced by an `ECPasswordVerifier`, as aMule 3.3 does. On Ctrl-C (or SIGTERM) it saves `known.met`, `clients.met`, the part files, the statistics and the Kad state, in aMule's formats and places.
 
     cargo run --release -p remuled -- [-c ~/.aMule] [--duration SECS]
 
 Stop aMule first: the two must not use one directory at once.
 
-Not yet supported:
-- External Connections, so `amulecmd` and `amulegui` cannot drive it;
-- reconnecting to a server;
-- fetching `server.met` or `nodes.dat`;
-- the IP filter;
-- statistics.
+Not yet supported: the rest of External Connections (downloads, shared files, servers, searches, preferences), so `amulecmd` and `amulegui` can only log in, read the status and shut it down.
 
 ## remule-gui: remote GUI for amuled
 
@@ -64,7 +63,7 @@ To try it without a daemon, run the scripted stand-in, which speaks the real EC 
     cargo run -p remule-ec --features fake-daemon --example fake_amuled -- 4712 secret
     cargo run -p remule-gui -- -h 127.0.0.1 -p 4712 -P secret
 
-Crates: `remule-cli` (the `remule` command), `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-hash` (eD2k and AICH hashing), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol client), `remule-gui` (the GUI) and `remuled` (the daemon, and the client `remule download` runs). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
+Crates: `remule-cli` (the `remule` command), `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-hash` (eD2k and AICH hashing), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol: client, and the daemon's side), `remule-gui` (the GUI) and `remuled` (the daemon, and the client `remule download` runs). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
 
 ## License
 

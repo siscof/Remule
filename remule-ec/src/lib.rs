@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Client side of aMule's External Connection (EC) protocol.
+//! aMule's External Connection (EC) protocol, both sides.
 //!
 //! EC is how `amulegui`, `amulecmd` and the web UI drive the `amuled`
 //! daemon. This crate speaks the 3.3 protocol of the aMule-org fork: SRP-6a
@@ -9,6 +9,8 @@
 //! * [`tag`]: packets and tags, and their wire encoding (sans-IO).
 //! * [`crypt`], [`srp`]: the transport keys and the login proofs (sans-IO).
 //! * [`client`]: a blocking TCP connection that logs in and sends requests.
+//! * [`server`]: the daemon's side of a connection (framing, login,
+//!   lockout), sans IO.
 //! * [`model`]: typed views of the replies a GUI needs.
 
 pub mod client;
@@ -17,8 +19,12 @@ pub mod crypt;
 #[cfg(any(test, feature = "fake-daemon"))]
 pub mod fake;
 pub mod model;
+pub mod server;
 pub mod srp;
 pub mod tag;
+
+#[cfg(test)]
+mod tests_server;
 
 pub use client::{Client, ConnectOptions, ServerInfo};
 pub use tag::{Packet, Tag};

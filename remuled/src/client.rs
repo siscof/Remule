@@ -291,6 +291,8 @@ struct EcInputs<'a> {
     shared: usize,
     now: Instant,
     download_ids: &'a mut DownloadIds,
+    /// The connected server as `server.met` lists it.
+    listed: Option<&'a ed2k_formats::server_met::ServerInfo>,
 }
 
 /// The client as the EC replies tell it.
@@ -304,8 +306,17 @@ fn ec_status(i: EcInputs<'_>) -> Status {
                 Some((SocketAddr::V4(a), _)) => Some(a),
                 _ => None,
             },
-            name: info.name.unwrap_or_default(),
-            description: info.description.unwrap_or_default(),
+            // `GetListName`: what the server calls itself, else the list's name.
+            name: info
+                .name
+                .filter(|n| !n.is_empty())
+                .or_else(|| i.listed.map(|l| l.name.clone()))
+                .unwrap_or_default(),
+            description: info
+                .description
+                .filter(|d| !d.is_empty())
+                .or_else(|| i.listed.map(|l| l.description.clone()))
+                .unwrap_or_default(),
             version: info.version.unwrap_or_default(),
             users: info.users,
             files: info.files,
@@ -1091,6 +1102,10 @@ pub async fn run(
                                     }
                                 },
                                 download_ids: &mut download_ids,
+                                listed: match server_since {
+                                    Some((SocketAddr::V4(a), _)) => server_list.find(a),
+                                    _ => None,
+                                },
                                 shared: shares.as_ref().map_or(0, |s| s.lock().unwrap_or_else(|e| e.into_inner()).shared_count()),
                                 now,
                             });

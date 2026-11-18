@@ -5,8 +5,9 @@
 Stock aMule 2.3.3 asks its sources only while it is connected to eD2k or
 Kad (`CPartFile::Process`, `theApp->IsConnected()`). This accepts the login
 (`OP_LOGINREQUEST`) and answers with a message, a status and `OP_IDCHANGE`
-giving the client a HighID: its own address. Everything else is read and
-ignored; no sources, no searches.
+giving the client a HighID: its own address. Every search
+(`OP_SEARCHREQUEST`) is answered with the one file in `SEARCH_RESULT`.
+Everything else is read and ignored; no sources.
 
 Usage: fake_ed2k_server.py LISTEN_IP PORT
 """
@@ -21,12 +22,42 @@ OP_LOGINREQUEST = 0x01
 OP_SERVERMESSAGE = 0x38
 OP_SERVERSTATUS = 0x34
 OP_IDCHANGE = 0x40
+OP_SEARCHREQUEST = 0x16
+OP_SEARCHRESULT = 0x33
+# Old-style tags: type, a one-byte name, the value.
+TAGTYPE_STRING = 0x02
+TAGTYPE_UINT32 = 0x03
+FT_FILENAME = 0x01
+FT_FILESIZE = 0x02
+FT_SOURCES = 0x15
+# (hash, name, size) of the file every search finds.
+SEARCH_RESULT = (bytes([0x5E] * 16), "remule interop result.iso", 7_340_032)
 # SRV_TCPFLG_COMPRESSION | SRV_TCPFLG_NEWTAGS | SRV_TCPFLG_UNICODE | SRV_TCPFLG_LARGEFILES
 TCP_FLAGS = 0x0001 | 0x0008 | 0x0010 | 0x0100
 
 
 def packet(opcode, payload=b""):
     return struct.pack("<BIB", OP_EDONKEYPROT, len(payload) + 1, opcode) + payload
+
+
+def tag(tagtype, name, value):
+    head = struct.pack("<BHB", tagtype, 1, name)
+    if tagtype == TAGTYPE_STRING:
+        raw = value.encode()
+        return head + struct.pack("<H", len(raw)) + raw
+    return head + struct.pack("<I", value)
+
+
+def search_result():
+    h, name, size = SEARCH_RESULT
+    tags = [
+        tag(TAGTYPE_STRING, FT_FILENAME, name),
+        tag(TAGTYPE_UINT32, FT_FILESIZE, size),
+        tag(TAGTYPE_UINT32, FT_SOURCES, 3),
+    ]
+    # One file: hash, a source's ID and port, its tags; then "no more".
+    entry = h + struct.pack("<IHI", 0x0100007F, 4662, len(tags)) + b"".join(tags)
+    return packet(OP_SEARCHRESULT, struct.pack("<I", 1) + entry + b"\x00")
 
 
 def read_exact(conn, n):
@@ -59,6 +90,9 @@ def serve(conn, addr):
                 # The client's own address as its ID: first octet in the low byte.
                 conn.sendall(packet(OP_IDCHANGE, socket.inet_aton(addr[0]) + struct.pack("<I", TCP_FLAGS)))
                 print(f"  -> HighID {addr[0]}", flush=True)
+            elif proto == OP_EDONKEYPROT and opcode == OP_SEARCHREQUEST:
+                conn.sendall(search_result())
+                print("  -> 1 search result", flush=True)
     except OSError as e:
         print(f"  {e}", flush=True)
     finally:

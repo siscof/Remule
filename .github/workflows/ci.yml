@@ -92,3 +92,49 @@ jobs:
         run: bash scripts/interop/amule-downloads-from-remule.sh
         env:
           SOURCE: ${{ matrix.source }}
+
+  # MIGRATION_PLAN.md 11.M: the unmodified C++ amulecmd drives remuled.
+  # No release has the SRP login yet (it came after 3.2.0), so amulecmd is
+  # built from the aMule-org commit remule is ported from, and cached.
+  amulecmd-interop:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    timeout-minutes: 45
+    env:
+      AMULE_REF: 688c51eb77654d1fdc2a2967d1dd530c28b74ca5
+    steps:
+      - name: Install tools
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc gcc-c++ make cmake git curl tar gzip python3 procps-ng \
+            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache amulecmd
+        id: amulecmd-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/amulecmd
+          key: amulecmd-fedora-${{ env.AMULE_REF }}
+      - name: Build amulecmd
+        if: steps.amulecmd-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q /tmp/amule-src
+          cd /tmp/amule-src
+          git fetch -q --depth 1 https://github.com/amule-org/amule.git "$AMULE_REF"
+          git checkout -q FETCH_HEAD
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_MONOLITHIC=NO -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES \
+            -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
+            -DENABLE_MEDIA_PROBE=OFF -DENABLE_VERSION_CHECK=OFF -DENABLE_BFD=NO \
+            -DTRANSLATED_MANPAGES=NO
+          cmake --build build --target amulecmd -j "$(nproc)"
+          mkdir -p /opt/amulecmd
+          cp "$(find build -type f -name amulecmd -perm -u+x | head -1)" /opt/amulecmd/
+      - name: Build remuled
+        run: cargo build --release -p remuled
+      - name: amulecmd drives remuled
+        run: bash scripts/interop/amulecmd-drives-remuled.sh
+        env:
+          AMULECMD: /opt/amulecmd/amulecmd

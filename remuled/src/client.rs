@@ -652,6 +652,11 @@ pub async fn run(
     let mut kad_since: Option<u32> = None;
     let mut last_traffic = Totals::default();
     let mut download_ids = DownloadIds::default();
+    let mut shared_state = crate::ec_shared::SharedState::default();
+    let reload_dirs = crate::ec_shared::ReloadDirs {
+        dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
+        reserved: vec![c.temp.clone(), c.config.clone()],
+    };
 
     let start = Instant::now();
     // The totals of earlier sessions, which this one adds to.
@@ -863,6 +868,9 @@ pub async fn run(
                         }
                         let _ = reply.send(r);
                         tick.reset_immediately();
+                    }
+                    Some(Control::Shared(req)) => {
+                        shared_state.handle(req, shares.as_ref(), &reload_dirs, &c.config);
                     }
                     None => ec_control = None,
                 }

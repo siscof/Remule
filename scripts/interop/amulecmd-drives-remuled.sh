@@ -151,7 +151,7 @@ echo "remuled is up; $("$AMULECMD" --version 2>&1 | head -1)"
 # --- what a user does ----------------------------------------------------------
 
 # Status: logged into the fake server.
-expect 30 "eD2k: Connected to remule interop server \[127\.0\.0\.1:\] with HighID" status
+expect 30 "eD2k: Connected to remule interop server \[127\.0\.0\.1:$SERVER_PORT\] with HighID" status
 # A wrong password is refused.
 "$AMULECMD" -h 127.0.0.1 -p "$EC_PORT" -P wrong -c status >"$WORK/wrong" 2>&1 || true
 grep -Eiq "wrong password|authentication failed|denied" "$WORK/wrong" || {

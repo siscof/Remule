@@ -30,6 +30,10 @@ pub struct EcSettings {
     pub addr: SocketAddrV4,
     pub credentials: Credentials,
     pub limits: Limits,
+    /// `ConnectToED2K` and `ConnectToKad`, which the server and network
+    /// requests check.
+    pub ed2k: bool,
+    pub kad: bool,
 }
 
 /// The connected server, as the EC server tag tells it.
@@ -247,6 +251,12 @@ pub enum Control {
         file: Md4Hash,
         op: FileOp,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// A server or network request ([`crate::ec_servers`]), answered by
+    /// the client loop.
+    Servers {
+        request: Packet,
+        reply: oneshot::Sender<Packet>,
     },
 }
 
@@ -602,6 +612,9 @@ pub async fn answer(
         | EC_OP_PARTFILE_RESUME
         | EC_OP_PARTFILE_STOP
         | EC_OP_PARTFILE_DELETE => (partfile_cmd(req, s, control).await, false),
+        op if crate::ec_servers::is_server_request(op) => {
+            (crate::ec_servers::ask(req, control).await, false)
+        }
         EC_OP_GET_SHARED_FILES
         | EC_OP_SHAREDFILES_RELOAD
         | EC_OP_SHARED_SET_PRIO

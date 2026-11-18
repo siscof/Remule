@@ -156,7 +156,6 @@ pub struct Download {
 #[derive(Debug, Default)]
 pub struct DownloadIds {
     ids: std::collections::HashMap<Md4Hash, u32>,
-    next: u32,
     last: std::collections::HashMap<Md4Hash, u64>,
 }
 
@@ -173,10 +172,10 @@ impl DownloadIds {
         let out = files
             .iter()
             .map(|f| {
-                let ecid = *self.ids.entry(f.hash).or_insert_with(|| {
-                    self.next += 1;
-                    self.next
-                });
+                let ecid = *self
+                    .ids
+                    .entry(f.hash)
+                    .or_insert_with(crate::ec_shared::next_ecid);
                 let speed = f
                     .transferred
                     .saturating_sub(*self.last.get(&f.hash).unwrap_or(&f.transferred));
@@ -245,6 +244,8 @@ pub enum Control {
         category: u32,
         reply: oneshot::Sender<bool>,
     },
+    /// Shared files ([`crate::ec_shared`]).
+    Shared(crate::ec_shared::SharedRequest),
     /// One partfile command on one download.
     File {
         file: Md4Hash,
@@ -410,48 +411,18 @@ fn failed(message: &str) -> Packet {
 /// their zeros and blanks are sent, as for a file nobody asked for.
 pub fn partfile_tag(d: &Download, detail: u8) -> Tag {
     let int = |name: u16, v: u64| Tag::int(name, v);
-    let mut t = Tag::int(EC_TAG_PARTFILE, d.ecid.into());
+    let base = crate::ec_shared::SharedBase {
+        ecid: d.ecid,
+        hash: d.hash,
+        name: d.name.clone(),
+        size: d.size,
+        file_name: format!("{:03}.part", d.part_met_id),
+        dir: d.dir.clone(),
+        up_priority: d.up_priority,
+        ..Default::default()
+    };
+    let mut t = crate::ec_shared::shared_tag(EC_TAG_PARTFILE, &base, detail);
     let mut add = |c: Tag| t.children.push(c);
-    // CEC_SharedFile_Tag.
-    for name in [
-        EC_TAG_KNOWNFILE_REQ_COUNT,
-        EC_TAG_KNOWNFILE_REQ_COUNT_ALL,
-        EC_TAG_KNOWNFILE_ACCEPT_COUNT,
-        EC_TAG_KNOWNFILE_ACCEPT_COUNT_ALL,
-        EC_TAG_KNOWNFILE_XFERRED,
-        EC_TAG_KNOWNFILE_XFERRED_ALL,
-    ] {
-        add(int(name, 0));
-    }
-    add(Tag::string(EC_TAG_KNOWNFILE_AICH_MASTERHASH, ""));
-    add(int(EC_TAG_KNOWNFILE_PRIO, d.up_priority.into()));
-    for name in [
-        EC_TAG_KNOWNFILE_COMPLETE_SOURCES_LOW,
-        EC_TAG_KNOWNFILE_COMPLETE_SOURCES_HIGH,
-        EC_TAG_KNOWNFILE_COMPLETE_SOURCES,
-        EC_TAG_KNOWNFILE_ON_QUEUE,
-        EC_TAG_KNOWNFILE_UPLOAD_SPEED,
-        EC_TAG_KNOWNFILE_UPLOADING_COUNT,
-        EC_TAG_KNOWNFILE_LAST_UPLOAD,
-    ] {
-        add(int(name, 0));
-    }
-    add(Tag::empty(EC_TAG_PARTFILE_COMMENTS));
-    add(int(EC_TAG_PARTFILE_KAD_COMMENT_SEARCHING, 0));
-    if detail != EC_DETAIL_UPDATE {
-        add(Tag::string(EC_TAG_PARTFILE_NAME, &d.name));
-        add(Tag::hash(EC_TAG_PARTFILE_HASH, d.hash.0));
-        add(Tag::string(
-            EC_TAG_KNOWNFILE_FILENAME,
-            &format!("{:03}.part", d.part_met_id),
-        ));
-        add(Tag::string(EC_TAG_KNOWNFILE_PATH, &d.dir));
-        add(int(EC_TAG_KNOWNFILE_SHARED_SINCE, 0));
-        add(int(EC_TAG_PARTFILE_SIZE_FULL, d.size));
-        add(Tag::string(EC_TAG_PARTFILE_ED2K_LINK, &ed2k_link(d)));
-        add(Tag::string(EC_TAG_KNOWNFILE_COMMENT, ""));
-        add(int(EC_TAG_KNOWNFILE_RATING, 0));
-    }
     // CEC_PartFile_Tag.
     add(int(EC_TAG_PARTFILE_STATUS, d.status.into()));
     add(int(EC_TAG_PARTFILE_STOPPED, d.stopped.into()));
@@ -486,12 +457,7 @@ pub fn partfile_tag(d: &Download, detail: u8) -> Tag {
 
 /// `CreateED2kLink(file, false)`: `ed2k://|file|NAME|SIZE|HASH|/`.
 pub fn ed2k_link(d: &Download) -> String {
-    format!(
-        "ed2k://|file|{}|{}|{}|/",
-        remule_core::part_file::clean_file_name(&d.name),
-        d.size,
-        d.hash
-    )
+    crate::ec_shared::ed2k_link(&d.name, d.size, &d.hash)
 }
 
 /// `Get_EC_Response_GetDownloadQueue`: every download, or those asked for
@@ -649,6 +615,13 @@ pub async fn answer(
         op if crate::ec_servers::is_server_request(op) => {
             (crate::ec_servers::ask(req, control).await, false)
         }
+        EC_OP_GET_SHARED_FILES
+        | EC_OP_SHAREDFILES_RELOAD
+        | EC_OP_SHARED_SET_PRIO
+        | EC_OP_GET_SHARED_DIRS => match crate::ec_shared::answer(req, control).await {
+            Some(p) => (p, false),
+            None => (failed("Invalid opcode (wrong protocol version?)"), false),
+        },
         op => {
             info!("External Connection: invalid opcode received: {op:#x}");
             (failed("Invalid opcode (wrong protocol version?)"), false)

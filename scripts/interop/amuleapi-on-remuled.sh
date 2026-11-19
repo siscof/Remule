@@ -116,8 +116,9 @@ AMULEAPI_BIN="$AMULEAPI" AMULE_SHARED_DIR="$CONF/Incoming" \
 	bash "$SUITE/run-all.sh" "${PHASES[@]}" >"$WORK/suite.log" 2>&1
 cat "$WORK/suite.log"
 
-# "<phase> exit=<rc>" per phase.
-mapfile -t RESULTS < <(grep -E '^[0-9][0-9a-z-]*\.sh exit=[0-9]+$' "$WORK/suite.log")
+# "<phase> exit=<rc>" per phase (not always at the start of a line: a
+# phase's last output may not end with a newline).
+mapfile -t RESULTS < <(grep -oE '[0-9][0-9a-z-]*\.sh exit=[0-9]+$' "$WORK/suite.log")
 declare -A RC=()
 for r in "${RESULTS[@]}"; do
 	RC[${r% exit=*}]=${r##*exit=}

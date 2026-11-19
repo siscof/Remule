@@ -1,2 +1,25 @@
 # Phases of aMule's amuleapi curl suite that pass against remuled
 # (scripts/interop/amuleapi-on-remuled.sh), one per line.
+02-auth.sh
+02b-auth-lockout-isolation.sh
+03-read-status.sh
+04-read-downloads-shared.sh
+08-read-download-parts.sh
+09-refresher-consolidation.sh
+11-downloads-default-filter.sh
+21-sse-heartbeat.sh
+25-cors.sh
+27-static-frontend.sh
+29-bulk-mutations.sh
+32-country-flags.sh
+36-shared-reload.sh
+37-shared-availability-parts.sh
+38-chat.sh
+39-shared-media-refresh.sh
+40-http-conformance.sh
+42-path-and-body-contracts.sh
+43-client-protocol-extensions.sh
+44-base-path.sh
+46-sse-session-end.sh
+48-cross-origin-writes.sh
+50-proxy-auth.sh

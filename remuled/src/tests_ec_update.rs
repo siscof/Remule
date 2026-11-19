@@ -119,7 +119,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
         download(5, vec![(0, 29_999_999)]),
         download(2, vec![(100, 199)]),
     ];
-    let p = st.reply(&dl, &data);
+    let p = st.reply(&dl, &data, false);
     assert_eq!(p.opcode, EC_OP_SHARED_FILES);
     // Files in ECID order, then clients, servers and friends.
     let tops: Vec<(u16, u64)> = p.tags.iter().map(|t| (t.name, t.as_int())).collect();
@@ -157,7 +157,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
     assert_eq!(p.tags[1].child_str(EC_TAG_PARTFILE_NAME), "book.pdf");
 
     // Nothing changed: bare ECIDs, still listed.
-    let p = st.reply(&dl, &data);
+    let p = st.reply(&dl, &data, false);
     for t in &p.tags[..3] {
         assert!(t.children.is_empty(), "{t:?}");
     }
@@ -167,7 +167,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
     // client's decoder turns into the new gaps.
     dl[0] = download(5, vec![(9_728_000, 29_999_999)]);
     dl[0].transferred = 9_728_000;
-    let p = st.reply(&dl, &data);
+    let p = st.reply(&dl, &data, false);
     let f5 = p.tags.iter().find(|t| t.as_int() == 5).unwrap();
     assert!(f5.has(EC_TAG_PARTFILE_SIZE_DONE));
     assert!(!f5.has(EC_TAG_PARTFILE_NAME));
@@ -180,7 +180,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
     // File 2 gone, file 7 new: 7 goes out whole; 2 is simply absent.
     dl.retain(|d| d.ecid != 2);
     dl.push(download(7, vec![(0, 9)]));
-    let p = st.reply(&dl, &data);
+    let p = st.reply(&dl, &data, false);
     assert!(p
         .tags
         .iter()
@@ -189,7 +189,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
     assert!(f7.has(EC_TAG_PARTFILE_NAME));
     // ... and if 2 came back under the same ECID, from nothing again.
     dl.push(download(2, vec![(100, 199)]));
-    let p = st.reply(&dl, &data);
+    let p = st.reply(&dl, &data, false);
     let f2 = p.tags.iter().find(|t| t.as_int() == 2).unwrap();
     assert!(f2.has(EC_TAG_PARTFILE_NAME));
     let mut fresh = Bars::new();
@@ -391,4 +391,48 @@ async fn amulegui_s_first_requests_are_answered() {
         .expect("the daemon did not stop")
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn the_partial_update_protocol_leaves_out_what_is_unchanged_and_names_what_is_gone() {
+    let mut st = UpdateState::default();
+    let data = UpdateData {
+        shared: vec![shared(3)],
+        servers: Vec::new(),
+    };
+    let mut dl = vec![download(5, vec![(0, 9)]), download(2, vec![(0, 9)])];
+    let files = |p: &Packet| {
+        p.tags
+            .iter()
+            .filter(|t| t.name == EC_TAG_PARTFILE || t.name == EC_TAG_KNOWNFILE)
+            .map(|t| t.as_int())
+            .collect::<Vec<_>>()
+    };
+    let removed = |p: &Packet| {
+        p.tags
+            .iter()
+            .filter(|t| t.name == EC_TAG_FILE_REMOVED)
+            .map(|t| t.as_int())
+            .collect::<Vec<_>>()
+    };
+    let p = st.reply(&dl, &data, true);
+    assert_eq!(files(&p), [2, 3, 5]);
+    // Nothing new: nothing at all, not even bare ECIDs.
+    let p = st.reply(&dl, &data, true);
+    assert!(files(&p).is_empty() && removed(&p).is_empty(), "{p:?}");
+    // A download cancelled and the shared file deleted: named, once.
+    dl.retain(|d| d.ecid != 2);
+    let gone = UpdateData::default();
+    let p = st.reply(&dl, &gone, true);
+    assert_eq!(removed(&p), [2, 3]);
+    assert!(files(&p).is_empty());
+    let p = st.reply(&dl, &gone, true);
+    assert!(removed(&p).is_empty());
+    // Without it, as before: bare ECIDs, and no removals.
+    let mut legacy = UpdateState::default();
+    legacy.reply(&dl, &data, false);
+    let p = legacy.reply(&dl, &data, false);
+    assert_eq!(files(&p), [3, 5]);
+    let p = legacy.reply(&[], &UpdateData::default(), false);
+    assert!(removed(&p).is_empty());
 }

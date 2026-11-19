@@ -522,6 +522,24 @@ impl PartFile {
 
     // ---- settings ----
 
+    /// `SetDownPriority` / `SetAutoDownPriority`: a `PR_*` value, or
+    /// automatic (which starts high, as aMule loads `PR_AUTO`).
+    pub fn set_down_priority(&mut self, prio: u32, auto: bool) {
+        if self.info.down_priority != prio || self.info.auto_down_priority != auto {
+            self.info.down_priority = prio;
+            self.info.auto_down_priority = auto;
+            self.dirty = true;
+        }
+    }
+
+    /// `SetCategory`.
+    pub fn set_category(&mut self, category: u32) {
+        if self.info.category != category {
+            self.info.category = category;
+            self.dirty = true;
+        }
+    }
+
     pub fn set_paused(&mut self, paused: bool) {
         if self.info.paused != paused {
             self.info.paused = paused;

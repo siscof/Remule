@@ -347,6 +347,7 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
     let history = std::sync::Mutex::new(crate::graphs::History::new());
     let mut cv = ec::ConnView {
         log: crate::applog::global().cursor(),
+        partial: false,
         update: Default::default(),
         prefs: &prefs,
         history: &history,
@@ -821,6 +822,34 @@ async fn an_ec_client_adds_pauses_and_cancels_a_download() {
             q.tags[0].child_int(EC_TAG_PARTFILE_STATUS) == u64::from(ec::ps::EMPTY)
         });
         assert!(!remule_core::PartFile::open(&met).unwrap().is_paused());
+        // Priority high: shown at once, kept in the met.
+        let prio = |v: u64| {
+            Packet::new(EC_OP_PARTFILE_PRIO_SET)
+                .with(target().with(Tag::int(EC_TAG_PARTFILE_PRIO, v)))
+        };
+        assert_eq!(ask(prio(2)).opcode, EC_OP_NOOP);
+        queue_until(&mut ask, &|q| {
+            q.tags[0].child_int(EC_TAG_PARTFILE_PRIO) == 2
+        });
+        assert_eq!(
+            remule_core::PartFile::open(&met)
+                .unwrap()
+                .info()
+                .down_priority,
+            2
+        );
+        // Automatic: sent back as high plus 10.
+        assert_eq!(ask(prio(5)).opcode, EC_OP_NOOP);
+        queue_until(&mut ask, &|q| {
+            q.tags[0].child_int(EC_TAG_PARTFILE_PRIO) == 12
+        });
+        // The one category there is, and one there is not.
+        let cat = |v: u64| {
+            Packet::new(EC_OP_PARTFILE_SET_CAT)
+                .with(target().with(Tag::int(EC_TAG_PARTFILE_CAT, v)))
+        };
+        assert_eq!(ask(cat(0)).opcode, EC_OP_NOOP);
+        assert_eq!(ask(cat(3)).message().unwrap(), "No such category: 3");
         // Cancelled: gone from the queue and the disk.
         assert_eq!(
             ask(Packet::new(EC_OP_PARTFILE_DELETE).with(target())).opcode,
@@ -855,6 +884,7 @@ async fn the_log_is_read_as_amules_is() {
     let history = std::sync::Mutex::new(crate::graphs::History::new());
     let mut cv = ec::ConnView {
         log: log.cursor(),
+        partial: false,
         update: Default::default(),
         prefs: &prefs,
         history: &history,

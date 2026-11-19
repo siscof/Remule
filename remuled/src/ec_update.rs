@@ -109,6 +109,9 @@ pub struct UpdateData {
 pub struct UpdateState {
     maps: HashMap<u32, ValueMap>,
     encoders: HashMap<u32, FileEncoder>,
+    /// The files alive at the last update (`m_lastSentFileIds`), for the
+    /// partial-update protocol's removals.
+    last_sent: Vec<u32>,
 }
 
 /// `CEC_Server_Tag(server, valuemap)`: every field, by ECID.
@@ -143,7 +146,11 @@ impl UpdateState {
     /// there"), then the clients (none are tracked yet), the servers and
     /// the friends (none). A file seen for the first time starts from
     /// nothing; one gone is forgotten.
-    pub fn reply(&mut self, downloads: &[Download], data: &UpdateData) -> Packet {
+    ///
+    /// With the partial-update protocol (`partial`), a file with nothing new
+    /// is left out instead, and each file of the last update that is gone
+    /// is named with `EC_TAG_FILE_REMOVED`.
+    pub fn reply(&mut self, downloads: &[Download], data: &UpdateData, partial: bool) -> Packet {
         enum Obj<'a> {
             Download(&'a Download),
             Shared(&'a SharedBase),
@@ -190,7 +197,17 @@ impl UpdateState {
                     EC_DETAIL_INC_UPDATE,
                 )),
             };
+            if partial && t.children.is_empty() {
+                continue;
+            }
             p = p.with(t);
+        }
+        if partial {
+            let current: Vec<u32> = files.iter().map(|(id, _)| *id).collect();
+            for gone in self.last_sent.iter().filter(|id| !current.contains(id)) {
+                p = p.with(Tag::int(EC_TAG_FILE_REMOVED, (*gone).into()));
+            }
+            self.last_sent = current;
         }
         p = p.with(Tag::empty(EC_TAG_CLIENT));
         let mut servers = Tag::empty(EC_TAG_SERVER);

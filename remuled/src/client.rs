@@ -971,21 +971,17 @@ pub async fn run(
                         };
                         if r.is_ok() {
                             let name = names.get(&file).cloned().unwrap_or_else(|| file.to_string());
+                            let t = start.elapsed().as_secs();
                             match op {
-                                FileOp::Pause | FileOp::Stop => { paused.insert(file); }
-                                FileOp::Resume => { paused.remove(&file); }
+                                FileOp::Pause => { paused.insert(file); info!("[{t:>5}s] {name}: paused"); }
+                                FileOp::Stop => { paused.insert(file); info!("[{t:>5}s] {name}: stopped"); }
+                                FileOp::Resume => { paused.remove(&file); info!("[{t:>5}s] {name}: resumed"); }
                                 FileOp::Delete => {
                                     paused.remove(&file);
                                     wanted.retain(|(h, _)| *h != file);
-                                    info!("[{:>5}s] {name}: cancelled", start.elapsed().as_secs());
+                                    info!("[{t:>5}s] {name}: cancelled");
                                 }
-                            }
-                            if op != FileOp::Delete {
-                                info!("[{:>5}s] {name}: {}", start.elapsed().as_secs(), match op {
-                                    FileOp::Pause => "paused",
-                                    FileOp::Stop => "stopped",
-                                    _ => "resumed",
-                                });
+                                FileOp::Priority { .. } | FileOp::Category(_) => {}
                             }
                         }
                         let _ = reply.send(r);

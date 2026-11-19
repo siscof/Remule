@@ -23,3 +23,4 @@
 46-sse-session-end.sh
 48-cross-origin-writes.sh
 50-proxy-auth.sh
+06-read-logs.sh

@@ -541,14 +541,28 @@ async fn partfile_cmd(
     s: &Status,
     control: &mpsc::UnboundedSender<Control>,
 ) -> Packet {
-    let op = match req.opcode {
-        EC_OP_PARTFILE_PAUSE => FileOp::Pause,
-        EC_OP_PARTFILE_RESUME => FileOp::Resume,
-        EC_OP_PARTFILE_STOP => FileOp::Stop,
-        _ => FileOp::Delete,
-    };
     let mut response: Option<Packet> = None;
     for t in &req.tags {
+        // The priority or category is the target's first child.
+        let first = || t.children.first().map_or(0, Tag::as_int);
+        let op = match req.opcode {
+            EC_OP_PARTFILE_PAUSE => FileOp::Pause,
+            EC_OP_PARTFILE_RESUME => FileOp::Resume,
+            EC_OP_PARTFILE_STOP => FileOp::Stop,
+            EC_OP_PARTFILE_PRIO_SET => match first() as u32 {
+                // PR_AUTO: automatic, starting high.
+                5 => FileOp::Priority {
+                    prio: 2,
+                    auto: true,
+                },
+                p => FileOp::Priority {
+                    prio: p,
+                    auto: false,
+                },
+            },
+            EC_OP_PARTFILE_SET_CAT => FileOp::Category(first() as u32),
+            _ => FileOp::Delete,
+        };
         if t.name != EC_TAG_PARTFILE || t.ty != EC_TAGTYPE_HASH16 {
             return failed("Invalid partfile command target.");
         }
@@ -564,6 +578,13 @@ async fn partfile_cmd(
         if let Some(id) = t.child(EC_TAG_ECID) {
             if !id.is_int() || id.as_int() != u64::from(d.ecid) {
                 return failed("The selected download has changed. Refresh and try again.");
+            }
+        }
+        // Only the one category there is, as aMule keeps none of its own.
+        if let FileOp::Category(c) = op {
+            if c >= 1 {
+                response.get_or_insert_with(|| failed(&format!("No such category: {c}")));
+                continue;
             }
         }
         if op == FileOp::Delete {
@@ -624,7 +645,7 @@ pub async fn answer(
                 Ok(()) => rx.await.unwrap_or_default(),
                 Err(_) => Default::default(),
             };
-            (conn.update.reply(&s.downloads, &data), false)
+            (conn.update.reply(&s.downloads, &data, conn.partial), false)
         }
         EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
         EC_OP_GET_STATSTREE => {
@@ -725,7 +746,9 @@ pub async fn answer(
         EC_OP_PARTFILE_PAUSE
         | EC_OP_PARTFILE_RESUME
         | EC_OP_PARTFILE_STOP
-        | EC_OP_PARTFILE_DELETE => (partfile_cmd(req, s, control).await, false),
+        | EC_OP_PARTFILE_DELETE
+        | EC_OP_PARTFILE_PRIO_SET
+        | EC_OP_PARTFILE_SET_CAT => (partfile_cmd(req, s, control).await, false),
         op if crate::ec_servers::is_server_request(op) => {
             (crate::ec_servers::ask(req, control).await, false)
         }
@@ -835,6 +858,8 @@ fn changes_downloads(opcode: u8) -> bool {
             | EC_OP_PARTFILE_RESUME
             | EC_OP_PARTFILE_STOP
             | EC_OP_PARTFILE_DELETE
+            | EC_OP_PARTFILE_PRIO_SET
+            | EC_OP_PARTFILE_SET_CAT
             | EC_OP_DOWNLOAD_SEARCH_RESULT
     )
 }
@@ -856,6 +881,8 @@ pub const LOG_LINES_PER_MESSAGE: usize = 5000;
 pub struct ConnView<'a> {
     /// What it has read of the log.
     pub log: crate::applog::Cursor,
+    /// It speaks the partial-update protocol.
+    pub partial: bool,
     /// What it was sent of each object, for incremental updates.
     pub update: crate::ec_update::UpdateState,
     pub prefs: &'a crate::ec_update::EcPrefs,
@@ -876,6 +903,7 @@ async fn connection(
     let mut conn = ServerConn::new(peer);
     let mut cv = ConnView {
         log: crate::applog::global().cursor(),
+        partial: false,
         update: Default::default(),
         prefs: sh.prefs,
         history: sh.history,
@@ -907,6 +935,7 @@ async fn connection(
             Received::Request(req) => {
                 let down = sh.shutting_down.load(Ordering::SeqCst);
                 let view = status.borrow_and_update().clone();
+                cv.partial = conn.partial_update();
                 let (reply, stops) = answer(&req, &view, down, &control, &mut cv).await;
                 // A change to the downloads is answered once the view shows
                 // it, as aMule's are: what the client asks next sees it.

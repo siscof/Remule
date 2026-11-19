@@ -47,9 +47,12 @@ fn unescape(s: &str) -> String {
 /// Parse an `ed2k://|file|...` link.
 pub fn parse(link: &str) -> Result<FileLink, String> {
     let bad = |why: &str| format!("{link:?}: {why}");
-    let rest = link
-        .trim()
-        .strip_prefix("ed2k://")
+    // The scheme in any case, as aMule takes it.
+    let link_t = link.trim();
+    let rest = link_t
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("ed2k://"))
+        .map(|_| &link_t[7..])
         .ok_or_else(|| bad("not an ed2k:// link"))?;
     let fields: Vec<&str> = rest.split('|').collect();
     if fields.len() < 5 || !fields[0].is_empty() || !fields[1].eq_ignore_ascii_case("file") {
@@ -171,6 +174,14 @@ pub fn magnet_to_ed2k(uri: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_scheme_is_read_in_any_case() {
+        let h = "3f1c2a9d8e7b6a5f4e3d2c1b0a998866";
+        let l = super::parse(&format!("ED2K://|FILE|x.bin|5|{h}|/")).unwrap();
+        assert_eq!((l.name.as_str(), l.size), ("x.bin", 5));
+        assert!(super::parse("ED2:/|file|x|5|y|/").is_err());
+    }
+
     #[test]
     fn magnets_with_an_ed2k_hash_become_ed2k_links() {
         use super::magnet_to_ed2k as m;

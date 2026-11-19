@@ -107,17 +107,17 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc gcc-c++ make cmake git curl tar gzip python3 procps-ng \
-            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth
+            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth             jq iproute
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Cache amulecmd and amulegui
+      - name: Cache amulecmd, amulegui and amuleapi
         id: amulecmd-cache
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-amulegui-fedora-${{ env.AMULE_REF }}
-      - name: Build amulecmd and amulegui
+          key: amulecmd-amulegui-amuleapi-fedora-${{ env.AMULE_REF }}
+      - name: Build amulecmd, amulegui and amuleapi
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
           git init -q /tmp/amule-src
@@ -125,14 +125,20 @@ jobs:
           git fetch -q --depth 1 https://github.com/amule-org/amule.git "$AMULE_REF"
           git checkout -q FETCH_HEAD
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_MONOLITHIC=NO -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES \
+            -DBUILD_MONOLITHIC=NO -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES -DBUILD_AMULEAPI=YES \
             -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
             -DENABLE_MEDIA_PROBE=OFF -DENABLE_VERSION_CHECK=OFF -DENABLE_BFD=NO \
             -DTRANSLATED_MANPAGES=NO
-          cmake --build build --target amulecmd amulegui -j "$(nproc)"
+          cmake --build build --target amulecmd amulegui amuleapi -j "$(nproc)"
           mkdir -p /opt/amulecmd
           cp "$(find build -type f -name amulecmd -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amulegui -perm -u+x | head -1)" /opt/amulecmd/
+          cp "$(find build -type f -name amuleapi -perm -u+x | head -1)" /opt/amulecmd/
+          # amuleapi's curl suite and static frontend, where run-all.sh
+          # looks for them (it climbs three levels from its own folder).
+          mkdir -p /opt/amulecmd/tree/unittests /opt/amulecmd/tree/src/webapi
+          cp -R unittests/curl-tests /opt/amulecmd/tree/unittests/
+          cp -R src/webapi/static /opt/amulecmd/tree/src/webapi/
       - name: Build remuled
         run: cargo build --release -p remuled
       - name: amulecmd drives remuled
@@ -144,3 +150,10 @@ jobs:
         env:
           AMULECMD: /opt/amulecmd/amulecmd
           AMULEGUI: /opt/amulecmd/amulegui
+      # MIGRATION_PLAN.md 12.1: the unmodified amuleapi in front of remuled,
+      # tested with aMule's own curl suite.
+      - name: amuleapi's curl suite against remuled
+        run: bash scripts/interop/amuleapi-on-remuled.sh
+        env:
+          AMULEAPI: /opt/amulecmd/amuleapi
+          SUITE: /opt/amulecmd/tree/unittests/curl-tests/amuleapi

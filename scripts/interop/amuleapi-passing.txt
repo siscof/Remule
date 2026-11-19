@@ -1,0 +1,2 @@
+# Phases of aMule's amuleapi curl suite that pass against remuled
+# (scripts/interop/amuleapi-on-remuled.sh), one per line.

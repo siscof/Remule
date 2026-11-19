@@ -335,6 +335,10 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     let _ = reply.send(Default::default());
                     seen.push("update".to_string());
                 }
+                Control::StatsTree(reply) => {
+                    let _ = reply.send(Default::default());
+                    seen.push("stats tree".to_string());
+                }
             }
         }
         seen
@@ -345,6 +349,7 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
         update: Default::default(),
         prefs: &prefs,
         history: &history,
+        version: "remuled test",
     };
     let (r, stops) = ec::answer(&req, s, shutting_down, &tx, &mut cv).await;
     drop(tx);
@@ -372,7 +377,7 @@ async fn requests_are_answered_as_process_request2_does() {
     .await;
     assert_eq!(r.opcode, EC_OP_MISC_DATA);
     assert_eq!(r.tags[0].name, EC_TAG_CONNSTATE);
-    let (r, ..) = ask(Packet::new(EC_OP_GET_STATSTREE), &s, false).await;
+    let (r, ..) = ask(Packet::new(EC_OP_GET_CHAT_SESSIONS), &s, false).await;
     assert_eq!(r.opcode, EC_OP_FAILED);
     assert_eq!(
         r.message().unwrap(),

@@ -162,6 +162,8 @@ echo "ok: a wrong password is refused"
 
 expect 10 "127\.0\.0\.1:$SERVER_PORT|127\.0\.0\.1.*$SERVER_PORT" show servers
 expect 60 "interop shared file\.bin" show shared
+# The statistics tree, as amulecmd prints it.
+expect 10 "Number of Shared Files: 1" statistics
 
 # A download from a link: listed, paused, resumed, cancelled.
 HASH=0123456789ABCDEF0123456789ABCDEF

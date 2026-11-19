@@ -27,3 +27,4 @@
 13-downloads-delete-clear.sh
 23-sse-replay.sh
 47-shared-delete.sh
+12-downloads-add-patch.sh

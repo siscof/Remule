@@ -346,6 +346,7 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
     let prefs = crate::ec_update::EcPrefs::default();
     let history = std::sync::Mutex::new(crate::graphs::History::new());
     let mut cv = ec::ConnView {
+        log: crate::applog::global().cursor(),
         update: Default::default(),
         prefs: &prefs,
         history: &history,
@@ -767,9 +768,10 @@ async fn an_ec_client_adds_pauses_and_cancels_a_download() {
     tokio::task::spawn_blocking(move || {
         let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
         let mut ask = |p: Packet| c.request(&p).unwrap();
-        // The queue as `show dl` asks for it, once it says what we expect.
+        // The queue as `show dl` asks for it, right after the change: a
+        // change is answered once the view shows it.
         let queue_until = |ask: &mut dyn FnMut(Packet) -> Packet, ok: &dyn Fn(&Packet) -> bool| {
-            for _ in 0..50 {
+            for _ in 0..1 {
                 let q = ask(Packet::new(EC_OP_GET_DLOAD_QUEUE));
                 if ok(&q) {
                     return q;
@@ -839,4 +841,80 @@ async fn an_ec_client_adds_pauses_and_cancels_a_download() {
         .expect("the daemon did not stop")
         .unwrap()
         .unwrap();
+}
+
+/// The log over EC: new lines on the GUI's stats poll, the whole log, the
+/// last line, a reset; the server's messages.
+#[tokio::test]
+async fn the_log_is_read_as_amules_is() {
+    let log = crate::applog::global();
+    let s = busy();
+    log.push(tracing::Level::INFO, "an EC log test line");
+    // One connection's view: what is new, once.
+    let prefs = crate::ec_update::EcPrefs::default();
+    let history = std::sync::Mutex::new(crate::graphs::History::new());
+    let mut cv = ec::ConnView {
+        log: log.cursor(),
+        update: Default::default(),
+        prefs: &prefs,
+        history: &history,
+        version: "remuled test",
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let stats = || Packet::new(EC_OP_STAT_REQ).with_detail(EC_DETAIL_INC_UPDATE);
+    let (r, _) = ec::answer(&stats(), &s, false, &tx, &mut cv).await;
+    let lines = r.tag(EC_TAG_STATS_LOGGER_MESSAGE).expect("the new lines");
+    assert!(lines
+        .children
+        .iter()
+        .any(|l| l.as_str().ends_with("INFO  an EC log test line\n")));
+    assert_eq!(
+        r.tags[3].name, EC_TAG_STATS_LOGGER_MESSAGE,
+        "after the banned count"
+    );
+    let (r, _) = ec::answer(&stats(), &s, false, &tx, &mut cv).await;
+    assert!(r.tag(EC_TAG_STATS_LOGGER_MESSAGE).is_none(), "nothing new");
+    // amulecmd's level gets none.
+    log.push(tracing::Level::INFO, "another");
+    let (r, _) = ec::answer(
+        &Packet::new(EC_OP_STAT_REQ).with_detail(EC_DETAIL_CMD),
+        &s,
+        false,
+        &tx,
+        &mut cv,
+    )
+    .await;
+    assert!(r.tag(EC_TAG_STATS_LOGGER_MESSAGE).is_none());
+
+    let (r, ..) = ask(Packet::new(EC_OP_GET_LOG), &s, false).await;
+    assert_eq!(r.opcode, EC_OP_LOG);
+    assert!(r.message().unwrap().contains("an EC log test line\n"));
+    let (r, ..) = ask(Packet::new(EC_OP_GET_LAST_LOG_ENTRY), &s, false).await;
+    assert!(r.message().unwrap().ends_with("INFO  another"), "{r:?}");
+    let (r, ..) = ask(
+        Packet::new(EC_OP_ADDLOGLINE)
+            .with(Tag::string(EC_TAG_STRING, "from a client"))
+            .with(Tag::empty(EC_TAG_LOG_TO_STATUS)),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert!(log.text().contains("!") && log.text().contains("WARN  from a client"));
+
+    log.server_message("hello from the server");
+    let (r, ..) = ask(Packet::new(EC_OP_GET_SERVERINFO), &s, false).await;
+    assert_eq!(r.opcode, EC_OP_SERVERINFO);
+    assert!(r.message().unwrap().contains("hello from the server\n"));
+    let (r, ..) = ask(Packet::new(EC_OP_CLEAR_SERVERINFO), &s, false).await;
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    let (r, ..) = ask(Packet::new(EC_OP_GET_SERVERINFO), &s, false).await;
+    assert_eq!(r.message().unwrap(), "");
+
+    // A reset: the log starts over, and this connection with it.
+    let (r, ..) = ask(Packet::new(EC_OP_RESET_LOG), &s, false).await;
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    let (r, _) = ec::answer(&stats(), &s, false, &tx, &mut cv).await;
+    let lines = r.tag(EC_TAG_STATS_LOGGER_MESSAGE).unwrap();
+    assert!(lines.children[0].as_str().ends_with("Log has been reset\n"));
 }

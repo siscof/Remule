@@ -542,11 +542,13 @@ impl ServerConn {
             if self.my_flags & EC_FLAG_LARGE_TAG_COUNT != 0 {
                 ok = ok.with(Tag::empty(EC_TAG_CAN_LARGE_TAG_COUNT));
             }
-            // The capabilities that advertise requests (partial updates,
-            // multi-search, chat, client history, shared dirs, search list,
-            // Kad lookups, search-all, metadata) are echoed once those
-            // requests are served: a client that sees one sends them.
-            return ok.with(Tag::int(EC_TAG_SESSION_ID, id.session_id));
+            ok = ok.with(Tag::int(EC_TAG_SESSION_ID, id.session_id));
+            // `EC_OP_KNOWNFILE_DELETE` is served. The other capabilities
+            // that advertise requests (partial updates, multi-search, chat,
+            // client history, shared dirs, search list, Kad lookups,
+            // search-all, metadata) are echoed once those requests are
+            // served: a client that sees one sends them.
+            return ok.with(Tag::empty(EC_TAG_CAN_DELETE_COMPLETE));
         }
         if present && proof.is_none() {
             return auth_failure(EC_AUTH_FAIL_INCOMPATIBLE, INVALID_HANDSHAKE);

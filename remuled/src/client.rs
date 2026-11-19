@@ -865,6 +865,7 @@ pub async fn run(
             ev = async { match &mut server { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
                 match ev {
                     Some(ServerEvent::SearchResults { results, .. }) => searches.server_results(results),
+                    Some(ServerEvent::Message(m)) => crate::applog::global().server_message(&m),
                     Some(ServerEvent::FoundSources { hash, sources }) => {
                         let eps: Vec<Endpoint> = sources.iter().filter_map(Endpoint::from_server).collect();
                         info!("[{:>5}s] server: {} sources ({} reachable) for {}",

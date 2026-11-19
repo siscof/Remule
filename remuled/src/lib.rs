@@ -11,6 +11,7 @@
 //! * [`http`]: one file over HTTP(S).
 //! * [`server_conn`]: which eD2k server to log into next, and when.
 //! * [`stats`]: the transfer statistics in `statistics.dat` and in the log.
+//! * [`graphs`]: the history the statistics graphs are drawn from.
 //! * [`ec`]: external connections, for `amulecmd` and `amulegui`.
 //! * [`ec_search`]: searches over external connections.
 //! * [`ec_servers`]: the server list and the networks over them.
@@ -26,6 +27,7 @@ pub mod ec_servers;
 pub mod ec_shared;
 pub mod ec_update;
 pub mod firewall;
+pub mod graphs;
 pub mod http;
 pub mod kad;
 pub mod server_conn;
@@ -47,5 +49,7 @@ mod tests_ec_shared;
 mod tests_ec_update;
 #[cfg(test)]
 mod tests_firewall;
+#[cfg(test)]
+mod tests_graphs;
 #[cfg(test)]
 mod tests_server_conn;

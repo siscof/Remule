@@ -752,6 +752,8 @@ pub async fn run(
     // External connections: a view of the client, refreshed every second,
     // and what they ask of it.
     let mut ec_view: Option<watch::Sender<Status>> = None;
+    // What the statistics graphs show, a record a second.
+    let history = Arc::new(Mutex::new(crate::graphs::History::new()));
     let mut ec_control: Option<mpsc::UnboundedReceiver<Control>> = None;
     if let Some(e) = &c.ec {
         if let Some(l) = ec::listen(e).await {
@@ -761,7 +763,14 @@ pub async fn run(
                 version: concat!("remuled ", env!("CARGO_PKG_VERSION")).into(),
                 session_id: rand::random(),
             };
-            tokio::spawn(ec::serve(l, e.clone(), identity, rx, ctl_tx));
+            tokio::spawn(ec::serve(
+                l,
+                e.clone(),
+                identity,
+                rx,
+                ctl_tx,
+                history.clone(),
+            ));
             ec_view = Some(tx);
             ec_control = Some(ctl_rx);
         }
@@ -1163,6 +1172,19 @@ pub async fn run(
                                 },
                                 shared: shares.as_ref().map_or(0, |s| s.lock().unwrap_or_else(|e| e.into_inner()).shared_count()),
                                 now,
+                            });
+                            history.lock().unwrap_or_else(|e| e.into_inner()).record(crate::graphs::Record {
+                                kbytes_sent: status.session_sent as f64 / 1024.0,
+                                kbytes_received: status.session_received as f64 / 1024.0,
+                                kbps_up: status.ul_speed as f32 / 1024.0,
+                                kbps_down: status.dl_speed as f32 / 1024.0,
+                                timestamp: statistics.uptime(now).as_secs_f64(),
+                                downloads: status.downloads.iter().map(|d| d.transferring).sum::<u32>().min(u16::MAX.into()) as u16,
+                                // Uploads are not counted per second yet.
+                                uploads: 0,
+                                connections: status.connections.min(u16::MAX.into()) as u16,
+                                kad_nodes: status.kad.as_ref().map_or(0, |k| k.nodes).min(u16::MAX.into()) as u16,
+                                kad_nodes_total: 0,
                             });
                             view.send_replace(status);
                         }

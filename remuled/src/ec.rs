@@ -625,6 +625,10 @@ pub async fn answer(
             (conn.update.reply(&s.downloads, &data), false)
         }
         EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
+        EC_OP_GET_STATSGRAPHS => {
+            let h = conn.history.lock().unwrap_or_else(|e| e.into_inner());
+            (crate::graphs::graphs_reply(req, &h), false)
+        }
         EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),
         EC_OP_SHUTDOWN => {
             let _ = control.send(Control::Shutdown);
@@ -702,6 +706,7 @@ pub async fn serve(
     identity: Identity,
     status: watch::Receiver<Status>,
     control: mpsc::UnboundedSender<Control>,
+    history: Arc<Mutex<crate::graphs::History>>,
 ) {
     let limiter = Arc::new(Mutex::new(AuthLimiter::new(settings.limits)));
     let creds = Arc::new(settings.credentials);
@@ -720,6 +725,7 @@ pub async fn serve(
         let _ = stream.set_nodelay(true);
         info!("New external connection accepted");
         let prefs = prefs.clone();
+        let history = history.clone();
         let (limiter, creds, identity, status, control, down) = (
             limiter.clone(),
             creds.clone(),
@@ -735,6 +741,7 @@ pub async fn serve(
                 limiter: &limiter,
                 shutting_down: &down,
                 prefs: &prefs,
+                history: &history,
             };
             let why = connection(stream, peer.ip(), shared, status, control).await;
             debug!("EC {peer}: {why}");
@@ -750,6 +757,7 @@ struct Shared<'a> {
     limiter: &'a Mutex<AuthLimiter>,
     shutting_down: &'a AtomicBool,
     prefs: &'a crate::ec_update::EcPrefs,
+    history: &'a Mutex<crate::graphs::History>,
 }
 
 /// What one connection keeps between its requests.
@@ -757,6 +765,8 @@ pub struct ConnView<'a> {
     /// What it was sent of each object, for incremental updates.
     pub update: crate::ec_update::UpdateState,
     pub prefs: &'a crate::ec_update::EcPrefs,
+    /// The statistics graphs' history.
+    pub history: &'a Mutex<crate::graphs::History>,
 }
 
 /// One connection, until it closes; returns why.
@@ -771,6 +781,7 @@ async fn connection(
     let mut cv = ConnView {
         update: Default::default(),
         prefs: sh.prefs,
+        history: sh.history,
     };
     loop {
         let mut header = [0u8; 8];

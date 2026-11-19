@@ -91,6 +91,19 @@ impl Tag {
         }
     }
 
+    /// A double, as the decimal string it travels as (`CECTag(name,
+    /// double)`); the shortest form that reads back the same value.
+    pub fn double(name: u16, v: f64) -> Self {
+        let mut data = format!("{v}").into_bytes();
+        data.push(0);
+        Tag {
+            name,
+            ty: EC_TAGTYPE_DOUBLE,
+            data,
+            children: Vec::new(),
+        }
+    }
+
     /// A 16-byte MD4 hash, network order.
     pub fn hash(name: u16, h: [u8; 16]) -> Self {
         Tag {

@@ -340,9 +340,11 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
         seen
     });
     let prefs = crate::ec_update::EcPrefs::default();
+    let history = std::sync::Mutex::new(crate::graphs::History::new());
     let mut cv = ec::ConnView {
         update: Default::default(),
         prefs: &prefs,
+        history: &history,
     };
     let (r, stops) = ec::answer(&req, s, shutting_down, &tx, &mut cv).await;
     drop(tx);
@@ -370,7 +372,7 @@ async fn requests_are_answered_as_process_request2_does() {
     .await;
     assert_eq!(r.opcode, EC_OP_MISC_DATA);
     assert_eq!(r.tags[0].name, EC_TAG_CONNSTATE);
-    let (r, ..) = ask(Packet::new(EC_OP_GET_STATSGRAPHS), &s, false).await;
+    let (r, ..) = ask(Packet::new(EC_OP_GET_STATSTREE), &s, false).await;
     assert_eq!(r.opcode, EC_OP_FAILED);
     assert_eq!(
         r.message().unwrap(),

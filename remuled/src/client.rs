@@ -451,6 +451,22 @@ fn add_link(
     wanted: &[(Md4Hash, u64)],
     shares: Option<&Arc<Mutex<SharedFiles>>>,
 ) -> Option<Added> {
+    // `AddLink`: a magnet with an ed2k hash is taken as its ed2k link.
+    let converted;
+    let link = if remule_core::link::is_magnet(link) {
+        match remule_core::link::magnet_to_ed2k(link) {
+            Some(l) => {
+                converted = l;
+                converted.as_str()
+            }
+            None => {
+                warn!("Cannot convert magnet link to eD2k: {link}");
+                return None;
+            }
+        }
+    } else {
+        link
+    };
     if !link
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("ed2k://"))

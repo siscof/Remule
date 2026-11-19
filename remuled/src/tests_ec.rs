@@ -858,6 +858,19 @@ async fn an_ec_client_adds_pauses_and_cancels_a_download() {
         queue_until(&mut ask, &|q| q.tags.is_empty());
         assert!(!met.exists());
         assert!(!temp2.join("001.part").exists());
+        // A magnet with an ed2k hash, as amuleapi passes it on.
+        let magnet = format!(
+            "magnet:?xt=urn:ed2k:{}&xl=4096&dn=magnet%20file.bin",
+            "AB".repeat(16)
+        );
+        assert_eq!(ask(add(&magnet)).opcode, EC_OP_NOOP);
+        queue_until(&mut ask, &|q| {
+            q.tags.len() == 1 && q.tags[0].child_str(EC_TAG_PARTFILE_NAME) == "magnet file.bin"
+        });
+        assert_eq!(
+            ask(add("magnet:?xt=urn:btih:abc&xl=1")).message().unwrap(),
+            "Invalid link or already on list."
+        );
         // An unknown one now.
         let r = ask(Packet::new(EC_OP_PARTFILE_PAUSE).with(target()));
         assert_eq!(r.message().unwrap(), format!("FileHash not found: {hash}"));

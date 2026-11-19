@@ -192,6 +192,15 @@ pub enum SharedRequest {
     },
     /// The configured folders.
     Dirs(oneshot::Sender<SharedDirs>),
+    /// `DeleteFileFromDisk`: a complete shared file off the disk and out
+    /// of the list, if it is still the one the client saw.
+    Delete {
+        hash: Md4Hash,
+        ecid: u32,
+        dir: String,
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Ask the client; `None` when it is gone.
@@ -273,6 +282,44 @@ pub async fn answer(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> O
             Some(d) => shared_dirs_reply(&d),
             None => gone(),
         },
+        EC_OP_KNOWNFILE_DELETE => {
+            let failed = |m: &str| Packet::new(EC_OP_FAILED).with(Tag::string(EC_TAG_STRING, m));
+            let hash = req
+                .tag(EC_TAG_KNOWNFILE)
+                .filter(|t| t.ty == EC_TAGTYPE_HASH16)
+                .and_then(Tag::as_hash);
+            let ecid = req
+                .tag(EC_TAG_ECID)
+                .filter(|t| t.is_int())
+                .map(Tag::as_int)
+                .filter(|&e| e != 0 && e <= u64::from(u32::MAX));
+            let text = |name: u16| {
+                req.tag(name)
+                    .filter(|t| t.ty == EC_TAGTYPE_STRING)
+                    .map(Tag::as_str)
+            };
+            let (Some(hash), Some(ecid), Some(dir), Some(name)) = (
+                hash,
+                ecid,
+                text(EC_TAG_KNOWNFILE_PATH),
+                text(EC_TAG_PARTFILE_NAME),
+            ) else {
+                return Some(failed("Invalid complete-file deletion target."));
+            };
+            let r = ask(control, |reply| SharedRequest::Delete {
+                hash: Md4Hash(hash),
+                ecid: ecid as u32,
+                dir,
+                name,
+                reply,
+            })
+            .await;
+            match r {
+                Some(Ok(())) => Packet::new(EC_OP_NOOP),
+                Some(Err(e)) => failed(&e),
+                None => gone(),
+            }
+        }
         _ => return None,
     })
 }
@@ -327,6 +374,19 @@ impl SharedState {
                 }
                 let _ = reply.send(());
             }
+            SharedRequest::Delete {
+                hash,
+                ecid,
+                dir,
+                name,
+                reply,
+            } => {
+                let r = match shares {
+                    Some(s) => self.delete(s, hash, ecid, &dir, &name),
+                    None => Err(CHANGED.into()),
+                };
+                let _ = reply.send(r);
+            }
             SharedRequest::Dirs(reply) => {
                 let d = crate::config::shared_dir_intents(config);
                 let _ = reply.send(SharedDirs {
@@ -335,6 +395,45 @@ impl SharedState {
                 });
             }
         }
+    }
+
+    /// `DeleteFileFromDisk`: only the file the client saw (its hash, ECID,
+    /// folder and name), and only once it is gone from the disk is it
+    /// taken out of the list.
+    fn delete(
+        &mut self,
+        shares: &Mutex<SharedFiles>,
+        hash: Md4Hash,
+        ecid: u32,
+        dir: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let mut s = shares.lock().unwrap_or_else(|e| e.into_inner());
+        let path = match s.get(&hash) {
+            Some((f, path))
+                if self.ids.get(&hash) == Some(&ecid)
+                    && f.name == name
+                    && path.parent().map(|p| p.display().to_string()).as_deref() == Some(dir) =>
+            {
+                path.to_path_buf()
+            }
+            _ => {
+                warn!("{CHANGED}");
+                return Err(CHANGED.into());
+            }
+        };
+        if let Err(e) = std::fs::remove_file(&path) {
+            // A failed removal is no proof the file is still there.
+            if path.exists() || e.kind() != std::io::ErrorKind::NotFound {
+                let msg = format!("Could not delete '{}' from disk.", path.display());
+                warn!("{msg}");
+                return Err(msg);
+            }
+        }
+        s.unshare(&hash);
+        self.ids.remove(&hash);
+        info!("Deleted '{}' from disk.", path.display());
+        Ok(())
     }
 
     /// The shared files as EC tells them, each with its ECID (kept while
@@ -376,6 +475,8 @@ impl SharedState {
         });
     }
 }
+
+const CHANGED: &str = "The selected file has changed or is not a complete file.";
 
 /// `SetAutoUpPriority` / `SetUpPriority`. Automatic starts as
 /// `UpdateAutoUpPriority` puts a file nobody is queued for: high.

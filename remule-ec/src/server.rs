@@ -171,6 +171,8 @@ pub struct ServerConn {
     seal_after_next: bool,
     srp: Option<(srp::Server, u8)>,
     notify: bool,
+    /// `m_partialUpdateActive`.
+    partial_update: bool,
     client: Option<(String, String)>,
     log: Vec<String>,
 }
@@ -251,6 +253,7 @@ impl ServerConn {
             seal_after_next: false,
             srp: None,
             notify: false,
+            partial_update: false,
             client: None,
             log: Vec::new(),
         }
@@ -271,6 +274,13 @@ impl ServerConn {
     /// The client's name and version, once it said them.
     pub fn client(&self) -> Option<&(String, String)> {
         self.client.as_ref()
+    }
+
+    /// Whether the client speaks the partial-update protocol
+    /// (`EC_TAG_CAN_PARTIAL_UPDATE`): unchanged files are left out of
+    /// incremental updates, and removed ones named.
+    pub fn partial_update(&self) -> bool {
+        self.partial_update
     }
 
     /// Whether the client asked for push notifications (`EC_TAG_CAN_NOTIFY`).
@@ -466,6 +476,7 @@ impl ServerConn {
             self.my_flags |= EC_FLAG_LARGE_TAG_COUNT;
         }
         self.notify = req.tag(EC_TAG_CAN_NOTIFY).is_some();
+        self.partial_update = req.tag(EC_TAG_CAN_PARTIAL_UPDATE).is_some();
         response
     }
 
@@ -542,11 +553,17 @@ impl ServerConn {
             if self.my_flags & EC_FLAG_LARGE_TAG_COUNT != 0 {
                 ok = ok.with(Tag::empty(EC_TAG_CAN_LARGE_TAG_COUNT));
             }
-            // The capabilities that advertise requests (partial updates,
-            // multi-search, chat, client history, shared dirs, search list,
-            // Kad lookups, search-all, metadata) are echoed once those
-            // requests are served: a client that sees one sends them.
-            return ok.with(Tag::int(EC_TAG_SESSION_ID, id.session_id));
+            ok = ok.with(Tag::int(EC_TAG_SESSION_ID, id.session_id));
+            if self.partial_update {
+                // Confirmed, so the client stops reading absence as removal.
+                ok = ok.with(Tag::empty(EC_TAG_CAN_PARTIAL_UPDATE));
+            }
+            // `EC_OP_KNOWNFILE_DELETE` is served. The other capabilities
+            // that advertise requests (partial updates, multi-search, chat,
+            // client history, shared dirs, search list, Kad lookups,
+            // search-all, metadata) are echoed once those requests are
+            // served: a client that sees one sends them.
+            return ok.with(Tag::empty(EC_TAG_CAN_DELETE_COMPLETE));
         }
         if present && proof.is_none() {
             return auth_failure(EC_AUTH_FAIL_INCOMPATIBLE, INVALID_HANDSHAKE);

@@ -23,3 +23,8 @@
 46-sse-session-end.sh
 48-cross-origin-writes.sh
 50-proxy-auth.sh
+06-read-logs.sh
+13-downloads-delete-clear.sh
+23-sse-replay.sh
+47-shared-delete.sh
+12-downloads-add-patch.sh

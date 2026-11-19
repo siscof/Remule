@@ -7,6 +7,7 @@
 //! * [`kad`]: a Kad node started from, and saved to, aMule's files.
 //! * [`firewall`]: whether others can reach us; answering Kad's firewall
 //!   checks over TCP.
+//! * [`applog`]: the log as External Connections read it.
 //! * [`bootstrap`]: `nodes.dat` and server lists fetched over HTTP at start.
 //! * [`http`]: one file over HTTP(S).
 //! * [`server_conn`]: which eD2k server to log into next, and when.
@@ -19,6 +20,7 @@
 //! * [`ec_stats`]: the statistics tree.
 //! * [`ec_update`]: `amulegui`'s incremental updates, and the preferences.
 
+pub mod applog;
 pub mod bootstrap;
 pub mod client;
 pub mod config;
@@ -37,6 +39,8 @@ pub mod stats;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_applog;
 #[cfg(test)]
 mod tests_bootstrap;
 #[cfg(test)]

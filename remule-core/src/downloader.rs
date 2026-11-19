@@ -80,6 +80,10 @@ pub enum FileOp {
     Resume,
     /// `Delete`: out of the queue, the `.part` and its met removed.
     Delete,
+    /// `SetDownPriority` (`PR_*`), or automatic.
+    Priority { prio: u32, auto: bool },
+    /// `SetCategory`.
+    Category(u32),
 }
 
 /// Settings for [`run`].
@@ -383,6 +387,10 @@ pub async fn run_with(
                             FileOp::Pause => found(queue.pause(&file, now, &mut out)),
                             FileOp::Stop => found(queue.stop(&file, now, &mut out)),
                             FileOp::Resume => found(queue.resume(&file)),
+                            FileOp::Priority { prio, auto } => {
+                                found(queue.set_file(&file, |f| f.set_down_priority(prio, auto)))
+                            }
+                            FileOp::Category(c) => found(queue.set_file(&file, |f| f.set_category(c))),
                             FileOp::Delete => match queue.remove(&file, now, &mut out) {
                                 Some(f) => f.delete().map_err(|e| e.to_string()),
                                 None => missing(),

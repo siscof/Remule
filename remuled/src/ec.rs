@@ -541,14 +541,28 @@ async fn partfile_cmd(
     s: &Status,
     control: &mpsc::UnboundedSender<Control>,
 ) -> Packet {
-    let op = match req.opcode {
-        EC_OP_PARTFILE_PAUSE => FileOp::Pause,
-        EC_OP_PARTFILE_RESUME => FileOp::Resume,
-        EC_OP_PARTFILE_STOP => FileOp::Stop,
-        _ => FileOp::Delete,
-    };
     let mut response: Option<Packet> = None;
     for t in &req.tags {
+        // The priority or category is the target's first child.
+        let first = || t.children.first().map_or(0, Tag::as_int);
+        let op = match req.opcode {
+            EC_OP_PARTFILE_PAUSE => FileOp::Pause,
+            EC_OP_PARTFILE_RESUME => FileOp::Resume,
+            EC_OP_PARTFILE_STOP => FileOp::Stop,
+            EC_OP_PARTFILE_PRIO_SET => match first() as u32 {
+                // PR_AUTO: automatic, starting high.
+                5 => FileOp::Priority {
+                    prio: 2,
+                    auto: true,
+                },
+                p => FileOp::Priority {
+                    prio: p,
+                    auto: false,
+                },
+            },
+            EC_OP_PARTFILE_SET_CAT => FileOp::Category(first() as u32),
+            _ => FileOp::Delete,
+        };
         if t.name != EC_TAG_PARTFILE || t.ty != EC_TAGTYPE_HASH16 {
             return failed("Invalid partfile command target.");
         }
@@ -564,6 +578,13 @@ async fn partfile_cmd(
         if let Some(id) = t.child(EC_TAG_ECID) {
             if !id.is_int() || id.as_int() != u64::from(d.ecid) {
                 return failed("The selected download has changed. Refresh and try again.");
+            }
+        }
+        // Only the one category there is, as aMule keeps none of its own.
+        if let FileOp::Category(c) = op {
+            if c >= 1 {
+                response.get_or_insert_with(|| failed(&format!("No such category: {c}")));
+                continue;
             }
         }
         if op == FileOp::Delete {
@@ -624,7 +645,7 @@ pub async fn answer(
                 Ok(()) => rx.await.unwrap_or_default(),
                 Err(_) => Default::default(),
             };
-            (conn.update.reply(&s.downloads, &data), false)
+            (conn.update.reply(&s.downloads, &data, conn.partial), false)
         }
         EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
         EC_OP_GET_STATSTREE => {
@@ -647,7 +668,68 @@ pub async fn answer(
             let _ = control.send(Control::Shutdown);
             (Packet::new(EC_OP_NOOP), true)
         }
-        EC_OP_STAT_REQ => (stats_reply(s, detail(req)), false),
+        EC_OP_STAT_REQ => {
+            let d = detail(req);
+            let mut p = stats_reply(s, d);
+            // `AddLoggerTag`: the lines this connection has not seen, after
+            // the banned count, at the GUI's levels.
+            if d == EC_DETAIL_FULL || d == EC_DETAIL_INC_UPDATE {
+                let lines = crate::applog::global().read(&mut conn.log, LOG_LINES_PER_MESSAGE);
+                if !lines.is_empty() {
+                    let mut t = Tag::empty(EC_TAG_STATS_LOGGER_MESSAGE);
+                    t.children = lines
+                        .iter()
+                        .map(|l| Tag::string(EC_TAG_STRING, l))
+                        .collect();
+                    p.tags.insert(3.min(p.tags.len()), t);
+                }
+            }
+            (p, false)
+        }
+        EC_OP_GET_LOG => (
+            Packet::new(EC_OP_LOG)
+                .with(Tag::string(EC_TAG_STRING, &crate::applog::global().text())),
+            false,
+        ),
+        EC_OP_RESET_LOG => {
+            crate::applog::global().reset();
+            (Packet::new(EC_OP_NOOP), false)
+        }
+        EC_OP_GET_LAST_LOG_ENTRY => {
+            let text = crate::applog::global().text();
+            let last = text
+                .strip_suffix('\n')
+                .unwrap_or(&text)
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            (
+                Packet::new(EC_OP_LOG).with(Tag::string(EC_TAG_STRING, &last)),
+                false,
+            )
+        }
+        EC_OP_GET_SERVERINFO => (
+            Packet::new(EC_OP_SERVERINFO).with(Tag::string(
+                EC_TAG_STRING,
+                &crate::applog::global().server_text(false),
+            )),
+            false,
+        ),
+        EC_OP_CLEAR_SERVERINFO => {
+            crate::applog::global().server_text(true);
+            (Packet::new(EC_OP_NOOP), false)
+        }
+        EC_OP_ADDLOGLINE => {
+            let level = if req.tag(EC_TAG_LOG_TO_STATUS).is_some() {
+                tracing::Level::WARN
+            } else {
+                tracing::Level::INFO
+            };
+            let line = req.tag(EC_TAG_STRING).map(Tag::as_str).unwrap_or_default();
+            crate::applog::global().push(level, &line);
+            (Packet::new(EC_OP_NOOP), false)
+        }
         EC_OP_GET_CONNSTATE => (
             Packet::new(EC_OP_MISC_DATA).with(connstate_tag(s, detail(req))),
             false,
@@ -664,14 +746,17 @@ pub async fn answer(
         EC_OP_PARTFILE_PAUSE
         | EC_OP_PARTFILE_RESUME
         | EC_OP_PARTFILE_STOP
-        | EC_OP_PARTFILE_DELETE => (partfile_cmd(req, s, control).await, false),
+        | EC_OP_PARTFILE_DELETE
+        | EC_OP_PARTFILE_PRIO_SET
+        | EC_OP_PARTFILE_SET_CAT => (partfile_cmd(req, s, control).await, false),
         op if crate::ec_servers::is_server_request(op) => {
             (crate::ec_servers::ask(req, control).await, false)
         }
         EC_OP_GET_SHARED_FILES
         | EC_OP_SHAREDFILES_RELOAD
         | EC_OP_SHARED_SET_PRIO
-        | EC_OP_GET_SHARED_DIRS => match crate::ec_shared::answer(req, control).await {
+        | EC_OP_GET_SHARED_DIRS
+        | EC_OP_KNOWNFILE_DELETE => match crate::ec_shared::answer(req, control).await {
             Some(p) => (p, false),
             None => (failed("Invalid opcode (wrong protocol version?)"), false),
         },
@@ -763,6 +848,22 @@ pub async fn serve(
     }
 }
 
+/// Requests that change the download queue; the client refreshes its view
+/// at once after each.
+fn changes_downloads(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        EC_OP_ADD_LINK
+            | EC_OP_PARTFILE_PAUSE
+            | EC_OP_PARTFILE_RESUME
+            | EC_OP_PARTFILE_STOP
+            | EC_OP_PARTFILE_DELETE
+            | EC_OP_PARTFILE_PRIO_SET
+            | EC_OP_PARTFILE_SET_CAT
+            | EC_OP_DOWNLOAD_SEARCH_RESULT
+    )
+}
+
 /// What every connection shares.
 struct Shared<'a> {
     creds: &'a Credentials,
@@ -773,8 +874,15 @@ struct Shared<'a> {
     history: &'a Mutex<crate::graphs::History>,
 }
 
+/// `EC_LOG_LINES_PER_MESSAGE`: a big backlog goes over a few polls.
+pub const LOG_LINES_PER_MESSAGE: usize = 5000;
+
 /// What one connection keeps between its requests.
 pub struct ConnView<'a> {
+    /// What it has read of the log.
+    pub log: crate::applog::Cursor,
+    /// It speaks the partial-update protocol.
+    pub partial: bool,
     /// What it was sent of each object, for incremental updates.
     pub update: crate::ec_update::UpdateState,
     pub prefs: &'a crate::ec_update::EcPrefs,
@@ -789,11 +897,13 @@ async fn connection(
     mut s: TcpStream,
     peer: std::net::IpAddr,
     sh: Shared<'_>,
-    status: watch::Receiver<Status>,
+    mut status: watch::Receiver<Status>,
     control: mpsc::UnboundedSender<Control>,
 ) -> String {
     let mut conn = ServerConn::new(peer);
     let mut cv = ConnView {
+        log: crate::applog::global().cursor(),
+        partial: false,
         update: Default::default(),
         prefs: sh.prefs,
         history: sh.history,
@@ -824,8 +934,16 @@ async fn connection(
             Received::Close(why) => return why,
             Received::Request(req) => {
                 let down = sh.shutting_down.load(Ordering::SeqCst);
-                let view = status.borrow().clone();
+                let view = status.borrow_and_update().clone();
+                cv.partial = conn.partial_update();
                 let (reply, stops) = answer(&req, &view, down, &control, &mut cv).await;
+                // A change to the downloads is answered once the view shows
+                // it, as aMule's are: what the client asks next sees it.
+                if changes_downloads(req.opcode) && reply.opcode != EC_OP_FAILED {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), status.changed())
+                            .await;
+                }
                 if stops {
                     info!("External Connection: shutdown requested");
                     sh.shutting_down.store(true, Ordering::SeqCst);

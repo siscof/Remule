@@ -343,6 +343,48 @@ async fn an_ec_client_lists_prioritises_and_reloads_shared_files() {
         // The first kept its ECID and priority through the reload.
         assert_eq!(l.tags[0].as_int(), ecid);
         assert_eq!(l.tags[0].child_int(EC_TAG_KNOWNFILE_PRIO), 3);
+
+        // Deleting a complete file, as amuleapi asks it: only the one the
+        // client saw (hash, ECID, folder, name).
+        let second = &l.tags[1];
+        let h2 = second
+            .child(EC_TAG_PARTFILE_HASH)
+            .unwrap()
+            .as_hash()
+            .unwrap();
+        let id2 = second.as_int();
+        let del = |hash: [u8; 16], ecid: u64, dir: &str, name: &str| {
+            Packet::new(EC_OP_KNOWNFILE_DELETE)
+                .with(Tag::hash(EC_TAG_KNOWNFILE, hash))
+                .with(Tag::int(EC_TAG_ECID, ecid))
+                .with(Tag::string(EC_TAG_KNOWNFILE_PATH, dir))
+                .with(Tag::string(EC_TAG_PARTFILE_NAME, name))
+        };
+        let dir = share2.display().to_string();
+        let changed = "The selected file has changed or is not a complete file.";
+        for stale in [
+            del(h2, id2 + 1000, &dir, "second.txt"),
+            del(h2, id2, &dir, "other.txt"),
+            del(h2, id2, "/elsewhere", "second.txt"),
+        ] {
+            let r = c.request(&stale).unwrap();
+            assert_eq!(r.message().unwrap(), changed);
+        }
+        let r = c
+            .request(&Packet::new(EC_OP_KNOWNFILE_DELETE).with(Tag::int(EC_TAG_ECID, id2)))
+            .unwrap();
+        assert_eq!(
+            r.message().unwrap(),
+            "Invalid complete-file deletion target."
+        );
+        assert!(share2.join("second.txt").exists());
+        let r = c.request(&del(h2, id2, &dir, "second.txt")).unwrap();
+        assert_eq!(r.opcode, EC_OP_NOOP);
+        assert!(!share2.join("second.txt").exists(), "off the disk");
+        let l = list(&mut c);
+        assert_eq!(l.tags.len(), 1, "out of the list");
+        assert_eq!(l.tags[0].child_str(EC_TAG_PARTFILE_NAME), "first.txt");
+
         assert_eq!(
             c.request(&Packet::new(EC_OP_SHUTDOWN)).unwrap().opcode,
             EC_OP_NOOP

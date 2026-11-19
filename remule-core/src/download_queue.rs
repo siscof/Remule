@@ -482,6 +482,19 @@ impl DownloadQueue {
     }
 
     /// `ResumeFile`: asked for again, sources taken again, saved.
+    /// A download's priority or category, saved at once. False if the
+    /// file is not here.
+    pub fn set_file(&mut self, hash: &Md4Hash, f: impl FnOnce(&mut PartFile)) -> bool {
+        let Some(e) = self.files.get_mut(hash) else {
+            return false;
+        };
+        f(&mut e.file);
+        if !e.done {
+            let _ = e.file.save();
+        }
+        true
+    }
+
     pub fn resume(&mut self, hash: &Md4Hash) -> bool {
         let Some(e) = self.files.get_mut(hash) else {
             return false;

@@ -451,6 +451,22 @@ fn add_link(
     wanted: &[(Md4Hash, u64)],
     shares: Option<&Arc<Mutex<SharedFiles>>>,
 ) -> Option<Added> {
+    // `AddLink`: a magnet with an ed2k hash is taken as its ed2k link.
+    let converted;
+    let link = if remule_core::link::is_magnet(link) {
+        match remule_core::link::magnet_to_ed2k(link) {
+            Some(l) => {
+                converted = l;
+                converted.as_str()
+            }
+            None => {
+                warn!("Cannot convert magnet link to eD2k: {link}");
+                return None;
+            }
+        }
+    } else {
+        link
+    };
     if !link
         .get(..7)
         .is_some_and(|p| p.eq_ignore_ascii_case("ed2k://"))
@@ -865,6 +881,7 @@ pub async fn run(
             ev = async { match &mut server { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
                 match ev {
                     Some(ServerEvent::SearchResults { results, .. }) => searches.server_results(results),
+                    Some(ServerEvent::Message(m)) => crate::applog::global().server_message(&m),
                     Some(ServerEvent::FoundSources { hash, sources }) => {
                         let eps: Vec<Endpoint> = sources.iter().filter_map(Endpoint::from_server).collect();
                         info!("[{:>5}s] server: {} sources ({} reachable) for {}",
@@ -970,21 +987,17 @@ pub async fn run(
                         };
                         if r.is_ok() {
                             let name = names.get(&file).cloned().unwrap_or_else(|| file.to_string());
+                            let t = start.elapsed().as_secs();
                             match op {
-                                FileOp::Pause | FileOp::Stop => { paused.insert(file); }
-                                FileOp::Resume => { paused.remove(&file); }
+                                FileOp::Pause => { paused.insert(file); info!("[{t:>5}s] {name}: paused"); }
+                                FileOp::Stop => { paused.insert(file); info!("[{t:>5}s] {name}: stopped"); }
+                                FileOp::Resume => { paused.remove(&file); info!("[{t:>5}s] {name}: resumed"); }
                                 FileOp::Delete => {
                                     paused.remove(&file);
                                     wanted.retain(|(h, _)| *h != file);
-                                    info!("[{:>5}s] {name}: cancelled", start.elapsed().as_secs());
+                                    info!("[{t:>5}s] {name}: cancelled");
                                 }
-                            }
-                            if op != FileOp::Delete {
-                                info!("[{:>5}s] {name}: {}", start.elapsed().as_secs(), match op {
-                                    FileOp::Pause => "paused",
-                                    FileOp::Stop => "stopped",
-                                    _ => "resumed",
-                                });
+                                FileOp::Priority { .. } | FileOp::Category(_) => {}
                             }
                         }
                         let _ = reply.send(r);

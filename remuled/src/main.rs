@@ -63,9 +63,18 @@ async fn stopped(duration: u64) {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     use std::io::IsTerminal;
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_ansi(std::io::stdout().is_terminal())
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    // To the console, and to the log External Connections read.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        )
+        .with(remuled::applog::EcLogLayer)
         .init();
     let args = Args::parse();
     let Some(dir) = args.config_dir.or_else(default_config_dir) else {

@@ -40,7 +40,7 @@ Runs the client from an aMule config directory, as `amuled` does:
 - a missing `nodes.dat`, and server lists from `addresses.dat`, are fetched over HTTP at start;
 - `ipfilter.dat` and `ipfilter_static.dat` keep it away from filtered peers and servers;
 - transfer totals are kept in `statistics.dat`;
-- with `AcceptExternalConnections` and an EC password, it accepts External Connections on `ECPort` (aMule 3.3's SRP login). So far they can ask for statistics and the connection state; list, add (ed2k links), pause, resume and cancel downloads; list, add, remove, connect to and disconnect from servers, and start and stop Kad; list the shared files, reload them and set their upload priority; search the server and Kad and download results; read the general and connection preferences; get `amulegui`'s incremental updates; and shut it down. `scripts/interop/amulecmd-drives-remuled.sh` (run in CI) checks this with aMule's own `amulecmd`.
+- with `AcceptExternalConnections` and an EC password, it accepts External Connections on `ECPort` (aMule 3.3's SRP login). So far they can ask for statistics and the connection state; list, add (ed2k links), pause, resume and cancel downloads; list, add, remove, connect to and disconnect from servers, and start and stop Kad; list the shared files, reload them and set their upload priority; search the server and Kad and download results; read the general and connection preferences; get `amulegui`'s incremental updates; read the statistics graphs and tree; and shut it down. `scripts/interop/amulecmd-drives-remuled.sh` (run in CI) checks this with aMule's own `amulecmd`.
 
 Nick, ports, limits and directories come from `amule.conf`, the user hash from `preferences.dat`, and the secure-ident key from `cryptkey.dat` (both made if missing). A legacy `ECPassword` in `amule.conf` is replaced by an `ECPasswordVerifier`, as aMule 3.3 does. On Ctrl-C (or SIGTERM) it saves `known.met`, `clients.met`, the part files, the statistics and the Kad state, in aMule's formats and places.
 
@@ -48,7 +48,7 @@ Nick, ports, limits and directories come from `amule.conf`, the user hash from `
 
 Stop aMule first: the two must not use one directory at once.
 
-Not yet supported: the rest of External Connections (changing preferences, logs, the statistics tree, categories, the upload queue, and the peers in `amulegui`'s updates).
+Not yet supported: the rest of External Connections (changing preferences, logs, categories, the upload queue, and the peers in `amulegui`'s updates).
 
 ## remule-gui: remote GUI for amuled
 

@@ -786,6 +786,8 @@ pub async fn run(
     let mut shared_state = crate::ec_shared::SharedState::default();
     // The servers' ECIDs, kept while they are listed.
     let mut server_ids = ServerIds::default();
+    // What the statistics tree shows that is not kept elsewhere.
+    let mut tree_track = crate::ec_stats::TreeTrack::default();
     let reload_dirs = crate::ec_shared::ReloadDirs {
         dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
         reserved: vec![c.temp.clone(), c.config.clone()],
@@ -831,6 +833,7 @@ pub async fn run(
                             li.id
                         );
                         our_id = li.id;
+                        tree_track.logins += 1;
                         server_since = connector.connected().map(|a| (a.addr, unix_now()));
                         let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
                         let was = reach;
@@ -1099,6 +1102,39 @@ pub async fn run(
                     Some(Control::Shared(req)) => {
                         shared_state.handle(req, shares.as_ref(), &reload_dirs, &c.config);
                     }
+                    Some(Control::StatsTree(reply)) => {
+                        let now_i = Instant::now();
+                        let session = statistics.session();
+                        let totals = statistics.totals();
+                        let view = ec_view.as_ref().map(|v| v.borrow().clone()).unwrap_or_default();
+                        let (shared_count, shared_size) = match &shares {
+                            Some(s) => {
+                                let s = s.lock().unwrap_or_else(|e| e.into_inner());
+                                let files = s.files();
+                                (files.len() as u64, files.iter().map(|(f, _)| f.size).sum())
+                            }
+                            None => (0, 0),
+                        };
+                        let moment = crate::ec_stats::Moment {
+                            uptime: statistics.uptime(now_i).as_secs(),
+                            session_sent: session.sent,
+                            session_received: session.received,
+                            total_sent: totals.sent,
+                            total_received: totals.received,
+                            connected_since: server_since
+                                .filter(|_| server.is_some())
+                                .map(|(_, t)| u64::from(unix_now().saturating_sub(t))),
+                            connections: view.connections.into(),
+                            active_uploads: 0,
+                            waiting_uploads: view.upload_queue.into(),
+                            found_sources: view.sources.into(),
+                            active_downloads: view.downloads.iter().map(|d| u64::from(d.transferring)).sum(),
+                            servers: server_list.entries().to_vec(),
+                            shared_count,
+                            shared_size,
+                        };
+                        let _ = reply.send(tree_track.data(moment));
+                    }
                     Some(Control::Update(reply)) => {
                         let shared = match &shares {
                             Some(s) => shared_state.list(&s.lock().unwrap_or_else(|e| e.into_inner())),
@@ -1173,6 +1209,13 @@ pub async fn run(
                                 shared: shares.as_ref().map_or(0, |s| s.lock().unwrap_or_else(|e| e.into_inner()).shared_count()),
                                 now,
                             });
+                            tree_track.sample(
+                                statistics.uptime(now).as_secs(),
+                                status.dl_speed,
+                                status.ul_speed,
+                                status.session_sent + status.session_received > 0,
+                                status.connections.into(),
+                            );
                             history.lock().unwrap_or_else(|e| e.into_inner()).record(crate::graphs::Record {
                                 kbytes_sent: status.session_sent as f64 / 1024.0,
                                 kbytes_received: status.session_received as f64 / 1024.0,

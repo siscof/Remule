@@ -280,6 +280,8 @@ pub enum Control {
     /// The shared files and servers for an incremental update
     /// ([`crate::ec_update`]).
     Update(oneshot::Sender<crate::ec_update::UpdateData>),
+    /// The statistics tree's data ([`crate::ec_stats`]).
+    StatsTree(oneshot::Sender<crate::ec_stats::TreeData>),
 }
 
 fn detail(req: &Packet) -> u8 {
@@ -625,6 +627,17 @@ pub async fn answer(
             (conn.update.reply(&s.downloads, &data), false)
         }
         EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
+        EC_OP_GET_STATSTREE => {
+            let (reply, rx) = oneshot::channel();
+            let data = match control.send(Control::StatsTree(reply)) {
+                Ok(()) => rx.await.unwrap_or_default(),
+                Err(_) => Default::default(),
+            };
+            (
+                crate::ec_stats::tree_reply(req, &data, conn.version, &conn.prefs.nick),
+                false,
+            )
+        }
         EC_OP_GET_STATSGRAPHS => {
             let h = conn.history.lock().unwrap_or_else(|e| e.into_inner());
             (crate::graphs::graphs_reply(req, &h), false)
@@ -767,6 +780,8 @@ pub struct ConnView<'a> {
     pub prefs: &'a crate::ec_update::EcPrefs,
     /// The statistics graphs' history.
     pub history: &'a Mutex<crate::graphs::History>,
+    /// The daemon's version, as `EC_OP_AUTH_OK` gives it.
+    pub version: &'a str,
 }
 
 /// One connection, until it closes; returns why.
@@ -782,6 +797,7 @@ async fn connection(
         update: Default::default(),
         prefs: sh.prefs,
         history: sh.history,
+        version: &sh.identity.version,
     };
     loop {
         let mut header = [0u8; 8];

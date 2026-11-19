@@ -123,7 +123,7 @@ grep -qi "connection failed\|connection lost\|reconnect" "$WORK/gui.log" &&
 # requests it polls with must not be among them.
 echo "----- requests remuled does not serve yet -----"
 grep -o "invalid opcode received: 0x[0-9a-f]*" "$WORK/remuled.log" | sort | uniq -c || true
-for op in 0x0a 0x3f 0x44 0x52; do
+for op in 0x0a 0x3f 0x44 0x46 0x52; do
 	grep -q "invalid opcode received: $op\$" "$WORK/remuled.log" &&
 		fail "remuled did not answer opcode $op"
 done

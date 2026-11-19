@@ -34,11 +34,15 @@ pub struct EcSettings {
     /// requests check.
     pub ed2k: bool,
     pub kad: bool,
+    /// What `EC_OP_GET_PREFERENCES` tells.
+    pub prefs: crate::ec_update::EcPrefs,
 }
 
 /// The connected server, as the EC server tag tells it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerStatus {
+    /// Its ECID, as the incremental updates name it.
+    pub ecid: u32,
     pub addr: Option<SocketAddrV4>,
     pub name: String,
     pub description: String,
@@ -150,6 +154,12 @@ pub struct Download {
     pub category: u32,
     pub last_seen_complete: u32,
     pub lost_to_corruption: u64,
+    /// The missing ranges, inclusive (the gap bar).
+    pub gaps: Vec<(u64, u64)>,
+    /// The blocks being downloaded, inclusive.
+    pub requested: Vec<(u64, u64)>,
+    /// How many sources have each part.
+    pub part_frequency: Vec<u16>,
 }
 
 /// ECIDs for the downloads, and their speeds.
@@ -213,6 +223,9 @@ impl DownloadIds {
                     category: f.category,
                     last_seen_complete: f.last_seen_complete,
                     lost_to_corruption: f.lost_to_corruption,
+                    gaps: f.gaps.clone(),
+                    requested: f.requested.clone(),
+                    part_frequency: f.part_frequency.clone(),
                 }
             })
             .collect();
@@ -264,6 +277,9 @@ pub enum Control {
         request: Packet,
         reply: oneshot::Sender<Packet>,
     },
+    /// The shared files and servers for an incremental update
+    /// ([`crate::ec_update`]).
+    Update(oneshot::Sender<crate::ec_update::UpdateData>),
 }
 
 fn detail(req: &Packet) -> u8 {
@@ -323,8 +339,8 @@ pub fn connstate_tag(s: &Status, detail: u8) -> Tag {
     ));
     if let Some(server) = &s.server {
         if detail == EC_DETAIL_INC_UPDATE {
-            // The ECID of the connected server: none are given out yet.
-            t = t.with(Tag::int(EC_TAG_SERVER, 0));
+            // Just the connected server's ECID.
+            t = t.with(Tag::int(EC_TAG_SERVER, server.ecid.into()));
         } else {
             t = t.with(server_tag(server, detail));
         }
@@ -596,8 +612,19 @@ pub async fn answer(
     s: &Status,
     shutting_down: bool,
     control: &mpsc::UnboundedSender<Control>,
+    conn: &mut ConnView<'_>,
 ) -> (Packet, bool) {
     match req.opcode {
+        // Only incremental: aMule has no other answer for it.
+        EC_OP_GET_UPDATE if detail(req) == EC_DETAIL_INC_UPDATE => {
+            let (reply, rx) = oneshot::channel();
+            let data = match control.send(Control::Update(reply)) {
+                Ok(()) => rx.await.unwrap_or_default(),
+                Err(_) => Default::default(),
+            };
+            (conn.update.reply(&s.downloads, &data), false)
+        }
+        EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
         EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),
         EC_OP_SHUTDOWN => {
             let _ = control.send(Control::Shutdown);
@@ -678,6 +705,7 @@ pub async fn serve(
 ) {
     let limiter = Arc::new(Mutex::new(AuthLimiter::new(settings.limits)));
     let creds = Arc::new(settings.credentials);
+    let prefs = Arc::new(settings.prefs);
     let identity = Arc::new(identity);
     // `IsOnShutDown`: one shutdown, whichever connection asks.
     let shutting_down = Arc::new(AtomicBool::new(false));
@@ -691,6 +719,7 @@ pub async fn serve(
         };
         let _ = stream.set_nodelay(true);
         info!("New external connection accepted");
+        let prefs = prefs.clone();
         let (limiter, creds, identity, status, control, down) = (
             limiter.clone(),
             creds.clone(),
@@ -705,6 +734,7 @@ pub async fn serve(
                 identity: &identity,
                 limiter: &limiter,
                 shutting_down: &down,
+                prefs: &prefs,
             };
             let why = connection(stream, peer.ip(), shared, status, control).await;
             debug!("EC {peer}: {why}");
@@ -719,6 +749,14 @@ struct Shared<'a> {
     identity: &'a Identity,
     limiter: &'a Mutex<AuthLimiter>,
     shutting_down: &'a AtomicBool,
+    prefs: &'a crate::ec_update::EcPrefs,
+}
+
+/// What one connection keeps between its requests.
+pub struct ConnView<'a> {
+    /// What it was sent of each object, for incremental updates.
+    pub update: crate::ec_update::UpdateState,
+    pub prefs: &'a crate::ec_update::EcPrefs,
 }
 
 /// One connection, until it closes; returns why.
@@ -730,6 +768,10 @@ async fn connection(
     control: mpsc::UnboundedSender<Control>,
 ) -> String {
     let mut conn = ServerConn::new(peer);
+    let mut cv = ConnView {
+        update: Default::default(),
+        prefs: sh.prefs,
+    };
     loop {
         let mut header = [0u8; 8];
         if let Err(e) = s.read_exact(&mut header).await {
@@ -756,7 +798,7 @@ async fn connection(
             Received::Request(req) => {
                 let down = sh.shutting_down.load(Ordering::SeqCst);
                 let view = status.borrow().clone();
-                let (reply, stops) = answer(&req, &view, down, &control).await;
+                let (reply, stops) = answer(&req, &view, down, &control, &mut cv).await;
                 if stops {
                     info!("External Connection: shutdown requested");
                     sh.shutting_down.store(true, Ordering::SeqCst);

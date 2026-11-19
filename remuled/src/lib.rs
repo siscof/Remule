@@ -15,6 +15,7 @@
 //! * [`ec_search`]: searches over external connections.
 //! * [`ec_servers`]: the server list and the networks over them.
 //! * [`ec_shared`]: shared files over external connections.
+//! * [`ec_update`]: `amulegui`'s incremental updates, and the preferences.
 
 pub mod bootstrap;
 pub mod client;
@@ -23,6 +24,7 @@ pub mod ec;
 pub mod ec_search;
 pub mod ec_servers;
 pub mod ec_shared;
+pub mod ec_update;
 pub mod firewall;
 pub mod http;
 pub mod kad;
@@ -41,6 +43,8 @@ mod tests_ec_search;
 mod tests_ec_servers;
 #[cfg(test)]
 mod tests_ec_shared;
+#[cfg(test)]
+mod tests_ec_update;
 #[cfg(test)]
 mod tests_firewall;
 #[cfg(test)]

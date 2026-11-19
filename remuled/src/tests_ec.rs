@@ -163,6 +163,7 @@ fn busy() -> Status {
         ed2k_enabled: true,
         kad_enabled: true,
         server: Some(ServerStatus {
+            ecid: 77,
             addr: Some(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 4661)),
             name: "Big Server".into(),
             description: "the one".into(),
@@ -330,11 +331,20 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     seen.push(format!("servers {:#x}", request.opcode));
                 }
                 Control::Shared(_) => seen.push("shared".to_string()),
+                Control::Update(reply) => {
+                    let _ = reply.send(Default::default());
+                    seen.push("update".to_string());
+                }
             }
         }
         seen
     });
-    let (r, stops) = ec::answer(&req, s, shutting_down, &tx).await;
+    let prefs = crate::ec_update::EcPrefs::default();
+    let mut cv = ec::ConnView {
+        update: Default::default(),
+        prefs: &prefs,
+    };
+    let (r, stops) = ec::answer(&req, s, shutting_down, &tx, &mut cv).await;
     drop(tx);
     (r, stops, client.await.unwrap())
 }
@@ -388,6 +398,9 @@ fn download(ecid: u32, hash: u8, status: u8) -> Download {
         category: 0,
         last_seen_complete: 0,
         lost_to_corruption: 0,
+        gaps: Vec::new(),
+        requested: Vec::new(),
+        part_frequency: Vec::new(),
     }
 }
 
@@ -478,6 +491,9 @@ fn download_ids_and_speeds_last_while_the_download_does() {
         category: 0,
         last_seen_complete: 0,
         lost_to_corruption: 0,
+        gaps: Vec::new(),
+        requested: Vec::new(),
+        part_frequency: Vec::new(),
     };
     let mut ids = DownloadIds::default();
     let temp = std::path::Path::new("T");

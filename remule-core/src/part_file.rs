@@ -479,6 +479,16 @@ impl PartFile {
             )
     }
 
+    /// Blocks being downloaded, inclusive, as aMule keeps them.
+    pub fn requested_inclusive(&self) -> &[(u64, u64)] {
+        &self.requested
+    }
+
+    /// How many known sources have each part (`m_SrcpartFrequency`).
+    pub fn part_frequency(&self) -> &[u16] {
+        &self.frequency
+    }
+
     /// Blocks being downloaded, half-open.
     pub fn requested_blocks(&self) -> Vec<Range<u64>> {
         self.requested.iter().map(|&(s, e)| s..e + 1).collect()

@@ -330,6 +330,12 @@ pub struct FileProgress {
     /// Unix time a complete source was last seen.
     pub last_seen_complete: u32,
     pub lost_to_corruption: u64,
+    /// The missing ranges, inclusive.
+    pub gaps: Vec<(u64, u64)>,
+    /// The blocks being downloaded, inclusive.
+    pub requested: Vec<(u64, u64)>,
+    /// How many sources have each part.
+    pub part_frequency: Vec<u16>,
 }
 
 /// Download statistics.
@@ -614,6 +620,9 @@ impl DownloadQueue {
                     category: e.file.info().category,
                     last_seen_complete: e.file.info().last_seen_complete,
                     lost_to_corruption: e.file.lost_to_corruption(),
+                    gaps: e.file.gaps().iter().collect(),
+                    requested: e.file.requested_inclusive().to_vec(),
+                    part_frequency: e.file.part_frequency().to_vec(),
                 }
             })
             .collect();

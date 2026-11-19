@@ -93,9 +93,9 @@ jobs:
         env:
           SOURCE: ${{ matrix.source }}
 
-  # MIGRATION_PLAN.md 11.M: the unmodified C++ amulecmd drives remuled.
-  # No release has the SRP login yet (it came after 3.2.0), so amulecmd is
-  # built from the aMule-org commit remule is ported from, and cached.
+  # MIGRATION_PLAN.md 11.M: the unmodified C++ amulecmd and amulegui drive
+  # remuled. No release has the SRP login yet (it came after 3.2.0), so both
+  # are built from the aMule-org commit remule is ported from, and cached.
   amulecmd-interop:
     runs-on: ubuntu-latest
     container: fedora:latest
@@ -107,17 +107,17 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc gcc-c++ make cmake git curl tar gzip python3 procps-ng \
-            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel
+            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Cache amulecmd
+      - name: Cache amulecmd and amulegui
         id: amulecmd-cache
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-fedora-${{ env.AMULE_REF }}
-      - name: Build amulecmd
+          key: amulecmd-amulegui-fedora-${{ env.AMULE_REF }}
+      - name: Build amulecmd and amulegui
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
           git init -q /tmp/amule-src
@@ -125,16 +125,22 @@ jobs:
           git fetch -q --depth 1 https://github.com/amule-org/amule.git "$AMULE_REF"
           git checkout -q FETCH_HEAD
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_MONOLITHIC=NO -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES \
+            -DBUILD_MONOLITHIC=NO -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES \
             -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
             -DENABLE_MEDIA_PROBE=OFF -DENABLE_VERSION_CHECK=OFF -DENABLE_BFD=NO \
             -DTRANSLATED_MANPAGES=NO
-          cmake --build build --target amulecmd -j "$(nproc)"
+          cmake --build build --target amulecmd amulegui -j "$(nproc)"
           mkdir -p /opt/amulecmd
           cp "$(find build -type f -name amulecmd -perm -u+x | head -1)" /opt/amulecmd/
+          cp "$(find build -type f -name amulegui -perm -u+x | head -1)" /opt/amulecmd/
       - name: Build remuled
         run: cargo build --release -p remuled
       - name: amulecmd drives remuled
         run: bash scripts/interop/amulecmd-drives-remuled.sh
         env:
           AMULECMD: /opt/amulecmd/amulecmd
+      - name: amulegui drives remuled
+        run: xvfb-run -a bash scripts/interop/amulegui-drives-remuled.sh
+        env:
+          AMULECMD: /opt/amulecmd/amulecmd
+          AMULEGUI: /opt/amulecmd/amulegui

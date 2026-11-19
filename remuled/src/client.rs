@@ -293,6 +293,8 @@ struct EcInputs<'a> {
     download_ids: &'a mut DownloadIds,
     /// The connected server as `server.met` lists it.
     listed: Option<&'a ed2k_formats::server_met::ServerInfo>,
+    /// The connected server's ECID.
+    server_ecid: u32,
 }
 
 /// The client as the EC replies tell it.
@@ -302,6 +304,7 @@ fn ec_status(i: EcInputs<'_>) -> Status {
     let server = i.server.map(|(s, since)| {
         let info = s.info();
         ServerStatus {
+            ecid: i.server_ecid,
             addr: match since {
                 Some((SocketAddr::V4(a), _)) => Some(a),
                 _ => None,
@@ -364,6 +367,24 @@ fn ec_status(i: EcInputs<'_>) -> Status {
         upload_queue: 0,
         banned: 0,
         downloads,
+    }
+}
+
+/// ECIDs for the servers in the list (`CECID`), kept while each is listed.
+#[derive(Debug, Default)]
+struct ServerIds(HashMap<SocketAddrV4, u32>);
+
+impl ServerIds {
+    fn id(&mut self, a: SocketAddrV4) -> u32 {
+        *self.0.entry(a).or_insert_with(crate::ec_shared::next_ecid)
+    }
+
+    /// Forget the servers no longer listed.
+    fn keep(&mut self, list: &[ed2k_formats::server_met::ServerInfo]) {
+        self.0.retain(|a, _| {
+            list.iter()
+                .any(|s| s.ip == Some(*a.ip()) && s.port == a.port())
+        });
     }
 }
 
@@ -754,6 +775,8 @@ pub async fn run(
     // The search external connections run.
     let mut searches = ec_search::SearchList::default();
     let mut shared_state = crate::ec_shared::SharedState::default();
+    // The servers' ECIDs, kept while they are listed.
+    let mut server_ids = ServerIds::default();
     let reload_dirs = crate::ec_shared::ReloadDirs {
         dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
         reserved: vec![c.temp.clone(), c.config.clone()],
@@ -1067,6 +1090,34 @@ pub async fn run(
                     Some(Control::Shared(req)) => {
                         shared_state.handle(req, shares.as_ref(), &reload_dirs, &c.config);
                     }
+                    Some(Control::Update(reply)) => {
+                        let shared = match &shares {
+                            Some(s) => shared_state.list(&s.lock().unwrap_or_else(|e| e.into_inner())),
+                            None => Vec::new(),
+                        };
+                        let live = server.as_ref().map(|s| s.info());
+                        let connected = match server_since {
+                            Some((SocketAddr::V4(a), _)) if server.is_some() => Some(a),
+                            _ => None,
+                        };
+                        server_ids.keep(server_list.entries());
+                        let servers = server_list.entries().iter().filter_map(|e| {
+                            let addr = SocketAddrV4::new(e.ip?, e.port);
+                            let mut info = e.clone();
+                            let mut tcp_flags = 0;
+                            // The connected one, as it told us of itself.
+                            if let (Some(l), true) = (&live, connected == Some(addr)) {
+                                if let Some(n) = l.name.as_ref().filter(|n| !n.is_empty()) { info.name = n.clone(); }
+                                if let Some(d) = l.description.as_ref().filter(|d| !d.is_empty()) { info.description = d.clone(); }
+                                if let Some(v) = l.version.as_ref().filter(|v| !v.is_empty()) { info.version = v.clone(); }
+                                info.users = l.users;
+                                info.files = l.files;
+                                tcp_flags = l.tcp_flags;
+                            }
+                            Some(crate::ec_update::UpdateServer { ecid: server_ids.id(addr), info, tcp_flags })
+                        }).collect();
+                        let _ = reply.send(crate::ec_update::UpdateData { shared, servers });
+                    }
                     None => ec_control = None,
                 }
             }
@@ -1105,6 +1156,10 @@ pub async fn run(
                                 listed: match server_since {
                                     Some((SocketAddr::V4(a), _)) => server_list.find(a),
                                     _ => None,
+                                },
+                                server_ecid: match server_since {
+                                    Some((SocketAddr::V4(a), _)) => server_ids.id(a),
+                                    _ => 0,
                                 },
                                 shared: shares.as_ref().map_or(0, |s| s.lock().unwrap_or_else(|e| e.into_inner()).shared_count()),
                                 now,

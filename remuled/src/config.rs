@@ -294,7 +294,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         None
     };
 
-    let client = ClientConfig {
+    let mut client = ClientConfig {
         temp: conf_path(dir, prefs.temp_dir.as_deref(), "Temp"),
         incoming: conf_path(dir, prefs.incoming_dir.as_deref(), "Incoming"),
         config: dir.to_path_buf(),
@@ -323,6 +323,10 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         status_every: Duration::from_secs(60),
         ec,
     };
+    if let Some(e) = client.ec.as_mut() {
+        e.prefs.user_hash = client.user_hash.0;
+        e.prefs.max_connections = client.max_connections.min(usize::from(u16::MAX)) as u16;
+    }
     Ok(Loaded {
         client,
         prefs,
@@ -489,5 +493,31 @@ fn ec_settings(
         },
         ed2k: prefs.connect_to_ed2k,
         kad: prefs.connect_to_kad,
+        prefs: crate::ec_update::EcPrefs {
+            nick: prefs.nick.clone(),
+            // The user hash and connection limit are set with the client.
+            user_hash: [0; 16],
+            upload_capacity: limit("/eMule/UploadCapacity", 2500) as u32,
+            download_capacity: limit("/eMule/DownloadCapacity", 12500) as u32,
+            max_upload: prefs.max_upload,
+            max_download: prefs.max_download,
+            slot_allocation: prefs.slot_allocation,
+            tcp_port: prefs.tcp_port,
+            udp_port: prefs.udp_port,
+            udp_enabled: prefs.udp_enabled,
+            max_sources_per_file: prefs.max_sources_per_file,
+            max_connections: 0,
+            autoconnect: prefs.autoconnect,
+            reconnect: prefs.reconnect,
+            ed2k: prefs.connect_to_ed2k,
+            kad: prefs.connect_to_kad,
+            bind_address: conf.get("/eMule/Address").unwrap_or_default().to_owned(),
+            bind_interface: conf
+                .get("/eMule/NetworkInterface")
+                .unwrap_or_default()
+                .to_owned(),
+            upnp_enabled: limit("/eMule/UPnPEnabled", 0) != 0,
+            upnp_tcp_port: limit("/eMule/UPnPTCPPort", 50000) as u16,
+        },
     })
 }

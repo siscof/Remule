@@ -12,6 +12,7 @@
 //! * [`server`]: the daemon's side of a connection (framing, login,
 //!   lockout), sans IO.
 //! * [`model`]: typed views of the replies a GUI needs.
+//! * [`rle`]: the differential run-length encoding of a download's bars.
 
 pub mod client;
 pub mod codes;
@@ -19,6 +20,7 @@ pub mod crypt;
 #[cfg(any(test, feature = "fake-daemon"))]
 pub mod fake;
 pub mod model;
+pub mod rle;
 pub mod server;
 pub mod srp;
 pub mod tag;

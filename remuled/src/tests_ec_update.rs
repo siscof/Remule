@@ -16,7 +16,10 @@ use remule_ec::{Client, ConnectOptions, Packet, Tag};
 
 use crate::ec::{self, Download, ServerStatus, Status};
 use crate::ec_shared::SharedBase;
-use crate::ec_update::{prefs_reply, EcPrefs, UpdateData, UpdateServer, UpdateState, ValueMap};
+use crate::ec_update::{
+    prefs_reply, DirPrefs, EcPrefs, GeoipPrefs, RemotePrefs, UpdateData, UpdateServer, UpdateState,
+    ValueMap,
+};
 
 fn download(ecid: u32, gaps: Vec<(u64, u64)>) -> Download {
     Download {
@@ -264,6 +267,80 @@ fn preferences_are_the_pages_asked_for() {
     assert!(r.tag(EC_TAG_PREFS_GENERAL).is_some());
 }
 
+#[test]
+fn the_remote_directories_and_geoip_pages() {
+    let mut p = prefs();
+    p.dirs = DirPrefs {
+        incoming: "/in".into(),
+        temp: "/tmp/t".into(),
+        shared: vec!["/a".into(), "/b".into()],
+        allowed_roots: vec!["/srv".into()],
+    };
+    p.remote = RemotePrefs {
+        web_port: 4711,
+        api_enabled: true,
+        api_port: 4713,
+        api_bind: "127.0.0.1".into(),
+        ec_address: "127.0.0.1".into(),
+        ec_port: 4712,
+        ..Default::default()
+    };
+    p.geoip = GeoipPrefs {
+        enabled: true,
+        source: GeoipPrefs::source_of("maxmind"),
+        ..Default::default()
+    };
+    let r = prefs_reply(
+        &Packet::new(EC_OP_GET_PREFERENCES).with(Tag::int(
+            EC_TAG_SELECT_PREFS,
+            (EC_PREFS_REMOTECONTROLS | EC_PREFS_DIRECTORIES | EC_PREFS_IP2COUNTRY).into(),
+        )),
+        &p,
+    );
+    let rc = r.tag(EC_TAG_PREFS_REMOTECTRL).unwrap();
+    assert_eq!(rc.child_int(EC_TAG_WEBSERVER_PORT), 4711);
+    assert!(!rc.has(EC_TAG_WEBSERVER_AUTORUN) && rc.has(EC_TAG_AMULEAPI_AUTORUN));
+    assert_eq!(rc.child_int(EC_TAG_AMULEAPI_PORT), 4713);
+    assert_eq!(rc.child_int(EC_TAG_EXTERNALCONN_ENABLED), 1);
+    assert_eq!(rc.child_int(EC_TAG_EXTERNALCONN_PORT), 4712);
+    assert_eq!(rc.child_str(EC_TAG_EXTERNALCONN_ADDRESS), "127.0.0.1");
+    assert_eq!(rc.child_int(EC_TAG_EXTERNALCONN_PASSWD_SET), 1);
+    assert_eq!(rc.child_int(EC_TAG_EXTERNALCONN_REQUIRE_ENCRYPTION), 1);
+
+    let d = r.tag(EC_TAG_PREFS_DIRECTORIES).unwrap();
+    assert_eq!(d.child_str(EC_TAG_DIRECTORIES_INCOMING), "/in");
+    assert_eq!(d.child_str(EC_TAG_DIRECTORIES_TEMP), "/tmp/t");
+    // A count, with the folders as its children.
+    let shared = d.child(EC_TAG_DIRECTORIES_SHARED).unwrap();
+    assert_eq!(shared.as_int(), 2);
+    let names: Vec<String> = shared.children.iter().map(Tag::as_str).collect();
+    assert_eq!(names, ["/a", "/b"]);
+    let roots = d.child(EC_TAG_DIRECTORIES_ALLOWED_ROOTS).unwrap();
+    assert_eq!(
+        (roots.as_int(), roots.children[0].as_str()),
+        (1, "/srv".into())
+    );
+    assert!(!d.has(EC_TAG_DIRECTORIES_SHARE_HIDDEN));
+
+    let g = r.tag(EC_TAG_PREFS_IP2COUNTRY).unwrap();
+    assert_eq!(g.child_int(EC_TAG_IP2COUNTRY_SUPPORTED), 0);
+    assert_eq!(g.child_int(EC_TAG_IP2COUNTRY_ENABLED), 1);
+    assert_eq!(g.child_int(EC_TAG_IP2COUNTRY_SOURCE), 1);
+    assert_eq!(GeoipPrefs::source_of("custom"), 2);
+    assert_eq!(GeoipPrefs::source_of("anything"), 0);
+    // Pages not asked for are left out.
+    assert!(r.tag(EC_TAG_PREFS_GENERAL).is_none());
+}
+
+#[test]
+fn the_kad_buddy_counters_are_sent_when_asked_for() {
+    let t = crate::ec::kad_buddy_tag();
+    assert_eq!(t.name, EC_TAG_KAD_BUDDY);
+    assert_eq!(t.children.len(), 41);
+    assert!(t.children.iter().all(|c| c.is_int() && c.as_int() == 0));
+    assert!(t.has(EC_TAG_KAD_BUDDY_PENDING) && t.has(EC_TAG_KAD_BUDDY_OWN_MISSING_SECONDS));
+}
+
 struct TempDir(PathBuf);
 
 impl Drop for TempDir {
@@ -435,4 +512,21 @@ fn the_partial_update_protocol_leaves_out_what_is_unchanged_and_names_what_is_go
     assert_eq!(files(&p), [3, 5]);
     let p = legacy.reply(&[], &UpdateData::default(), false);
     assert!(removed(&p).is_empty());
+}
+
+#[test]
+fn allowed_remote_dirs_are_one_a_line() {
+    let d = TempDir(std::env::temp_dir().join(format!("remuled-allowed-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&d.0);
+    std::fs::create_dir_all(&d.0).unwrap();
+    assert!(crate::config::allowed_remote_dirs(&d.0).is_empty());
+    std::fs::write(
+        d.0.join("allowed-remote-dirs.dat"),
+        "# roots\n/srv/media\n\n  /tmp  \r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::config::allowed_remote_dirs(&d.0),
+        ["/srv/media", "/tmp"]
+    );
 }

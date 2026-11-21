@@ -435,6 +435,58 @@ pub fn stats_reply(s: &Status, detail: u8) -> Packet {
     p.with(connstate_tag(s, detail))
 }
 
+/// `MakeKadBuddyTag`: the buddy counters, serving and own, in aMule's order.
+pub fn kad_buddy_tag() -> Tag {
+    let mut t = Tag::empty(EC_TAG_KAD_BUDDY);
+    t.children = [
+        EC_TAG_KAD_BUDDY_PENDING,
+        EC_TAG_KAD_BUDDY_SERVING_REQUESTS,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERED,
+        EC_TAG_KAD_BUDDY_SERVING_REFUSED_FIREWALLED,
+        EC_TAG_KAD_BUDDY_SERVING_REFUSED_FULL,
+        EC_TAG_KAD_BUDDY_SERVING_REFUSED_CONFLICT,
+        EC_TAG_KAD_BUDDY_SERVING_RATE_LIMITED,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERS_EXPIRED,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERS_SUPERSEDED,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERS_DUPLICATE,
+        EC_TAG_KAD_BUDDY_SERVING_STARTED,
+        EC_TAG_KAD_BUDDY_SERVING_RELEASED_EXTRA,
+        EC_TAG_KAD_BUDDY_SERVING_ENDED,
+        EC_TAG_KAD_BUDDY_SERVING_TIMED_OUT,
+        EC_TAG_KAD_BUDDY_SERVING_SECONDS,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACK_BYTES,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS_NO_BUDDY,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS_MISMATCHED,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS_RATE_LIMITED,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS,
+        EC_TAG_KAD_BUDDY_SERVING_REASK_BYTES,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS_NO_BUDDY,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS_MISMATCHED,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS_MALFORMED,
+        EC_TAG_KAD_BUDDY_SERVING_RELAY_BYTES_PEAK,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACK_REQUESTS_PEAK,
+        EC_TAG_KAD_BUDDY_OWN_SEARCHES,
+        EC_TAG_KAD_BUDDY_OWN_REQUESTS,
+        EC_TAG_KAD_BUDDY_OWN_REQUESTS_SKIPPED,
+        EC_TAG_KAD_BUDDY_OWN_OFFERS,
+        EC_TAG_KAD_BUDDY_OWN_CONNECT_ATTEMPTS,
+        EC_TAG_KAD_BUDDY_OWN_CONNECT_FAILURES,
+        EC_TAG_KAD_BUDDY_OWN_CONNECTED,
+        EC_TAG_KAD_BUDDY_OWN_ENDED,
+        EC_TAG_KAD_BUDDY_OWN_TIMED_OUT,
+        EC_TAG_KAD_BUDDY_OWN_SECONDS,
+        EC_TAG_KAD_BUDDY_OWN_CALLBACKS,
+        EC_TAG_KAD_BUDDY_OWN_REASKS,
+        EC_TAG_KAD_BUDDY_OWN_NEEDED_SECONDS,
+        EC_TAG_KAD_BUDDY_OWN_MISSING_SECONDS,
+    ]
+    .into_iter()
+    .map(|n| Tag::int(n, 0))
+    .collect();
+    t
+}
+
 fn failed(message: &str) -> Packet {
     Packet::new(EC_OP_FAILED).with(Tag::string(EC_TAG_STRING, message))
 }
@@ -689,6 +741,12 @@ pub async fn answer(
         EC_OP_STAT_REQ => {
             let d = detail(req);
             let mut p = stats_reply(s, d);
+            // `MakeKadBuddyTag`, when asked for: no buddy is kept or
+            // served yet, so every counter is 0.
+            if d != EC_DETAIL_UPDATE && req.tag(EC_TAG_KAD_BUDDY).is_some() {
+                let at = p.tags.len().saturating_sub(1);
+                p.tags.insert(at, kad_buddy_tag());
+            }
             // `AddLoggerTag`: the lines this connection has not seen, after
             // the banned count, at the GUI's levels.
             if d == EC_DETAIL_FULL || d == EC_DETAIL_INC_UPDATE {

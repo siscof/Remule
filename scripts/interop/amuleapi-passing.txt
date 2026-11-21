@@ -31,3 +31,5 @@
 01-version-and-errors.sh
 17-shared-priority-patch.sh
 30-shared-verify.sh
+05-read-servers-kad-categories-prefs.sh
+41-shared-content.sh

@@ -423,6 +423,59 @@ async fn searching_server(listener: tokio::net::TcpListener) {
 
 const SECRET: &str = "5ebe2294ecd0e0f08eab7690d2a6ee69"; // md5("secret")
 
+/// A daemon logged into a scripted server, with EC on: its config
+/// directory, EC port and task.
+async fn searching_daemon(
+    name: &str,
+) -> (
+    TempDir,
+    u16,
+    tokio::task::JoinHandle<Result<crate::client::Summary, String>>,
+) {
+    let d = TempDir::new(name);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = listener.local_addr().unwrap().port();
+    tokio::spawn(searching_server(listener));
+    let (port, ec_port) = (free_port(), free_port());
+    std::fs::write(
+        d.0.join("amule.conf"),
+        format!(
+            "[eMule]\nPort={port}\nConnectToKad=0\nConnectToED2K=1\n\
+             [ExternalConnect]\nAcceptExternalConnections=1\nECPort={ec_port}\n\
+             ECPassword={SECRET}\n"
+        ),
+    )
+    .unwrap();
+    let met = ServerMet {
+        version: 0x0E,
+        servers: vec![ServerRecord {
+            ip: Ipv4Addr::LOCALHOST,
+            port: server_port,
+            tags: Vec::new(),
+        }],
+        legacy_counts: false,
+    };
+    std::fs::write(d.0.join("server.met"), met.write()).unwrap();
+    let loaded = config::load(&d.0).unwrap();
+    let daemon = tokio::spawn(crate::client::run(
+        loaded.client,
+        Vec::new(),
+        Vec::new(),
+        std::future::pending(),
+    ));
+    let mut tries = 0;
+    while tokio::net::TcpStream::connect(("127.0.0.1", ec_port))
+        .await
+        .is_err()
+    {
+        tries += 1;
+        assert!(tries < 100, "the daemon never listened for EC");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    (d, ec_port, daemon)
+}
+
 /// A daemon logged into a scripted server: an EC client searches it,
 /// reads the results and the progress as `amulecmd` does, downloads one,
 /// and finds it in the download queue.
@@ -578,4 +631,155 @@ async fn an_ec_client_searches_and_downloads_a_result() {
         .expect("the daemon did not stop")
         .unwrap()
         .unwrap();
+}
+
+/// What amuleapi does, speaking multi-search: two searches by ID, each
+/// polled, listed, its results read and one downloaded; one stopped, one
+/// closed, and an ID no search has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_search_client_runs_searches_by_id() {
+    let (_d, ec_port, daemon) = searching_daemon("multi").await;
+    tokio::task::spawn_blocking(move || {
+        let mut opts = ConnectOptions::new("127.0.0.1", ec_port, SECRET);
+        opts.capabilities = vec![EC_TAG_CAN_MULTI_SEARCH, EC_TAG_CAN_SEARCH_PROGRESS_UNION];
+        let mut c = Client::connect(&opts).unwrap();
+        let mut ask = |p: Packet| c.request(&p).unwrap();
+        for _ in 0..100 {
+            let r = ask(Packet::new(EC_OP_GET_CONNSTATE).with_detail(EC_DETAIL_CMD));
+            if r.tags[0].as_int() & 1 == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let search = |words: &str, r: u64| {
+            Packet::new(EC_OP_SEARCH_START)
+                .with(
+                    Tag::int(EC_TAG_SEARCH_TYPE, EC_SEARCH_LOCAL.into())
+                        .with(Tag::string(EC_TAG_SEARCH_NAME, words))
+                        .with(Tag::string(EC_TAG_SEARCH_FILE_TYPE, "")),
+                )
+                .with(Tag::int(EC_TAG_SEARCH_REF, r))
+        };
+        // A refusal echoes the client's token.
+        let r = ask(Packet::new(EC_OP_SEARCH_START)
+            .with(
+                Tag::int(EC_TAG_SEARCH_TYPE, EC_SEARCH_KAD.into())
+                    .with(Tag::string(EC_TAG_SEARCH_NAME, "x")),
+            )
+            .with(Tag::int(EC_TAG_SEARCH_REF, 5)));
+        assert_eq!(r.opcode, EC_OP_FAILED);
+        assert_eq!(r.tag(EC_TAG_SEARCH_REF).unwrap().as_int(), 5);
+        assert!(r.tag(EC_TAG_SEARCH_ID).is_none());
+
+        let r = ask(search("ubuntu", 7));
+        assert_eq!(r.opcode, EC_OP_STRINGS);
+        let first = r.tag(EC_TAG_SEARCH_ID).unwrap().as_int();
+        assert_eq!(r.tag(EC_TAG_SEARCH_REF).unwrap().as_int(), 7);
+        assert_eq!(r.tag(EC_TAG_SEARCH_ED2K_ACTIVE).unwrap().as_int(), 1);
+        assert_eq!(r.tag(EC_TAG_SEARCH_KAD_ACTIVE).unwrap().as_int(), 0);
+        // Its progress, by ID, until done.
+        // With the union form, naming an ID narrows the union: its entry.
+        let progress = |ask: &mut dyn FnMut(Packet) -> Packet, id: u64| {
+            let u = ask(Packet::new(EC_OP_SEARCH_PROGRESS).with(Tag::int(EC_TAG_SEARCH_ID, id)));
+            let mut p = Packet::new(EC_OP_SEARCH_PROGRESS);
+            if let Some(e) = u.tags.iter().find(|t| t.as_int() == id) {
+                p.tags = e.children.clone();
+            }
+            p
+        };
+        let mut done = None;
+        for _ in 0..100 {
+            let p = progress(&mut ask, first);
+            if p.tag(EC_TAG_SEARCH_LIFECYCLE_STATE).unwrap().as_int() == Lifecycle::Finished as u64
+            {
+                done = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let p = done.expect("the search never finished");
+        assert_eq!(p.tag(EC_TAG_SEARCH_ID).unwrap().as_int(), first);
+        assert_eq!(p.tag(EC_TAG_SEARCH_NAME).unwrap().as_str(), "ubuntu");
+        assert_eq!(p.tag(EC_TAG_SEARCH_RESULT_COUNT).unwrap().as_int(), 2);
+        assert_eq!(p.tag(EC_TAG_SEARCH_STATUS).unwrap().as_int(), 0xffff);
+
+        // A second one: its own ID and results.
+        let r = ask(search("linux", 8));
+        let second = r.tag(EC_TAG_SEARCH_ID).unwrap().as_int();
+        assert_ne!(first, second);
+        let results = |ask: &mut dyn FnMut(Packet) -> Packet, id: u64| {
+            ask(Packet::new(EC_OP_SEARCH_RESULTS)
+                .with_detail(EC_DETAIL_FULL)
+                .with(Tag::int(EC_TAG_SEARCH_ID, id)))
+        };
+        assert_eq!(results(&mut ask, first).tags.len(), 2);
+        // Listed in ID order, each with its query.
+        let l = ask(Packet::new(EC_OP_SEARCH_LIST));
+        let ids: Vec<u64> = l.tags.iter().map(Tag::as_int).collect();
+        assert_eq!(ids, [first, second]);
+        assert_eq!(l.tags[0].child_str(EC_TAG_SEARCH_NAME), "ubuntu");
+        assert_eq!(l.tags[0].child_int(EC_TAG_SEARCH_RESULT_COUNT), 2);
+        // The union form: every search, one child each.
+        let u = ask(Packet::new(EC_OP_SEARCH_PROGRESS));
+        assert_eq!(u.tags.len(), 2);
+        assert!(u.tags.iter().all(
+            |t| t.name == EC_TAG_SEARCH_ID && t.child(EC_TAG_SEARCH_LIFECYCLE_STATE).is_some()
+        ));
+
+        // A result downloaded by its ECID.
+        let r = results(&mut ask, first);
+        let ecid = r.tags[0].as_int();
+        let dl = Packet::new(EC_OP_DOWNLOAD_SEARCH_RESULT).with(
+            Tag::hash(EC_TAG_PARTFILE, [0; 16])
+                .with(Tag::int(EC_TAG_PARTFILE_CAT, 0))
+                .with(Tag::int(EC_TAG_SEARCHFILE, ecid)),
+        );
+        assert_eq!(ask(dl).opcode, EC_OP_STRINGS);
+
+        // Stopped: results kept. Closed: gone, and an ID no search has
+        // is expired.
+        let stop = |id: u64, close: bool| {
+            let mut p = Packet::new(EC_OP_SEARCH_STOP).with(Tag::int(EC_TAG_SEARCH_ID, id));
+            if close {
+                p = p.with(Tag::empty(EC_TAG_SEARCH_CLOSE));
+            }
+            p
+        };
+        assert_eq!(ask(stop(second, false)).opcode, EC_OP_MISC_DATA);
+        assert_eq!(ask(stop(first, true)).opcode, EC_OP_MISC_DATA);
+        let r = results(&mut ask, first);
+        assert!(r.tag(EC_TAG_SEARCH_EXPIRED).is_some());
+        // Left out of the union: how a union client learns it expired.
+        let u = ask(Packet::new(EC_OP_SEARCH_PROGRESS).with(Tag::int(EC_TAG_SEARCH_ID, first)));
+        assert!(u.tags.is_empty());
+        assert_eq!(ask(Packet::new(EC_OP_SEARCH_LIST)).tags.len(), 1);
+        // Re-asking Kad is not done: nothing to widen, the ID echoed.
+        let m =
+            ask(Packet::new(EC_OP_SEARCH_REQUEST_MORE).with(Tag::int(EC_TAG_SEARCH_ID, second)));
+        assert_eq!(m.tag(EC_TAG_SEARCH_MORE_REASKABLE).unwrap().as_int(), 0);
+        assert_eq!(m.tag(EC_TAG_SEARCH_ID).unwrap().as_int(), second);
+        assert_eq!(ask(Packet::new(EC_OP_SHUTDOWN)).opcode, EC_OP_NOOP);
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn only_one_search_waits_for_the_server() {
+    use crate::ec_search::Searches;
+    let mut s = Searches::default();
+    let now = Instant::now();
+    local(&mut s.legacy, now);
+    assert!(s.legacy.ed2k_running());
+    s.server_results(vec![result(1, "a.iso", 1000, 1, 0)]);
+    assert_eq!(s.legacy.results().len(), 1);
+    assert!(!s.legacy.ed2k_running(), "the answer ends it");
+    // An answer nobody waits for goes nowhere.
+    s.server_results(vec![result(2, "b.iso", 1000, 1, 0)]);
+    assert_eq!(s.legacy.results().len(), 1);
 }

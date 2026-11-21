@@ -269,7 +269,9 @@ pub enum Control {
     /// ([`crate::ec_search`]).
     Search {
         req: Packet,
-        reply: oneshot::Sender<Packet>,
+        ctx: crate::ec_search::Ctx,
+        /// The reply, and the ID of a search it started.
+        reply: oneshot::Sender<(Packet, Option<u32>)>,
     },
     /// A server or network request ([`crate::ec_servers`]), answered by
     /// the client loop.
@@ -987,7 +989,11 @@ pub async fn answer(
         EC_OP_GET_DLOAD_QUEUE => (download_queue_reply(req, s), false),
         EC_OP_ADD_LINK => (add_links(req, control).await, false),
         op if crate::ec_search::is_search(op) => {
-            (crate::ec_search::forward(req, control).await, false)
+            let (p, started) = crate::ec_search::forward(req, conn.search, control).await;
+            if let Some(id) = started {
+                conn.search.current = id;
+            }
+            (p, false)
         }
         EC_OP_PARTFILE_PAUSE
         | EC_OP_PARTFILE_RESUME
@@ -1161,6 +1167,8 @@ pub struct ConnView<'a> {
     pub log: crate::applog::Cursor,
     /// It speaks the partial-update protocol.
     pub partial: bool,
+    /// How it searches, and the last search it started.
+    pub search: crate::ec_search::Ctx,
     /// What it was sent of each object, for incremental updates.
     pub update: crate::ec_update::UpdateState,
     pub prefs: &'a Mutex<crate::prefs::PrefStore>,
@@ -1182,6 +1190,7 @@ async fn connection(
     let mut cv = ConnView {
         log: crate::applog::global().cursor(),
         partial: false,
+        search: Default::default(),
         update: Default::default(),
         prefs: sh.prefs,
         history: sh.history,
@@ -1214,6 +1223,8 @@ async fn connection(
                 let down = sh.shutting_down.load(Ordering::SeqCst);
                 let view = status.borrow_and_update().clone();
                 cv.partial = conn.partial_update();
+                cv.search.multi = conn.multi_search();
+                cv.search.union = conn.progress_union();
                 let (reply, stops) = answer(&req, &view, down, &control, &mut cv).await;
                 // A change to the downloads is answered once the view shows
                 // it, as aMule's are: what the client asks next sees it.

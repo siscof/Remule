@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Searches over external connections (`CSearchList` and the search
-//! requests of `ExternalConn.cpp`), for clients that do not speak
-//! multi-search: one search at a time, its results in the legacy
-//! `0xffffffff` bucket.
+//! requests of `ExternalConn.cpp`): the legacy single search (`0xffffffff`)
+//! for clients that do not speak multi-search, and for those that do
+//! (`EC_TAG_CAN_MULTI_SEARCH`, amuleapi and amulegui) searches by a
+//! daemon-allocated `EC_TAG_SEARCH_ID`, several at once ([`Searches`]):
+//! started, listed, polled one by one or all together, stopped and closed.
 //!
 //! [`SearchList`] keeps the search and its results without IO: what may be
 //! started, the results merged as `CSearchList::AddToList` merges them, and
@@ -12,7 +14,8 @@
 //!
 //! Not yet: the global sweep over other servers by UDP (a global search
 //! asks the connected server, as a local one does), filtering results by
-//! file type, stopping a running Kad lookup (its later results are ignored).
+//! file type, stopping a running Kad lookup (its later results are ignored),
+//! re-asking Kad for more results, browsing a peer's files.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
@@ -208,7 +211,6 @@ pub struct Plan {
 #[derive(Debug, Default)]
 pub struct SearchList {
     results: Vec<SearchFile>,
-    next_ecid: u32,
     /// `m_searchType`.
     kind: Kind,
     /// `m_currentSearch != -1`.
@@ -230,9 +232,41 @@ fn parser_error(e: impl std::fmt::Display) -> String {
 }
 
 impl SearchList {
+    /// A result's `CECID`: unique across every search, as aMule's are.
     fn ecid(&mut self) -> u32 {
-        self.next_ecid += 1;
-        self.next_ecid
+        crate::ec_shared::next_ecid()
+    }
+
+    /// The eD2k part waits for the server's answer.
+    pub fn ed2k_running(&self) -> bool {
+        self.ed2k_running
+    }
+
+    /// `StopInFlightEd2kSearch`: another search takes the server; the
+    /// results and any Kad part stay.
+    pub fn stop_ed2k(&mut self) {
+        if self.ed2k_running {
+            self.finish_ed2k();
+        }
+    }
+
+    /// `GetSearchBarStatusById`: a finished search 0xfffe with a Kad part,
+    /// else 0xffff; a running one its percent.
+    pub fn bar_status(&self, now: Instant) -> u32 {
+        match self.lifecycle() {
+            Lifecycle::Finished if matches!(self.kind, Kind::Kad | Kind::All) => 0xfffe,
+            Lifecycle::Finished => 0xffff,
+            _ => self.percent(now).into(),
+        }
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// The Kad part still runs.
+    pub fn kad_running(&self) -> bool {
+        self.kad_id.is_some() && !(self.kind == Kind::Kad && self.kad_finished)
     }
 
     pub fn results(&self) -> &[SearchFile] {
@@ -637,33 +671,58 @@ fn reply(op: u8, message: &str) -> Packet {
     Packet::new(op).with(Tag::string(EC_TAG_STRING, message))
 }
 
-/// `Get_EC_Response_Search` on the legacy sentinel: the bucket emptied,
-/// then the search started (or why not).
-async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
-    let empty = Tag::empty(EC_TAG_SEARCH_TYPE);
-    let (ty, params) = search_params(req.tags.first().unwrap_or(&empty));
-    let kind = match ty {
+/// What a start asks for: its kind, or the refusal.
+fn kind_of(ty: u8, params: &SearchParams) -> Result<Kind, Packet> {
+    Ok(match ty {
         EC_SEARCH_WEB => {
-            return reply(
+            return Err(reply(
                 EC_OP_FAILED,
                 "WebSearch from remote interface makes no sense.",
-            )
+            ))
         }
         _ if params.min_bitrate > MAX_MIN_BITRATE || params.min_length > MAX_MIN_LENGTH => {
-            return reply(EC_OP_FAILED, "Invalid media search filter.")
+            return Err(reply(EC_OP_FAILED, "Invalid media search filter."))
         }
         EC_SEARCH_BROWSE => {
-            return reply(
+            return Err(reply(
                 EC_OP_FAILED,
                 "A browse is not a search that can be started.",
-            )
+            ))
         }
         EC_SEARCH_GLOBAL => Kind::Global,
         EC_SEARCH_KAD => Kind::Kad,
         EC_SEARCH_ALL => Kind::All,
         _ => Kind::Local,
+    })
+}
+
+/// `Get_EC_Response_Search` on the legacy sentinel: the bucket emptied,
+/// then the search started (or why not).
+async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
+    let empty = Tag::empty(EC_TAG_SEARCH_TYPE);
+    let (ty, params) = search_params(req.tags.first().unwrap_or(&empty));
+    let kind = match kind_of(ty, &params) {
+        Ok(k) => k,
+        Err(p) => return p,
     };
     list.remove_results();
+    match launch(list, kind, &params, net).await {
+        Ok(_) => reply(
+            EC_OP_STRINGS,
+            "Search in progress. Refetch results in a moment!",
+        ),
+        Err(e) => reply(EC_OP_FAILED, &e),
+    }
+}
+
+/// `StartNewSearch` on `list`: checked, then the Kad part started and the
+/// request sent to the server. Which parts started.
+async fn launch(
+    list: &mut SearchList,
+    kind: Kind,
+    params: &SearchParams,
+    net: &Net<'_>,
+) -> Result<Plan, String> {
     let networks = Networks {
         ed2k_connected: net.server.is_some(),
         large_files: net
@@ -671,10 +730,7 @@ async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
             .is_some_and(|s| s.info().tcp_flags & LARGEFILES != 0),
         kad_running: net.kad.is_some(),
     };
-    let mut plan = match list.plan(kind, &params, networks) {
-        Ok(p) => p,
-        Err(e) => return reply(EC_OP_FAILED, &e),
-    };
+    let mut plan = list.plan(kind, params, networks)?;
     let mut kad_id = None;
     if let (Some(p), Some(k)) = (plan.kad.clone(), net.kad) {
         match k.search_keyword(p).await {
@@ -686,12 +742,7 @@ async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
                 info!("All search: Kad component could not start: {e}");
                 plan.kad = None;
             }
-            Err(e) => {
-                return reply(
-                    EC_OP_FAILED,
-                    &format!("Unexpected error while attempting Kad search: {e}"),
-                )
-            }
+            Err(e) => return Err(format!("Unexpected error while attempting Kad search: {e}")),
         }
     }
     list.begin(&plan, kad_id, Instant::now());
@@ -700,14 +751,11 @@ async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
             warn!("search request to the server: {e}");
         }
     }
-    reply(
-        EC_OP_STRINGS,
-        "Search in progress. Refetch results in a moment!",
-    )
+    Ok(plan)
 }
 
 /// `Get_EC_Response_Search_Results_Download`.
-fn downloads(req: &Packet, list: &SearchList) -> (Packet, Vec<ToDownload>) {
+fn downloads(req: &Packet, list: &Searches) -> (Packet, Vec<ToDownload>) {
     let mut out = Vec::new();
     let mut all_found = true;
     for t in &req.tags {
@@ -735,24 +783,391 @@ fn downloads(req: &Packet, list: &SearchList) -> (Packet, Vec<ToDownload>) {
     }
 }
 
-/// A search request: the reply, and the results to start downloading.
-/// `status` says what became of a file (`download_status`).
+/// `kMaxEcSearches`: how many searches by ID are kept; the least recently
+/// used goes first.
+pub const MAX_EC_SEARCHES: usize = 20;
+
+/// One search by ID (multi-search).
+#[derive(Debug)]
+struct ByIdSearch {
+    id: u32,
+    /// The query, as `GetSearchStringById` tells it.
+    name: String,
+    type_text: String,
+    params: SearchParams,
+    list: SearchList,
+}
+
+/// The searches: the legacy one (`0xffffffff`) and those by ID, as one
+/// `CSearchList` holds them. Only one eD2k part runs at a time, whichever
+/// search started last; each Kad part feeds its own search.
+#[derive(Debug, Default)]
+pub struct Searches {
+    pub legacy: SearchList,
+    /// Most recently used first.
+    by_id: Vec<ByIdSearch>,
+    next_id: u32,
+    /// `s_ecSearches.Current()`: the last started.
+    current: u32,
+}
+
+/// What a connection brings to a search request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ctx {
+    /// It speaks multi-search.
+    pub multi: bool,
+    /// It reads an id-less progress request as every search.
+    pub union: bool,
+    /// The last search it started (`m_currentSearchId`), 0 for none.
+    pub current: u32,
+}
+
+impl Searches {
+    fn all_mut(&mut self) -> impl Iterator<Item = &mut SearchList> {
+        std::iter::once(&mut self.legacy).chain(self.by_id.iter_mut().map(|s| &mut s.list))
+    }
+
+    /// The server's answer, for the search whose eD2k part waits for it.
+    pub fn server_results(&mut self, results: Vec<SearchResult>) {
+        if let Some(l) = self.all_mut().find(|l| l.ed2k_running()) {
+            l.server_results(results);
+        }
+    }
+
+    pub fn kad_result(&mut self, search: u32, k: KeywordResult) {
+        for l in self.all_mut() {
+            if l.kad_id == Some(search) {
+                l.kad_result(search, k);
+                return;
+            }
+        }
+    }
+
+    pub fn kad_done(&mut self, search: u32) {
+        for l in self.all_mut() {
+            l.kad_done(search);
+        }
+    }
+
+    pub fn poll(&mut self, now: Instant) {
+        for l in self.all_mut() {
+            l.poll(now);
+        }
+    }
+
+    /// The searches by ID in ID order, as `GetKnownSearchIds` gives them.
+    fn by_ids(&self) -> Vec<&ByIdSearch> {
+        let mut v: Vec<&ByIdSearch> = self.by_id.iter().collect();
+        v.sort_by_key(|s| s.id);
+        v
+    }
+
+    /// The search by ID, marked recently used (`Touch`).
+    fn touch(&mut self, id: u32) -> Option<&mut ByIdSearch> {
+        let i = self.by_id.iter().position(|s| s.id == id)?;
+        let s = self.by_id.remove(i);
+        self.by_id.insert(0, s);
+        self.by_id.first_mut()
+    }
+
+    fn default_id(&self, ctx: Ctx) -> u32 {
+        if ctx.current != 0 {
+            ctx.current
+        } else {
+            self.current
+        }
+    }
+
+    /// The ID a request names, or the default one.
+    fn asked(&self, req: &Packet, ctx: Ctx) -> u32 {
+        req.tag(EC_TAG_SEARCH_ID)
+            .map_or_else(|| self.default_id(ctx), |t| t.as_int() as u32)
+    }
+
+    /// `AppendSearchProgress`: one search's progress tags, after `out`'s.
+    fn progress_tags(s: &ByIdSearch, out: &mut Vec<Tag>, now: Instant) {
+        let l = &s.list;
+        out.extend([
+            Tag::int(EC_TAG_SEARCH_STATUS, l.bar_status(now).into()),
+            Tag::int(EC_TAG_SEARCH_ID, s.id.into()),
+            Tag::string(EC_TAG_SEARCH_NAME, &s.name),
+            Tag::int(EC_TAG_SEARCH_LIFECYCLE_STATE, l.lifecycle() as u64),
+            Tag::int(EC_TAG_SEARCH_LIFECYCLE_KIND, l.kind() as u64),
+            Tag::int(EC_TAG_SEARCH_RESULT_COUNT, l.results().len() as u64),
+            Tag::int(EC_TAG_SEARCH_LIFECYCLE_PERCENT, l.percent(now).into()),
+            Tag::int(EC_TAG_SEARCH_ED2K_ACTIVE, l.ed2k_running().into()),
+            Tag::int(EC_TAG_SEARCH_KAD_ACTIVE, l.kad_running().into()),
+        ]);
+    }
+
+    /// `Get_EC_Response_Search` by ID: a new search with a new ID, the
+    /// running eD2k part of another stopped first (`StopInFlightEd2kSearch`);
+    /// the least recently used dropped past [`MAX_EC_SEARCHES`].
+    async fn start(&mut self, req: &Packet, net: &Net<'_>) -> (Packet, Option<u32>) {
+        let empty = Tag::empty(EC_TAG_SEARCH_TYPE);
+        let t = req.tags.first().unwrap_or(&empty);
+        let (ty, params) = search_params(t);
+        let echo_ref = |mut p: Packet| {
+            if let Some(r) = req.tag(EC_TAG_SEARCH_REF) {
+                p = p.with(Tag::int(EC_TAG_SEARCH_REF, r.as_int()));
+            }
+            p
+        };
+        let kind = match kind_of(ty, &params) {
+            Ok(k) => k,
+            Err(p) => return (echo_ref(p), None),
+        };
+        let mut list = SearchList::default();
+        let networks = Networks {
+            ed2k_connected: net.server.is_some(),
+            large_files: net
+                .server
+                .is_some_and(|s| s.info().tcp_flags & LARGEFILES != 0),
+            kad_running: net.kad.is_some(),
+        };
+        // Checked before anything running is touched.
+        if let Err(e) = list.plan(kind, &params, networks) {
+            return (echo_ref(reply(EC_OP_FAILED, &e)), None);
+        }
+        if kind != Kind::Kad {
+            for l in self.all_mut() {
+                l.stop_ed2k();
+            }
+        }
+        if let Err(e) = launch(&mut list, kind, &params, net).await {
+            return (echo_ref(reply(EC_OP_FAILED, &e)), None);
+        }
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.next_id;
+        self.by_id.insert(
+            0,
+            ByIdSearch {
+                id,
+                name: params.query.clone(),
+                type_text: t.child_str(EC_TAG_SEARCH_FILE_TYPE),
+                params,
+                list,
+            },
+        );
+        self.by_id.truncate(MAX_EC_SEARCHES);
+        self.current = id;
+        let s = &self.by_id[0];
+        let p = reply(
+            EC_OP_STRINGS,
+            "Search in progress. Refetch results in a moment!",
+        )
+        .with(Tag::int(EC_TAG_SEARCH_ID, id.into()))
+        .with(Tag::int(
+            EC_TAG_SEARCH_ED2K_ACTIVE,
+            s.list.ed2k_running().into(),
+        ))
+        .with(Tag::int(
+            EC_TAG_SEARCH_KAD_ACTIVE,
+            s.list.kad_running().into(),
+        ));
+        (echo_ref(p), Some(id))
+    }
+
+    /// `Get_EC_Response_Search_List`: every search by ID, with what it was
+    /// started with and how it stands.
+    fn list_reply(&self, now: Instant) -> Packet {
+        let mut p = Packet::new(EC_OP_SEARCH_LIST);
+        for s in self.by_ids() {
+            let l = &s.list;
+            let mut t = Tag::int(EC_TAG_SEARCH_ID, s.id.into())
+                .with(Tag::int(EC_TAG_SEARCH_STATUS, l.bar_status(now).into()))
+                .with(Tag::int(EC_TAG_SEARCH_ED2K_ACTIVE, l.ed2k_running().into()))
+                .with(Tag::int(EC_TAG_SEARCH_KAD_ACTIVE, l.kad_running().into()))
+                .with(Tag::string(EC_TAG_SEARCH_NAME, &s.name));
+            if !s.type_text.is_empty() {
+                t = t.with(Tag::string(EC_TAG_SEARCH_FILE_TYPE, &s.type_text));
+            }
+            if !s.params.extension.is_empty() {
+                t = t.with(Tag::string(EC_TAG_SEARCH_EXTENSION, &s.params.extension));
+            }
+            t = t
+                .with(Tag::int(EC_TAG_SEARCH_MIN_SIZE, s.params.min_size))
+                .with(Tag::int(EC_TAG_SEARCH_MAX_SIZE, s.params.max_size))
+                .with(Tag::int(EC_TAG_SEARCH_AVAILABILITY, s.params.availability))
+                .with(Tag::int(EC_TAG_SEARCH_MIN_BITRATE, s.params.min_bitrate))
+                .with(Tag::int(EC_TAG_SEARCH_MIN_LENGTH, s.params.min_length));
+            for (name, v) in [
+                (EC_TAG_SEARCH_CODEC, &s.params.codec),
+                (EC_TAG_SEARCH_TITLE, &s.params.title),
+                (EC_TAG_SEARCH_ALBUM, &s.params.album),
+                (EC_TAG_SEARCH_ARTIST, &s.params.artist),
+            ] {
+                if !v.is_empty() {
+                    t = t.with(Tag::string(name, v));
+                }
+            }
+            t = t
+                .with(Tag::int(EC_TAG_SEARCH_LIFECYCLE_KIND, l.kind() as u64))
+                .with(Tag::int(
+                    EC_TAG_SEARCH_LIFECYCLE_STATE,
+                    l.lifecycle() as u64,
+                ))
+                .with(Tag::int(
+                    EC_TAG_SEARCH_RESULT_COUNT,
+                    l.results().len() as u64,
+                ))
+                .with(Tag::int(
+                    EC_TAG_SEARCH_LIFECYCLE_PERCENT,
+                    l.percent(now).into(),
+                ));
+            p = p.with(t);
+        }
+        p
+    }
+
+    /// A request in multi-search mode.
+    async fn serve_by_id(
+        &mut self,
+        req: &Packet,
+        ctx: Ctx,
+        net: &Net<'_>,
+        status: &(dyn Fn(&Md4Hash) -> u8 + Sync),
+    ) -> (Packet, Option<u32>) {
+        let now = Instant::now();
+        let expired = |op: u8, id: u32| {
+            let mut p = Packet::new(op).with(Tag::empty(EC_TAG_SEARCH_EXPIRED));
+            if id != 0 && op == EC_OP_SEARCH_PROGRESS {
+                p = p.with(Tag::int(EC_TAG_SEARCH_ID, id.into()));
+            }
+            p
+        };
+        match req.opcode {
+            EC_OP_SEARCH_START => self.start(req, net).await,
+            EC_OP_SEARCH_LIST => (self.list_reply(now), None),
+            // amulegui's union poll: every search's results, each with
+            // its search's ID.
+            EC_OP_SEARCH_RESULTS
+                if req
+                    .tag(EC_TAG_DETAIL_LEVEL)
+                    .is_some_and(|t| t.as_int() == u64::from(EC_DETAIL_INC_UPDATE)) =>
+            {
+                let mut p = Packet::new(EC_OP_SEARCH_RESULTS);
+                for s in self.by_ids() {
+                    for f in s.list.results() {
+                        for r in std::iter::once(f).chain(&f.children) {
+                            let mut t = r.tag(EC_DETAIL_INC_UPDATE, status(&r.hash));
+                            t.children
+                                .insert(0, Tag::int(EC_TAG_SEARCH_ID, s.id.into()));
+                            p = p.with(t);
+                        }
+                    }
+                }
+                (p, None)
+            }
+            EC_OP_SEARCH_RESULTS => {
+                let id = self.asked(req, ctx);
+                match self.touch(id) {
+                    Some(s) => (s.list.results_reply(req, status), None),
+                    None => (expired(EC_OP_SEARCH_RESULTS, id), None),
+                }
+            }
+            EC_OP_SEARCH_PROGRESS if ctx.union => {
+                let wanted: Vec<u32> = req
+                    .tags_named(EC_TAG_SEARCH_ID)
+                    .map(|t| t.as_int() as u32)
+                    .collect();
+                let ids: Vec<u32> = if wanted.is_empty() {
+                    self.by_ids().iter().map(|s| s.id).collect()
+                } else {
+                    wanted
+                };
+                let mut p = Packet::new(EC_OP_SEARCH_PROGRESS);
+                for id in ids {
+                    if let Some(s) = self.touch(id) {
+                        let mut t = Tag::int(EC_TAG_SEARCH_ID, id.into());
+                        Self::progress_tags(s, &mut t.children, now);
+                        p = p.with(t);
+                    }
+                }
+                (p, None)
+            }
+            EC_OP_SEARCH_PROGRESS => {
+                let id = self.asked(req, ctx);
+                match self.touch(id) {
+                    Some(s) => {
+                        let mut p = Packet::new(EC_OP_SEARCH_PROGRESS);
+                        Self::progress_tags(s, &mut p.tags, now);
+                        (p, None)
+                    }
+                    None => (expired(EC_OP_SEARCH_PROGRESS, id), None),
+                }
+            }
+            EC_OP_SEARCH_STOP => {
+                let id = self.asked(req, ctx);
+                if req.tag(EC_TAG_SEARCH_CLOSE).is_some() {
+                    // A tab closed: stopped, its results freed.
+                    self.by_id.retain(|s| s.id != id);
+                    if self.current == id {
+                        self.current = 0;
+                    }
+                } else if let Some(s) = self.touch(id) {
+                    s.list.stop();
+                }
+                (Packet::new(EC_OP_MISC_DATA), None)
+            }
+            EC_OP_SEARCH_REQUEST_MORE => {
+                // Re-asking Kad's peers is not done yet: nothing to widen.
+                let id = self.asked(req, ctx);
+                let mut p =
+                    Packet::new(EC_OP_MISC_DATA).with(Tag::int(EC_TAG_SEARCH_MORE_REASKABLE, 0));
+                if id != 0 {
+                    p = p.with(Tag::int(EC_TAG_SEARCH_ID, id.into()));
+                }
+                (p, None)
+            }
+            _ => (Packet::new(EC_OP_FAILED), None),
+        }
+    }
+
+    /// `AddFileToDownloadByEcid` / `ByHash` over every search.
+    fn find_for_download(&self, ecid: Option<u32>, hash: Option<Md4Hash>) -> Option<&SearchFile> {
+        std::iter::once(&self.legacy)
+            .chain(self.by_id.iter().map(|s| &s.list))
+            .find_map(|l| l.find_for_download(ecid, hash))
+    }
+}
+
+/// A search request: the reply, the results to start downloading, and
+/// the ID of a search it started. `status` says what became of a file
+/// (`download_status`).
 pub async fn serve(
     req: &Packet,
-    list: &mut SearchList,
+    searches: &mut Searches,
+    ctx: Ctx,
     net: Net<'_>,
     status: &(dyn Fn(&Md4Hash) -> u8 + Sync),
-) -> (Packet, Vec<ToDownload>) {
+) -> (Packet, Vec<ToDownload>, Option<u32>) {
     let now = Instant::now();
-    match req.opcode {
-        EC_OP_SEARCH_START => (start(req, list, &net).await, Vec::new()),
-        EC_OP_SEARCH_STOP => {
-            list.stop();
-            (Packet::new(EC_OP_MISC_DATA), Vec::new())
+    if req.opcode == EC_OP_DOWNLOAD_SEARCH_RESULT {
+        let (p, todo) = downloads(req, searches);
+        return (p, todo, None);
+    }
+    if ctx.multi {
+        let (p, started) = searches.serve_by_id(req, ctx, &net, status).await;
+        return (p, Vec::new(), started);
+    }
+    let p = match req.opcode {
+        EC_OP_SEARCH_START => {
+            // An eD2k search takes the server from a search by ID.
+            let ty = req.tags.first().map_or(0, |t| t.as_int() as u8);
+            if ty != EC_SEARCH_KAD {
+                for s in &mut searches.by_id {
+                    s.list.stop_ed2k();
+                }
+            }
+            start(req, &mut searches.legacy, &net).await
         }
-        EC_OP_SEARCH_RESULTS => (list.results_reply(req, status), Vec::new()),
-        EC_OP_SEARCH_PROGRESS => (list.progress_reply(now), Vec::new()),
-        EC_OP_DOWNLOAD_SEARCH_RESULT => downloads(req, list),
+        EC_OP_SEARCH_STOP => {
+            searches.legacy.stop();
+            Packet::new(EC_OP_MISC_DATA)
+        }
+        EC_OP_SEARCH_RESULTS => searches.legacy.results_reply(req, status),
+        EC_OP_SEARCH_PROGRESS => searches.legacy.progress_reply(now),
         EC_OP_SEARCH_REQUEST_MORE => {
             // Only multi-search has searches to widen.
             let mut p =
@@ -760,11 +1175,12 @@ pub async fn serve(
             if let Some(id) = req.tag(EC_TAG_SEARCH_ID) {
                 p = p.with(Tag::int(EC_TAG_SEARCH_ID, id.as_int()));
             }
-            (p, Vec::new())
+            p
         }
         // A legacy client has the one search, nothing to list.
-        _ => (Packet::new(EC_OP_SEARCH_LIST), Vec::new()),
-    }
+        _ => Packet::new(EC_OP_SEARCH_LIST),
+    };
+    (p, Vec::new(), None)
 }
 
 /// The search opcodes.
@@ -782,17 +1198,22 @@ pub fn is_search(op: u8) -> bool {
 }
 
 /// Hand a search request to the client, which holds the search.
-pub async fn forward(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> Packet {
+pub async fn forward(
+    req: &Packet,
+    ctx: Ctx,
+    control: &mpsc::UnboundedSender<Control>,
+) -> (Packet, Option<u32>) {
+    let gone = || (reply(EC_OP_FAILED, "Already shutting down."), None);
     let (tx, rx) = oneshot::channel();
     if control
         .send(Control::Search {
             req: req.clone(),
+            ctx,
             reply: tx,
         })
         .is_err()
     {
-        return reply(EC_OP_FAILED, "Already shutting down.");
+        return gone();
     }
-    rx.await
-        .unwrap_or_else(|_| reply(EC_OP_FAILED, "Already shutting down."))
+    rx.await.unwrap_or_else(|_| gone())
 }

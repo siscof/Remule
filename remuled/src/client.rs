@@ -803,7 +803,7 @@ pub async fn run(
     let mut last_traffic = Totals::default();
     let mut download_ids = DownloadIds::default();
     // The search external connections run.
-    let mut searches = ec_search::SearchList::default();
+    let mut searches = ec_search::Searches::default();
     let mut shared_state = crate::ec_shared::SharedState::default();
     shared_state.load_comments(&c.config);
     let mut friends = crate::friends::FriendList::load(&c.config);
@@ -1011,7 +1011,7 @@ pub async fn run(
                         let _ = reply.send(r);
                         tick.reset_immediately();
                     }
-                    Some(Control::Search { req, reply }) => {
+                    Some(Control::Search { req, ctx, reply }) => {
                         let net = ec_search::Net { server: server.as_ref(), kad: kad_node.as_ref().map(|k| &k.handle) };
                         let status = |h: &Md4Hash| {
                             if wanted.iter().any(|(w, _)| w == h) {
@@ -1022,7 +1022,7 @@ pub async fn run(
                                 ec_search::download_status::NEW
                             }
                         };
-                        let (packet, todo) = ec_search::serve(&req, &mut searches, net, &status).await;
+                        let (packet, todo, started_id) = ec_search::serve(&req, &mut searches, ctx, net, &status).await;
                         let started = !todo.is_empty();
                         for d in todo {
                             let add = new_download(&c, &wanted, shares.as_ref(), NewDownload {
@@ -1038,7 +1038,7 @@ pub async fn run(
                                 }).await;
                             }
                         }
-                        let _ = reply.send(packet);
+                        let _ = reply.send((packet, started_id));
                         if started {
                             tick.reset_immediately();
                         }

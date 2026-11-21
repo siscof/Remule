@@ -359,6 +359,7 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
     let mut cv = ec::ConnView {
         log: crate::applog::global().cursor(),
         partial: false,
+        search: Default::default(),
         update: Default::default(),
         prefs: &prefs,
         history: &history,
@@ -942,6 +943,7 @@ async fn the_log_is_read_as_amules_is() {
     let mut cv = ec::ConnView {
         log: log.cursor(),
         partial: false,
+        search: Default::default(),
         update: Default::default(),
         prefs: &prefs,
         history: &history,

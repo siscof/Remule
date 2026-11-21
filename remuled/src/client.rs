@@ -367,6 +367,8 @@ fn ec_status(i: EcInputs<'_>) -> Status {
         upload_queue: 0,
         banned: 0,
         downloads,
+        // Set by the caller, which counts the changes.
+        applied: 0,
     }
 }
 
@@ -770,6 +772,8 @@ pub async fn run(
     let mut ec_view: Option<watch::Sender<Status>> = None;
     // What the statistics graphs show, a record a second.
     let history = Arc::new(Mutex::new(crate::graphs::History::new()));
+    // Changes to the downloads applied, for the views EC answers from.
+    let download_changes = Arc::new(ec::DownloadChanges::new(0));
     let mut ec_control: Option<mpsc::UnboundedReceiver<Control>> = None;
     if let Some(e) = &c.ec {
         if let Some(l) = ec::listen(e).await {
@@ -786,6 +790,7 @@ pub async fn run(
                 rx,
                 ctl_tx,
                 history.clone(),
+                download_changes.clone(),
             ));
             ec_view = Some(tx);
             ec_control = Some(ctl_rx);
@@ -978,6 +983,7 @@ pub async fn run(
                                 kad: kad_node.as_ref().filter(|_| kad_connected.is_some()).map(|k| &k.handle),
                             }).await;
                         }
+                        download_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let _ = reply.send(taken);
                         // The EC view shows it at once.
                         tick.reset_immediately();
@@ -1003,6 +1009,7 @@ pub async fn run(
                                 FileOp::Priority { .. } | FileOp::Category(_) => {}
                             }
                         }
+                        download_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let _ = reply.send(r);
                         tick.reset_immediately();
                     }
@@ -1033,6 +1040,7 @@ pub async fn run(
                                 }).await;
                             }
                         }
+                        download_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let _ = reply.send((packet, started_id));
                         if started {
                             tick.reset_immediately();
@@ -1126,8 +1134,10 @@ pub async fn run(
                     Some(Control::Friend { req, reply }) => {
                         let _ = reply.send(friends.answer(&req));
                     }
-                    Some(Control::CategoryRemoved(cat)) => {
+                    Some(Control::CategoryRemoved(cat, done)) => {
                         let _ = cmd.send(Command::RemoveCategory(cat));
+                        download_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = done.send(());
                         tick.reset_immediately();
                     }
                     Some(Control::IpFilterReload) => {
@@ -1221,7 +1231,7 @@ pub async fn run(
                                 sent: traffic.sent.saturating_sub(last_traffic.sent),
                                 received: traffic.received.saturating_sub(last_traffic.received),
                             };
-                            let status = ec_status(EcInputs {
+                            let mut status = ec_status(EcInputs {
                                 c: &c,
                                 server: server.as_ref().map(|s| (s, server_since)),
                                 connecting: attempting.is_some(),
@@ -1271,6 +1281,9 @@ pub async fn run(
                                 kad_nodes: status.kad.as_ref().map_or(0, |k| k.nodes).min(u16::MAX.into()) as u16,
                                 kad_nodes_total: 0,
                             });
+                            // Taken after every change handled so far: this
+                            // loop handles changes and ticks in turn.
+                            status.applied = download_changes.load(std::sync::atomic::Ordering::SeqCst);
                             view.send_replace(status);
                         }
                         last_traffic = traffic;

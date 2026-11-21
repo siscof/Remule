@@ -1,0 +1,4 @@
+# Windows builds carry the C runtime inside the executables, so they start
+# on a PC without the Visual C++ redistributable (the shared zip).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

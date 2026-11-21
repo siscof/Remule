@@ -50,6 +50,12 @@ Stop aMule first: the two must not use one directory at once.
 
 Not yet supported: the rest of External Connections (changing preferences, logs, categories, the upload queue, and the peers in `amulegui`'s updates).
 
+## Windows: one zip to share
+
+    powershell -File scripts\package-windows.ps1
+
+builds `distemule-<version>-windows-x64.zip`: `Remule.exe` (the `remule-app` launcher), `remuled.exe`, `remule-gui.exe`, a README for whoever it is shared with, and the license. The C runtime is linked in, so nothing else needs installing. `Remule.exe` keeps its own config folder, `%APPDATA%emule\daemon`, and never touches an aMule install. The first time, it sets that folder up with an External Connections password and a free local port. It then starts `remuled` with no console window and opens `remule-gui` connected to it. When the window is closed, it asks `remuled` over EC to save and stop.
+
 ## remule-gui: remote GUI for amuled
 
 A native (egui) port of `amulegui`. It connects to an aMule daemon over External Connections (aMule 3.3+, SRP login over an encrypted channel), like `amulegui` does.

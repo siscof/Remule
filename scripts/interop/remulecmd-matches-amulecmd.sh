@@ -145,7 +145,7 @@ compare() {
 
 # The first lines of the log, which do not grow between the two runs.
 normalize_head() {
-	normalize | head -n 8
+	normalize | sed -n 1,8p
 }
 
 # Help, which needs no daemon: the first line is the program and version.

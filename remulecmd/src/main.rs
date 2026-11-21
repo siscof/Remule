@@ -241,15 +241,13 @@ fn write_config(path: &Path, conf: &ConfFile) -> bool {
             return false;
         }
     }
-    if std::fs::write(path, conf.to_bytes()).is_err() {
-        return false;
-    }
+    let written = std::fs::write(path, conf.to_bytes()).is_ok();
     #[cfg(unix)]
-    {
+    if written {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    true
+    written
 }
 
 /// Output, unless `--quiet`.

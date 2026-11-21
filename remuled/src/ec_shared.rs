@@ -354,7 +354,11 @@ pub async fn answer(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> O
                 .tag(EC_TAG_KNOWNFILE_COMMENT)
                 .map(Tag::as_str)
                 .unwrap_or_default();
-            let rating = req.tag(EC_TAG_KNOWNFILE_RATING).map_or(0, Tag::as_int) as u8;
+            // 0 to 5, as it is read back from amule.conf.
+            let rating = req
+                .tag(EC_TAG_KNOWNFILE_RATING)
+                .map_or(0, Tag::as_int)
+                .min(5) as u8;
             if let Some(hash) = hash {
                 let r = ask(control, |reply| SharedRequest::SetComment {
                     hash: Md4Hash(hash),
@@ -502,13 +506,13 @@ impl SharedState {
             }
             SharedRequest::Reload => {
                 if let Some(s) = shares {
-                    self.reload(s.clone(), reload.now());
+                    self.reload(s.clone(), reload.clone());
                 }
             }
             SharedRequest::SetDirs { dirs, reply } => {
                 let refused = set_shared_dirs(config, &dirs);
                 if let Some(s) = shares {
-                    self.reload(s.clone(), reload.now());
+                    self.reload(s.clone(), reload.clone());
                 }
                 let _ = reply.send(refused);
             }
@@ -702,15 +706,20 @@ impl SharedState {
             return;
         }
         let (reloading, again) = (self.reloading.clone(), self.again.clone());
-        tokio::task::spawn_blocking(move || {
-            loop {
-                again.store(false, Ordering::SeqCst);
-                reload_now(&shares, &dirs);
-                if !again.load(Ordering::SeqCst) {
-                    break;
-                }
+        tokio::task::spawn_blocking(move || loop {
+            again.store(false, Ordering::SeqCst);
+            // The folders as they are now: a change made while the last
+            // pass ran is walked by this one.
+            reload_now(&shares, &dirs.now());
+            if again.load(Ordering::SeqCst) {
+                continue;
             }
             reloading.store(false, Ordering::SeqCst);
+            // Asked again between the check and here: walk once more,
+            // unless that request started a reload of its own.
+            if !again.load(Ordering::SeqCst) || reloading.swap(true, Ordering::SeqCst) {
+                break;
+            }
         });
     }
 }

@@ -698,13 +698,29 @@ fn kind_of(ty: u8, params: &SearchParams) -> Result<Kind, Packet> {
 
 /// `Get_EC_Response_Search` on the legacy sentinel: the bucket emptied,
 /// then the search started (or why not).
-async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
+async fn start(
+    req: &Packet,
+    list: &mut SearchList,
+    others: &mut [ByIdSearch],
+    net: &Net<'_>,
+) -> Packet {
     let empty = Tag::empty(EC_TAG_SEARCH_TYPE);
     let (ty, params) = search_params(req.tags.first().unwrap_or(&empty));
     let kind = match kind_of(ty, &params) {
         Ok(k) => k,
         Err(p) => return p,
     };
+    // Checked before anything running is touched: a search refused here
+    // takes the server from no other search.
+    if let Err(e) = SearchList::default().plan(kind, &params, networks(net)) {
+        return reply(EC_OP_FAILED, &e);
+    }
+    // An eD2k search takes the server from a search by ID.
+    if kind != Kind::Kad {
+        for s in others {
+            s.list.stop_ed2k();
+        }
+    }
     list.remove_results();
     match launch(list, kind, &params, net).await {
         Ok(_) => reply(
@@ -712,6 +728,17 @@ async fn start(req: &Packet, list: &mut SearchList, net: &Net<'_>) -> Packet {
             "Search in progress. Refetch results in a moment!",
         ),
         Err(e) => reply(EC_OP_FAILED, &e),
+    }
+}
+
+/// What the networks allow a search.
+fn networks(net: &Net<'_>) -> Networks {
+    Networks {
+        ed2k_connected: net.server.is_some(),
+        large_files: net
+            .server
+            .is_some_and(|s| s.info().tcp_flags & LARGEFILES != 0),
+        kad_running: net.kad.is_some(),
     }
 }
 
@@ -823,6 +850,30 @@ pub struct Ctx {
 }
 
 impl Searches {
+    /// A search by ID with this list, for tests that need one running
+    /// without a network.
+    #[cfg(test)]
+    pub(crate) fn insert_by_id(&mut self, id: u32, list: SearchList) {
+        self.by_id.insert(
+            0,
+            ByIdSearch {
+                id,
+                name: String::new(),
+                type_text: String::new(),
+                params: SearchParams::default(),
+                list,
+            },
+        );
+    }
+
+    /// Whether the search by this ID still waits for the server.
+    #[cfg(test)]
+    pub(crate) fn by_id_ed2k_running(&self, id: u32) -> bool {
+        self.by_id
+            .iter()
+            .any(|s| s.id == id && s.list.ed2k_running())
+    }
+
     fn all_mut(&mut self) -> impl Iterator<Item = &mut SearchList> {
         std::iter::once(&mut self.legacy).chain(self.by_id.iter_mut().map(|s| &mut s.list))
     }
@@ -1152,16 +1203,7 @@ pub async fn serve(
         return (p, Vec::new(), started);
     }
     let p = match req.opcode {
-        EC_OP_SEARCH_START => {
-            // An eD2k search takes the server from a search by ID.
-            let ty = req.tags.first().map_or(0, |t| t.as_int() as u8);
-            if ty != EC_SEARCH_KAD {
-                for s in &mut searches.by_id {
-                    s.list.stop_ed2k();
-                }
-            }
-            start(req, &mut searches.legacy, &net).await
-        }
+        EC_OP_SEARCH_START => start(req, &mut searches.legacy, &mut searches.by_id, &net).await,
         EC_OP_SEARCH_STOP => {
             searches.legacy.stop();
             Packet::new(EC_OP_MISC_DATA)

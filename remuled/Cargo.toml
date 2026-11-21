@@ -28,5 +28,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
+flate2 = "1"
 ed2k-crypto = { path = "../ed2k-crypto" }
 ed2k-hash = { path = "../ed2k-hash" }

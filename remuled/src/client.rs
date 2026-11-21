@@ -789,11 +789,6 @@ pub async fn run(
             ));
             ec_view = Some(tx);
             ec_control = Some(ctl_rx);
-            if e.prefs.check_new_version() {
-                tokio::spawn(crate::version_check::run_daily(
-                    crate::version_check::global(),
-                ));
-            }
         }
     }
     // For the EC view: the server logged into and since when, when Kad
@@ -1441,6 +1436,16 @@ async fn update_ip_filter(dir: PathBuf, url: String, filter: Arc<AddressFilter>)
             return;
         }
     };
+    // Unlike aMule, which replaces the file first and only then finds it
+    // unreadable, a download that unpacks to no list keeps the filter there
+    // is: an update must not lift the blocks of a working one.
+    if !matches!(
+        ed2k_formats::archive::unpack(&body, crate::config::IPFILTER_MEMBERS),
+        Some((_, ed2k_formats::archive::FileType::Text))
+    ) {
+        warn!("Failed to load ipfilter.dat from {url}, unknown format encountered; the current filter is kept");
+        return;
+    }
     let (download, dat) = (dir.join("ipfilter.download"), dir.join("ipfilter.dat"));
     if let Err(e) = std::fs::write(&download, &body).and_then(|_| std::fs::rename(&download, &dat))
     {

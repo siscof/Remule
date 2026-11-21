@@ -1135,6 +1135,7 @@ version = "0.1.0"
 dependencies = [
  "ed2k-codec",
  "ed2k-types",
+ "flate2",
  "md4",
  "rand 0.8.5",
  "rsa",
@@ -3567,6 +3568,7 @@ dependencies = [
  "ed2k-peer",
  "ed2k-server",
  "ed2k-types",
+ "flate2",
  "rand 0.8.5",
  "remule-core",
  "remule-ec",

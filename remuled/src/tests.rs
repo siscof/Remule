@@ -480,12 +480,25 @@ fn the_ip_filter_loads_as_amule_does() {
     assert!(!f.blocks_client(Ipv4Addr::new(2, 0, 0, 1)));
     assert!(f.blocks_server(Ipv4Addr::new(2, 0, 0, 1)));
 
-    // A zip is not read, and says so.
+    // A broken archive is not read, and says so as aMule does.
     std::fs::write(dir.join("ipfilter.dat"), b"PK\x03\x04rest of a zip").unwrap();
     let mut notes = Vec::new();
     let f = config::ip_filter(dir, &ConfFile::new(), &mut notes, &mut Vec::new());
     assert!(!f.blocks_client(Ipv4Addr::new(1, 0, 0, 5)));
-    assert!(notes.iter().any(|n| n.contains("packed list")), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("unknown format encountered")),
+        "{notes:?}"
+    );
+    // A gzipped list is read, and left unpacked on disk (`UnpackArchive`).
+    let list = b"1.0.0.0 - 1.0.0.255 , 0 , packed\n";
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, list).unwrap();
+    std::fs::write(dir.join("ipfilter.dat"), gz.finish().unwrap()).unwrap();
+    let f = config::ip_filter(dir, &ConfFile::new(), &mut Vec::new(), &mut Vec::new());
+    assert!(f.blocks_client(Ipv4Addr::new(1, 0, 0, 5)));
+    assert_eq!(std::fs::read(dir.join("ipfilter.dat")).unwrap(), list);
 }
 
 /// With loopback blocked in `ipfilter_static.dat`, the daemon neither logs

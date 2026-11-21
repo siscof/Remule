@@ -1092,6 +1092,14 @@ pub async fn serve(
     let limiter = Arc::new(Mutex::new(AuthLimiter::new(settings.limits)));
     let creds = Arc::new(settings.credentials);
     let prefs = Arc::new(Mutex::new(settings.prefs));
+    // The daily version check, on while the preference is.
+    {
+        let prefs = prefs.clone();
+        tokio::spawn(crate::version_check::run_daily(
+            crate::version_check::global(),
+            move || lock(&prefs).check_new_version(),
+        ));
+    }
     let identity = Arc::new(identity);
     // `IsOnShutDown`: one shutdown, whichever connection asks.
     let shutting_down = Arc::new(AtomicBool::new(false));

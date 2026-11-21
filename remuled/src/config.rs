@@ -168,21 +168,38 @@ const IPFILTER_STATIC_PLACEHOLDER: &str = concat!(
     "# place them in this file. aMule will not change this file.\n",
 );
 
+/// The names an IP filter archive's list goes by (`ipfilter_files`).
+pub const IPFILTER_MEMBERS: &[&str] = &["ipfilter.dat", "guardian.p2p", "guarding.p2p"];
+
 /// One IP filter list, as `CIPFilterTask::LoadFromFile` reads it: missing
-/// or empty is no ranges; a zip or gzip one is not read (unpacking is not
-/// ported).
+/// or empty is no ranges; a zip, gzip or tar one is unpacked in place
+/// first (`UnpackArchive`), and one that is not text then is not read.
 fn load_filter_list(
     path: &Path,
     notes: &mut Vec<String>,
     info: &mut Vec<String>,
 ) -> Option<IpFilterFile> {
-    let bytes = read_opt(path).filter(|b| !b.is_empty())?;
-    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(&[0x1F, 0x8B]) {
-        notes.push(format!(
-            "{}: a packed list, not read (unpacking is not ported yet)",
-            path.display()
-        ));
-        return None;
+    use ed2k_formats::archive::{self, FileType};
+    let mut bytes = read_opt(path).filter(|b| !b.is_empty())?;
+    let packed = matches!(
+        archive::guess(&bytes),
+        FileType::Zip | FileType::GZip | FileType::Tar
+    );
+    match archive::unpack(&bytes, IPFILTER_MEMBERS) {
+        Some((plain, FileType::Text)) => {
+            if packed {
+                // As aMule: the archive is replaced by what it held.
+                let _ = std::fs::write(path, &plain);
+            }
+            bytes = plain;
+        }
+        _ => {
+            notes.push(format!(
+                "Failed to load ipfilter.dat file '{}', unknown format encountered.",
+                path.display()
+            ));
+            return None;
+        }
     }
     let f = IpFilterFile::parse(&bytes);
     let mut msg = format!(

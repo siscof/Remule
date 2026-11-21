@@ -24,6 +24,7 @@
 
 pub mod addresses_dat;
 pub mod amule_conf;
+pub mod archive;
 pub mod canceled_met;
 pub mod clients_met;
 pub mod cryptkey_dat;

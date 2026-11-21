@@ -226,6 +226,18 @@ fn a_shared_file_is_renamed_in_its_folder() {
         s.rename(&ed2k_types::Md4Hash([3; 16]), "z.bin"),
         Err(RenameError::NotShared)
     ));
+    // On Windows a colon would be a drive or a stream.
+    if cfg!(windows) {
+        for bad in ["C:x.bin", "a.bin:stream", "C:"] {
+            assert!(!is_bare_file_name(bad), "{bad}");
+            assert!(matches!(s.rename(&hash, bad), Err(RenameError::NotBare)));
+        }
+    } else {
+        assert!(is_bare_file_name("a:b.bin"));
+    }
+    // Only its case changed: allowed, even where case is ignored.
+    let p = s.rename(&hash, "A.bin").unwrap();
+    assert_eq!(p, share.join("A.bin"));
     let p = s.rename(&hash, "b.bin").unwrap();
     assert_eq!(p, share.join("b.bin"));
     assert!(p.exists() && !share.join("a.bin").exists());

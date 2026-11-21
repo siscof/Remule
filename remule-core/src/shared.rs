@@ -95,7 +95,20 @@ pub enum RenameError {
 
 /// `CPath::IsBareFileName`: one path component, not `.` or `..`.
 pub fn is_bare_file_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    // On Windows a colon makes a drive-relative path ("C:x") or names a
+    // stream ("a.bin:s"); elsewhere it is an ordinary character.
+    if cfg!(windows) && name.contains(':') {
+        return false;
+    }
+    // Exactly one plain component: not ".", "..", a root or a prefix.
+    let mut c = Path::new(name).components();
+    matches!(
+        (c.next(), c.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == name
+    )
 }
 
 /// Write `data` to `path` through a temporary file (`CFile::write_safe`).
@@ -299,7 +312,17 @@ impl SharedFiles {
         if new == old {
             return Ok(new);
         }
-        if fs::symlink_metadata(&new).is_ok() {
+        // Never out of its folder, whatever the name parsed to.
+        if new.parent() != old.parent() {
+            return Err(RenameError::NotBare);
+        }
+        // Taken by another file; on a filesystem that ignores case, a new
+        // case of its own name is not.
+        let same_file = || match (fs::canonicalize(&new), fs::canonicalize(&old)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if fs::symlink_metadata(&new).is_ok() && !same_file() {
             return Err(RenameError::Io(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "a file of that name is already there",

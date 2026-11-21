@@ -783,3 +783,27 @@ fn only_one_search_waits_for_the_server() {
     s.server_results(vec![result(2, "b.iso", 1000, 1, 0)]);
     assert_eq!(s.legacy.results().len(), 1);
 }
+
+/// A legacy search that is refused takes the server from no search by ID
+/// (aMule stops them only once a new search really starts).
+#[tokio::test]
+async fn a_refused_legacy_search_leaves_the_others_running() {
+    use crate::ec_search::{serve, Ctx, Net, Searches};
+    let mut s = Searches::default();
+    let mut running = SearchList::default();
+    local(&mut running, Instant::now());
+    s.insert_by_id(9, running);
+    assert!(s.by_id_ed2k_running(9));
+    // A local search with no server: refused.
+    let req = Packet::new(EC_OP_SEARCH_START).with(
+        Tag::int(EC_TAG_SEARCH_TYPE, EC_SEARCH_LOCAL.into())
+            .with(Tag::string(EC_TAG_SEARCH_NAME, "ubuntu")),
+    );
+    let net = Net {
+        server: None,
+        kad: None,
+    };
+    let (p, ..) = serve(&req, &mut s, Ctx::default(), net, &|_| 0).await;
+    assert_eq!(p.opcode, EC_OP_FAILED);
+    assert!(s.by_id_ed2k_running(9), "still waiting for the server");
+}

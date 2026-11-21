@@ -125,10 +125,12 @@ impl VersionCheck {
 }
 
 /// The periodic check, for as long as the daemon runs: at once, then a
-/// day after the last attempt, whatever started it.
-pub async fn run_daily(check: &'static VersionCheck) {
+/// day after the last attempt, whatever started it; each time only while
+/// `enabled` says the preference is on (aMule's timer reads it each time,
+/// so turning it on or off over EC takes effect without a restart).
+pub async fn run_daily(check: &'static VersionCheck, enabled: impl Fn() -> bool) {
     loop {
-        if check.due(crate::ec::unix_now()) {
+        if enabled() && check.due(crate::ec::unix_now()) {
             check.start();
         }
         tokio::time::sleep(Duration::from_secs(60)).await;

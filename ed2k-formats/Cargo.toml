@@ -11,3 +11,5 @@ ed2k-codec = { path = "../ed2k-codec" }
 md4 = "0.10"
 rsa = "0.9"
 rand = "0.8"
+# Packed downloads (`archive`).
+flate2 = "1"

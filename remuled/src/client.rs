@@ -806,6 +806,7 @@ pub async fn run(
     let mut searches = ec_search::SearchList::default();
     let mut shared_state = crate::ec_shared::SharedState::default();
     shared_state.load_comments(&c.config);
+    let mut friends = crate::friends::FriendList::load(&c.config);
     // The servers' ECIDs, kept while they are listed.
     let mut server_ids = ServerIds::default();
     // What the statistics tree shows that is not kept elsewhere.
@@ -813,6 +814,7 @@ pub async fn run(
     let reload_dirs = crate::ec_shared::ReloadDirs {
         dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
         reserved: vec![c.temp.clone(), c.config.clone()],
+        incoming: Some((c.config.clone(), c.incoming.clone())),
     };
 
     let start = Instant::now();
@@ -1118,6 +1120,21 @@ pub async fn run(
                         }
                         tick.reset_immediately();
                     }
+                    Some(Control::ClientHistory(reply)) => {
+                        let (tx, rx) = oneshot::channel();
+                        if cmd.send(Command::CreditHistory(tx)).is_ok() {
+                            tokio::spawn(async move {
+                                let _ = reply.send(rx.await.unwrap_or_default());
+                            });
+                        }
+                    }
+                    Some(Control::Friend { req, reply }) => {
+                        let _ = reply.send(friends.answer(&req));
+                    }
+                    Some(Control::CategoryRemoved(cat)) => {
+                        let _ = cmd.send(Command::RemoveCategory(cat));
+                        tick.reset_immediately();
+                    }
                     Some(Control::IpFilterReload) => {
                         if let Some(f) = c.ip_filter.clone() {
                             let dir = c.config.clone();
@@ -1191,7 +1208,7 @@ pub async fn run(
                             }
                             Some(crate::ec_update::UpdateServer { ecid: server_ids.id(addr), info, tcp_flags })
                         }).collect();
-                        let _ = reply.send(crate::ec_update::UpdateData { shared, servers });
+                        let _ = reply.send(crate::ec_update::UpdateData { shared, servers, friends: friends.view() });
                     }
                     None => ec_control = None,
                 }

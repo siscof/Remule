@@ -65,6 +65,12 @@ pub enum Command {
         op: FileOp,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// The credit history ([`crate::credits::Credits::history`]); empty
+    /// without an uploader.
+    CreditHistory(tokio::sync::oneshot::Sender<Vec<crate::credits::HistoryEntry>>),
+    /// A category was deleted: the downloads in it, or after it, moved
+    /// ([`DownloadQueue::remove_category`]).
+    RemoveCategory(u32),
     /// Hang up, save the files, and return the queue.
     Shutdown,
 }
@@ -377,6 +383,19 @@ pub async fn run_with(
                         if let Some(up) = uploader.as_mut() {
                             up.set_our_id(id);
                         }
+                        Vec::new()
+                    }
+                    Some(Command::CreditHistory(reply)) => {
+                        let h = uploader
+                            .as_ref()
+                            .and_then(|u| u.credits())
+                            .map(|c| c.history())
+                            .unwrap_or_default();
+                        let _ = reply.send(h);
+                        Vec::new()
+                    }
+                    Some(Command::RemoveCategory(cat)) => {
+                        queue.remove_category(cat);
                         Vec::new()
                     }
                     Some(Command::File { file, op, reply }) => {

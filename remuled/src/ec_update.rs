@@ -102,6 +102,7 @@ pub struct UpdateServer {
 pub struct UpdateData {
     pub shared: Vec<SharedBase>,
     pub servers: Vec<UpdateServer>,
+    pub friends: Vec<crate::friends::FriendView>,
 }
 
 /// One connection's view: what it was sent of each object.
@@ -144,7 +145,7 @@ impl UpdateState {
     /// order with what changed (a file with nothing new is a bare ECID,
     /// which a client that infers removal from absence reads as "still
     /// there"), then the clients (none are tracked yet), the servers and
-    /// the friends (none). A file seen for the first time starts from
+    /// the friends. A file seen for the first time starts from
     /// nothing; one gone is forgotten.
     ///
     /// With the partial-update protocol (`partial`), a file with nothing new
@@ -215,6 +216,13 @@ impl UpdateState {
             let map = self.maps.entry(s.ecid).or_default();
             servers.children.push(map.filter(server_tag(s)));
         }
-        p.with(servers).with(Tag::empty(EC_TAG_FRIEND))
+        let mut friends = Tag::empty(EC_TAG_FRIEND);
+        for f in &data.friends {
+            let map = self.maps.entry(f.ecid).or_default();
+            friends
+                .children
+                .push(map.filter(crate::friends::friend_tag(f)));
+        }
+        p.with(servers).with(friends)
     }
 }

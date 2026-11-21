@@ -5,6 +5,7 @@
 //! * [`config`]: an aMule config directory turned into a client's settings.
 //! * [`client`]: the running client (also behind `remule download`).
 //! * [`kad`]: a Kad node started from, and saved to, aMule's files.
+//! * [`friends`]: the friend list, `emfriends.met`.
 //! * [`firewall`]: whether others can reach us; answering Kad's firewall
 //!   checks over TCP.
 //! * [`applog`]: the log as External Connections read it.
@@ -34,6 +35,7 @@ pub mod ec_shared;
 pub mod ec_stats;
 pub mod ec_update;
 pub mod firewall;
+pub mod friends;
 pub mod graphs;
 pub mod http;
 pub mod kad;
@@ -50,6 +52,8 @@ mod tests_applog;
 mod tests_bootstrap;
 #[cfg(test)]
 mod tests_ec;
+#[cfg(test)]
+mod tests_ec_more;
 #[cfg(test)]
 mod tests_ec_search;
 #[cfg(test)]

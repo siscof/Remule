@@ -16,6 +16,8 @@
 //!   own folder.
 //! * `EC_OP_VERIFY_LOCAL_DATA`: a shared file checked against its hashes
 //!   (`CVerifyLocalDataTask`), answered at once; the outcome is logged.
+//! * `EC_OP_SET_SHARED_DIRS`: the shared folders replaced and saved, a
+//!   widening change checked against the allowed roots, then a reload.
 //! * `EC_OP_GET_SHARED_DIRS`: the shared folders as configured
 //!   (`Get_EC_Response_GetSharedDirs`).
 //!
@@ -204,6 +206,13 @@ pub enum SharedRequest {
     },
     /// The configured folders.
     Dirs(oneshot::Sender<SharedDirs>),
+    /// `Get_EC_Response_SetSharedDirs`: the folders to share (each with
+    /// its recursive flag), saved, then a reload; the folders refused, each
+    /// with its reason.
+    SetDirs {
+        dirs: Vec<(String, bool)>,
+        reply: oneshot::Sender<Vec<(String, u8)>>,
+    },
     /// `DeleteFileFromDisk`: a complete shared file off the disk and out
     /// of the list, if it is still the one the client saw.
     Delete {
@@ -304,6 +313,30 @@ pub async fn answer(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> O
                 .collect();
             match ask(control, |reply| SharedRequest::SetPriority { files, reply }).await {
                 Some(()) => Packet::new(EC_OP_NOOP),
+                None => gone(),
+            }
+        }
+        EC_OP_SET_SHARED_DIRS => {
+            let dirs = req
+                .tags_named(EC_TAG_SHAREDDIR)
+                .map(|t| {
+                    let recursive = t
+                        .child(EC_TAG_SHAREDDIR_RECURSIVE)
+                        .is_some_and(|r| r.as_int() != 0);
+                    (t.as_str(), recursive)
+                })
+                .collect();
+            match ask(control, |reply| SharedRequest::SetDirs { dirs, reply }).await {
+                Some(refused) => {
+                    let mut p = Packet::new(EC_OP_SET_SHARED_DIRS);
+                    for (dir, reason) in refused {
+                        p = p.with(
+                            Tag::string(EC_TAG_SHAREDDIR_REJECTED, &dir)
+                                .with(Tag::int(EC_TAG_SHAREDDIR_ERROR, reason.into())),
+                        );
+                    }
+                    p
+                }
                 None => gone(),
             }
         }
@@ -431,6 +464,22 @@ pub struct SharedState {
 pub struct ReloadDirs {
     pub dirs: Vec<PathBuf>,
     pub reserved: Vec<PathBuf>,
+    /// The daemon's: the shared folders read again from its config
+    /// directory at each reload (`FindSharedFiles` rereads the intent
+    /// files), then this incoming folder. `None`: `dirs` as given.
+    pub incoming: Option<(PathBuf, PathBuf)>,
+}
+
+impl ReloadDirs {
+    /// The folders a reload walks now.
+    fn now(&self) -> ReloadDirs {
+        let mut r = self.clone();
+        if let Some((config, incoming)) = &self.incoming {
+            r.dirs = crate::config::shared_dirs(config);
+            r.dirs.push(incoming.clone());
+        }
+        r
+    }
 }
 
 impl SharedState {
@@ -453,8 +502,15 @@ impl SharedState {
             }
             SharedRequest::Reload => {
                 if let Some(s) = shares {
-                    self.reload(s.clone(), reload.clone());
+                    self.reload(s.clone(), reload.now());
                 }
+            }
+            SharedRequest::SetDirs { dirs, reply } => {
+                let refused = set_shared_dirs(config, &dirs);
+                if let Some(s) = shares {
+                    self.reload(s.clone(), reload.now());
+                }
+                let _ = reply.send(refused);
             }
             SharedRequest::SetPriority { files, reply } => {
                 if let Some(s) = shares {
@@ -723,6 +779,99 @@ pub fn verify_local_data(shares: Arc<Mutex<SharedFiles>>, hash: Md4Hash) {
             }
         }
     });
+}
+
+/// Why a folder was not shared (`EC_SHAREDDIR_ERR_*`).
+pub mod shareddir_err {
+    /// It does not exist, or is not a folder.
+    pub const MISSING: u8 = 1;
+    pub const UNREADABLE: u8 = 2;
+    /// Outside the roots of `allowed-remote-dirs.dat`.
+    pub const OUTSIDE_ROOTS: u8 = 3;
+}
+
+/// `Get_EC_Response_SetSharedDirs` and `SaveSharedFolders`: the new lists
+/// written to `shareddir-explicit.dat` and `shareddir-recursive.dat`. Only a
+/// change that widens what is shared is checked (a new folder, or one made
+/// recursive): it must exist, be readable and lie inside the allowed roots.
+/// A refused change to a folder already shared keeps it as it was. Returns
+/// the refused folders, as sent, with their reasons.
+pub fn set_shared_dirs(config: &Path, dirs: &[(String, bool)]) -> Vec<(String, u8)> {
+    use ed2k_formats::shareddir_dat::{EXPLICIT_FILE_NAME, RECURSIVE_FILE_NAME};
+    let stored = crate::config::shared_dir_intents(config);
+    let roots: Vec<PathBuf> = crate::prefs::allowed_remote_dirs(config)
+        .iter()
+        .map(|r| canonical(Path::new(r)))
+        .collect();
+    let mut explicit: Vec<String> = Vec::new();
+    let mut recursive: Vec<String> = Vec::new();
+    let mut refused = Vec::new();
+    // Two entries naming one folder: the later wins.
+    let mut place = |dir: String, rec: bool| {
+        let same = |d: &String| same_dir(d, &dir);
+        explicit.retain(|d| !same(d));
+        recursive.retain(|d| !same(d));
+        if rec {
+            recursive.push(dir);
+        } else {
+            explicit.push(dir);
+        }
+    };
+    for (raw, want_recursive) in dirs {
+        let path = Path::new(raw);
+        let canon = canonical(path);
+        let found = stored
+            .explicit
+            .iter()
+            .map(|d| (d, false))
+            .chain(stored.recursive.iter().map(|d| (d, true)))
+            .find(|(d, _)| same_dir(d, raw) || canonical(Path::new(d)) == canon);
+        let widening = match found {
+            None => true,
+            Some((_, was_recursive)) => *want_recursive && !was_recursive,
+        };
+        if widening {
+            let reason = if !path.is_dir() {
+                shareddir_err::MISSING
+            } else if std::fs::read_dir(path).is_err() {
+                shareddir_err::UNREADABLE
+            } else if !roots.iter().any(|r| canon.starts_with(r)) {
+                shareddir_err::OUTSIDE_ROOTS
+            } else {
+                0
+            };
+            if reason != 0 {
+                refused.push((raw.clone(), reason));
+                if let Some((d, was_recursive)) = found {
+                    place(d.clone(), was_recursive);
+                }
+                continue;
+            }
+        }
+        match (widening, found) {
+            (false, Some((d, _))) => place(d.clone(), *want_recursive),
+            _ => place(canon.display().to_string(), *want_recursive),
+        }
+    }
+    for (name, list) in [
+        (EXPLICIT_FILE_NAME, &explicit),
+        (RECURSIVE_FILE_NAME, &recursive),
+    ] {
+        let text: String = list.iter().map(|d| format!("{d}\n")).collect();
+        if let Err(e) = std::fs::write(config.join(name), text) {
+            warn!("{name}: {e}");
+        }
+    }
+    refused
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_owned())
+}
+
+/// `CPath::IsSameDir`.
+fn same_dir(a: &str, b: &str) -> bool {
+    a == b || canonical(Path::new(a)) == canonical(Path::new(b))
 }
 
 const CHANGED: &str = "The selected file has changed or is not a complete file.";

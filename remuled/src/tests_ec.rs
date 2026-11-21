@@ -340,6 +340,15 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     seen.push("stats tree".to_string());
                 }
                 Control::IpFilterReload => seen.push("ipfilter reload".to_string()),
+                Control::ClientHistory(reply) => {
+                    let _ = reply.send(Vec::new());
+                    seen.push("client history".to_string());
+                }
+                Control::Friend { req, reply } => {
+                    let _ = reply.send(Packet::new(EC_OP_NOOP));
+                    seen.push(format!("friend {:#x}", req.opcode));
+                }
+                Control::CategoryRemoved(c) => seen.push(format!("category removed {c}")),
                 Control::IpFilterUpdate(url) => seen.push(format!("ipfilter update {url}")),
             }
         }

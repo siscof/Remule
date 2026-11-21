@@ -35,3 +35,7 @@
 41-shared-content.sh
 15-preferences-patch.sh
 35-ipfilter-actions.sh
+18-categories-crud.sh
+31-shared-directories.sh
+33-known-clients.sh
+34-friends.sh

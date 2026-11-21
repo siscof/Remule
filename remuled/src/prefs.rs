@@ -1166,6 +1166,36 @@ pub struct PrefStore {
     server_urls: Vec<String>,
     /// The P2P ports in use (TCP, UDP).
     listening: (u16, u16),
+    /// The download categories, the default one first.
+    categories: Vec<Category>,
+}
+
+/// A download category (`Category_Struct`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Category {
+    pub title: String,
+    /// Where its downloads go; empty for the default one.
+    pub path: String,
+    pub comment: String,
+    pub color: u32,
+    pub prio: u8,
+}
+
+/// What a category command answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CategoryResult {
+    Done,
+    /// Applied, but the folder could not be used: the one kept.
+    PathKept {
+        index: u32,
+        path: String,
+    },
+    /// Nothing changed: why, and the category or the refused folder.
+    Refused {
+        index: Option<u32>,
+        folder: Option<String>,
+        message: &'static str,
+    },
 }
 
 fn rows_of(page: u16) -> impl Iterator<Item = &'static Row> {
@@ -1236,6 +1266,7 @@ impl PrefStore {
             allowed_roots: read_lines(&config.join("allowed-remote-dirs.dat")),
             server_urls: read_lines(&config.join("addresses.dat")),
             listening: runtime.listening,
+            categories: load_categories(conf),
         };
         // What is in use where amule.conf says nothing.
         let fill = |s: &mut PrefStore, tag: u16, key: &str, v: Val| {
@@ -1286,6 +1317,174 @@ impl PrefStore {
         }
     }
 
+    /// How many categories there are, the default one included.
+    pub fn category_count(&self) -> u32 {
+        self.categories.len() as u32
+    }
+
+    /// `CEC_Category_Tag(index, detail)`.
+    fn category_tag(&self, index: usize, detail: u8) -> Tag {
+        let c = &self.categories[index];
+        let mut t = Tag::int(EC_TAG_CATEGORY, index as u64);
+        if detail != EC_DETAIL_CMD {
+            t = t
+                .with(Tag::string(EC_TAG_CATEGORY_PATH, &c.path))
+                .with(Tag::string(EC_TAG_CATEGORY_COMMENT, &c.comment))
+                .with(Tag::int(EC_TAG_CATEGORY_COLOR, c.color.into()))
+                .with(Tag::int(EC_TAG_CATEGORY_PRIO, c.prio.into()));
+        }
+        t.with(Tag::string(EC_TAG_CATEGORY_TITLE, &c.title))
+    }
+
+    /// The category a request's single `EC_TAG_CATEGORY` describes.
+    fn category_of(t: &Tag) -> Category {
+        Category {
+            title: t.child_str(EC_TAG_CATEGORY_TITLE),
+            path: t.child_str(EC_TAG_CATEGORY_PATH),
+            comment: t.child_str(EC_TAG_CATEGORY_COMMENT),
+            color: t.child_int(EC_TAG_CATEGORY_COLOR) as u32,
+            prio: t.child_int(EC_TAG_CATEGORY_PRIO) as u8,
+        }
+    }
+
+    /// `UpdateCategory`: the folder must be one or be made, else the old
+    /// one is kept and false returned; the rest is taken either way.
+    fn update_category(&mut self, index: usize, new: Category) -> bool {
+        let path = Path::new(&new.path);
+        let usable =
+            !new.path.is_empty() && (path.is_dir() || std::fs::create_dir_all(path).is_ok());
+        let c = &mut self.categories[index];
+        if usable {
+            c.path = new.path;
+        }
+        c.title = new.title;
+        c.comment = new.comment;
+        c.color = new.color;
+        c.prio = new.prio;
+        self.save_categories();
+        usable
+    }
+
+    /// `EC_OP_CREATE_CATEGORY`: a new category, its folder inside the
+    /// allowed roots (none given: the incoming folder).
+    pub fn create_category(&mut self, t: &Tag) -> CategoryResult {
+        let mut new = Self::category_of(t);
+        if !new.path.is_empty() {
+            match self.allowed(&new.path) {
+                Some(canonical) => new.path = canonical,
+                None => {
+                    return CategoryResult::Refused {
+                        index: None,
+                        folder: Some(new.path),
+                        message: "The category folder is outside the allowed remote directories.",
+                    }
+                }
+            }
+        }
+        // `CreateCategory`: the incoming folder until a usable one is set.
+        self.categories.push(Category {
+            path: self.text(EC_TAG_DIRECTORIES_INCOMING),
+            ..Default::default()
+        });
+        let index = self.categories.len() - 1;
+        if self.update_category(index, new) {
+            CategoryResult::Done
+        } else {
+            CategoryResult::PathKept {
+                index: index as u32,
+                path: self.categories[index].path.clone(),
+            }
+        }
+    }
+
+    /// `EC_OP_UPDATE_CATEGORY`: an existing category; a change of its
+    /// folder only inside the allowed roots.
+    pub fn update_category_from(&mut self, t: &Tag) -> CategoryResult {
+        let index = t.as_int();
+        if index >= self.categories.len() as u64 {
+            return CategoryResult::Refused {
+                index: Some(index as u32),
+                folder: None,
+                message: "No such category.",
+            };
+        }
+        let index = index as usize;
+        let mut new = Self::category_of(t);
+        if !new.path.is_empty() && !same_dir(&new.path, &self.categories[index].path) {
+            match self.allowed(&new.path) {
+                Some(canonical) => new.path = canonical,
+                None => {
+                    return CategoryResult::Refused {
+                        index: None,
+                        folder: Some(new.path),
+                        message: "The category folder is outside the allowed remote directories.",
+                    }
+                }
+            }
+        }
+        if self.update_category(index, new) {
+            CategoryResult::Done
+        } else {
+            CategoryResult::PathKept {
+                index: index as u32,
+                path: self.categories[index].path.clone(),
+            }
+        }
+    }
+
+    /// `EC_OP_DELETE_CATEGORY` (`CategoryDelete`): any but the default one.
+    pub fn delete_category(&mut self, index: u64) -> CategoryResult {
+        if index == 0 {
+            return CategoryResult::Refused {
+                index: Some(0),
+                folder: None,
+                message: "The default category cannot be deleted.",
+            };
+        }
+        if index >= self.categories.len() as u64 {
+            return CategoryResult::Refused {
+                index: Some(index as u32),
+                folder: None,
+                message: "No such category.",
+            };
+        }
+        self.categories.remove(index as usize);
+        self.save_categories();
+        CategoryResult::Done
+    }
+
+    /// `SaveCats`: `/General/Count` and a `Cat#N` group each, the default
+    /// one not among them; the groups of deleted ones removed.
+    fn save_categories(&self) {
+        if self.config.as_os_str().is_empty() {
+            return;
+        }
+        let r = crate::config::update_conf(&self.config, |conf| {
+            conf.set("/General/Count", &(self.categories.len() - 1).to_string());
+            for (i, c) in self.categories.iter().enumerate().skip(1) {
+                conf.set(&format!("/Cat#{i}/Title"), &c.title);
+                conf.set(&format!("/Cat#{i}/Incoming"), &c.path);
+                conf.set(&format!("/Cat#{i}/Comment"), &c.comment);
+                conf.set(&format!("/Cat#{i}/Color"), &c.color.to_string());
+                conf.set(&format!("/Cat#{i}/Priority"), &c.prio.to_string());
+            }
+            let mut i = self.categories.len();
+            loop {
+                let mut any = false;
+                for key in ["Title", "Incoming", "Comment", "Color", "Priority"] {
+                    any |= conf.remove(&format!("/Cat#{i}/{key}"));
+                }
+                if !any {
+                    break;
+                }
+                i += 1;
+            }
+        });
+        if let Err(e) = r {
+            warn!("{e}");
+        }
+    }
+
     /// `IPFilterURL`.
     pub fn ipfilter_url(&self) -> String {
         self.text(EC_TAG_IPFILTER_UPDATE_URL)
@@ -1330,9 +1529,15 @@ impl PrefStore {
             // What aMule adds after a row.
             match r.tag {
                 EC_TAG_USER_NICK => t.children.push(Tag::hash(EC_TAG_USER_HASH, self.user_hash)),
-                EC_TAG_DIRECTORIES_TEMP => t
-                    .children
-                    .push(counted(EC_TAG_DIRECTORIES_SHARED, &self.shared)),
+                EC_TAG_DIRECTORIES_TEMP => {
+                    // As shared now: the folder lists may have changed.
+                    let shared = if self.config.as_os_str().is_empty() {
+                        self.shared.clone()
+                    } else {
+                        shared_list(&self.config)
+                    };
+                    t.children.push(counted(EC_TAG_DIRECTORIES_SHARED, &shared))
+                }
                 EC_TAG_SERVERS_AUTO_UPDATE => {
                     let mut l = Tag::empty(EC_TAG_SERVERS_URL_LIST);
                     l.children = self
@@ -1361,6 +1566,17 @@ impl PrefStore {
     pub fn reply(&self, req: &Packet) -> Packet {
         let selection = req.tag(EC_TAG_SELECT_PREFS).map_or(0, Tag::as_int) as u32;
         let mut out = Packet::new(EC_OP_SET_PREFERENCES).with_detail(EC_DETAIL_UPDATE);
+        // The categories only once there is more than the default one.
+        if selection & EC_PREFS_CATEGORIES != 0 && self.categories.len() > 1 {
+            let detail = req
+                .tag(EC_TAG_DETAIL_LEVEL)
+                .map_or(EC_DETAIL_FULL, |t| t.as_int() as u8);
+            let mut cats = Tag::empty(EC_TAG_PREFS_CATEGORIES);
+            cats.children = (0..self.categories.len())
+                .map(|i| self.category_tag(i, detail))
+                .collect();
+            out = out.with(cats);
+        }
         for &(bit, page) in PAGES {
             if selection & bit != 0 {
                 out = out.with(self.page(page));
@@ -1590,6 +1806,50 @@ fn counted(name: u16, items: &[String]) -> Tag {
         .map(|s| Tag::string(EC_TAG_STRING, s))
         .collect();
     t
+}
+
+/// `LoadCats`: the default category, then `Cat#1` to `/General/Count`;
+/// one without a title or folder is skipped, a missing folder made.
+fn load_categories(conf: &ed2k_formats::amule_conf::ConfFile) -> Vec<Category> {
+    let mut out = vec![Category::default()];
+    let count = conf
+        .get("/General/Count")
+        .and_then(ed2k_formats::amule_conf::parse_long)
+        .unwrap_or(0);
+    for i in 1..=count.max(0) {
+        let get = |k: &str| {
+            conf.get(&format!("/Cat#{i}/{k}"))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let num = |k: &str| {
+            conf.get(&format!("/Cat#{i}/{k}"))
+                .and_then(ed2k_formats::amule_conf::parse_long)
+                .unwrap_or(0)
+        };
+        let c = Category {
+            title: get("Title"),
+            path: get("Incoming"),
+            comment: get("Comment"),
+            color: num("Color") as u32,
+            prio: num("Priority") as u8,
+        };
+        if c.title.is_empty() || c.path.is_empty() {
+            info!("Invalid category found, skipping");
+            continue;
+        }
+        if !Path::new(&c.path).is_dir() {
+            let _ = std::fs::create_dir_all(&c.path);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `shareddir_list`: the explicit folders and the recursive roots.
+fn shared_list(config: &Path) -> Vec<String> {
+    let d = crate::config::shared_dir_intents(config);
+    d.explicit.into_iter().chain(d.recursive).collect()
 }
 
 fn canonical(p: &Path) -> PathBuf {

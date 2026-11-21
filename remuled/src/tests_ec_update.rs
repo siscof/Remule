@@ -114,6 +114,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
     let data = UpdateData {
         shared: vec![shared(3)],
         servers: vec![server(9)],
+        friends: Vec::new(),
     };
     let mut dl = vec![
         download(5, vec![(0, 29_999_999)]),
@@ -346,6 +347,7 @@ fn the_partial_update_protocol_leaves_out_what_is_unchanged_and_names_what_is_go
     let data = UpdateData {
         shared: vec![shared(3)],
         servers: Vec::new(),
+        friends: Vec::new(),
     };
     let mut dl = vec![download(5, vec![(0, 9)]), download(2, vec![(0, 9)])];
     let files = |p: &Packet| {

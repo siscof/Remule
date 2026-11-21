@@ -126,6 +126,10 @@ impl Uploader {
         self.idle_timeout = t;
     }
 
+    pub fn credits(&self) -> Option<&Credits> {
+        self.credits.as_ref()
+    }
+
     pub fn credits_mut(&mut self) -> Option<&mut Credits> {
         self.credits.as_mut()
     }

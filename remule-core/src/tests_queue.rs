@@ -950,3 +950,23 @@ fn a_reloaded_ip_filter_is_seen_by_everything_sharing_it() {
     assert!(!other.blocks_server(ip), "servers not filtered now");
     assert_eq!(other.ban_count(), 1);
 }
+
+#[test]
+fn a_deleted_category_moves_its_downloads_to_the_default_one() {
+    let dir = TempDir::new("queue-category");
+    let mut q = DownloadQueue::new(config(&dir));
+    for (h, cat) in [(1u8, 0u32), (2, 1), (3, 2), (4, 3)] {
+        let mut f = PartFile::create(&dir.temp(), "x", Md4Hash([h; 16]), 100).unwrap();
+        f.set_category(cat);
+        q.add_file(f);
+    }
+    q.remove_category(2);
+    let cat = |h: u8| {
+        q.files()
+            .find(|f| f.hash() == Md4Hash([h; 16]))
+            .unwrap()
+            .info()
+            .category
+    };
+    assert_eq!((cat(1), cat(2), cat(3), cat(4)), (0, 1, 0, 2));
+}

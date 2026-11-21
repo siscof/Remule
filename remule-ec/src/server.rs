@@ -558,12 +558,16 @@ impl ServerConn {
                 // Confirmed, so the client stops reading absence as removal.
                 ok = ok.with(Tag::empty(EC_TAG_CAN_PARTIAL_UPDATE));
             }
-            // `EC_OP_KNOWNFILE_DELETE` is served. The other capabilities
-            // that advertise requests (partial updates, multi-search, chat,
-            // client history, shared dirs, search list, Kad lookups,
-            // search-all, metadata) are echoed once those requests are
-            // served: a client that sees one sends them.
-            return ok.with(Tag::empty(EC_TAG_CAN_DELETE_COMPLETE));
+            // Served unconditionally: the client history, deleting
+            // complete files, and the shared folders' configuration. The
+            // other capabilities that advertise requests (multi-search,
+            // chat, search list, Kad lookups, search-all, metadata) are
+            // echoed once those requests are served: a client that sees one
+            // sends them.
+            return ok
+                .with(Tag::empty(EC_TAG_CAN_CLIENT_HISTORY))
+                .with(Tag::empty(EC_TAG_CAN_DELETE_COMPLETE))
+                .with(Tag::empty(EC_TAG_CAN_SHAREDDIRS_CONFIG));
         }
         if present && proof.is_none() {
             return auth_failure(EC_AUTH_FAIL_INCOMPATIBLE, INVALID_HANDSHAKE);

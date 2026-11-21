@@ -495,6 +495,26 @@ impl DownloadQueue {
         true
     }
 
+    /// `ResetCatParts` after a category is deleted (`RemoveCategory`): its
+    /// downloads go to the default category, those in a later one move
+    /// down one; each changed file is saved.
+    pub fn remove_category(&mut self, cat: u32) {
+        for e in self.files.values_mut() {
+            let now = e.file.info().category;
+            let new = if now == cat {
+                0
+            } else if now > cat {
+                now - 1
+            } else {
+                continue;
+            };
+            e.file.set_category(new);
+            if !e.done {
+                let _ = e.file.save();
+            }
+        }
+    }
+
     pub fn resume(&mut self, hash: &Md4Hash) -> bool {
         let Some(e) = self.files.get_mut(hash) else {
             return false;

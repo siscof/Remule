@@ -169,6 +169,7 @@ fn ecids_are_one_counter_and_last_while_shared() {
     let dirs = ReloadDirs {
         dirs: vec![share.clone()],
         reserved: Vec::new(),
+        incoming: None,
     };
     ec_shared::reload_now(&shares, &dirs);
     let mut st = SharedState::default();
@@ -208,6 +209,7 @@ async fn priorities_are_set_as_amule_sets_them() {
     let dirs = ReloadDirs {
         dirs: vec![share.clone()],
         reserved: Vec::new(),
+        incoming: None,
     };
     ec_shared::reload_now(&shares, &dirs);
     let hash = shares.lock().unwrap().files()[0].0.hash;
@@ -495,6 +497,7 @@ fn comments_are_read_from_amule_conf() {
     let dirs = ReloadDirs {
         dirs: vec![share.clone()],
         reserved: Vec::new(),
+        incoming: None,
     };
     ec_shared::reload_now(&shares, &dirs);
     let hash = shares.lock().unwrap().files()[0].0.hash;

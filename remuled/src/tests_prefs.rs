@@ -72,6 +72,9 @@ fn the_pages_are_the_ones_asked_for_with_amule_conf_s_values() {
         "http://one/server.met\nhttp://two/\n",
     )
     .unwrap();
+    // The shared folders as their lists say now.
+    std::fs::write(d.0.join("shareddir-explicit.dat"), "/a\n").unwrap();
+    std::fs::write(d.0.join("shareddir-recursive.dat"), "/b\n").unwrap();
     let s = store(
         &d.0,
         "[eMule]\nNick=me\nMaxUpload=50\nUDPEnable=0\nReconnect=0\nFileBufferSizePref=2\n\

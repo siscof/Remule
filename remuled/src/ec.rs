@@ -282,6 +282,16 @@ pub enum Control {
     Update(oneshot::Sender<crate::ec_update::UpdateData>),
     /// The statistics tree's data ([`crate::ec_stats`]).
     StatsTree(oneshot::Sender<crate::ec_stats::TreeData>),
+    /// `EC_OP_FRIEND`, answered by the client loop, which keeps the
+    /// friends ([`crate::friends`]).
+    Friend {
+        req: Packet,
+        reply: oneshot::Sender<Packet>,
+    },
+    /// The credit history (`EC_OP_GET_CLIENT_HISTORY`).
+    ClientHistory(oneshot::Sender<Vec<remule_core::credits::HistoryEntry>>),
+    /// `ResetCatParts`: a category was deleted.
+    CategoryRemoved(u32),
     /// `NotifyAlways_IPFilter_Reload`: the IP filter read again.
     IpFilterReload,
     /// `CIPFilter::Update`: `ipfilter.dat` fetched from this URL, then
@@ -492,6 +502,114 @@ pub fn kad_buddy_tag() -> Tag {
     t
 }
 
+/// `FormatPackedClientVersion`: `major * 100000 + minor * 1000 + update *
+/// 100`, written as each client family writes its version.
+pub fn format_client_version(soft: u8, packed: u32) -> String {
+    let (major, minor, update) = (
+        packed / 100_000,
+        (packed % 100_000) / 1000,
+        (packed % 1000) / 100,
+    );
+    let letter = |n: u32| char::from_u32(u32::from(b'a') + n).unwrap_or('?');
+    match soft {
+        // aMule, lxMule, Hydranode and the MLDonkeys: three numbers.
+        3 | 2 | 6 | 0x34 | 0x98 | 0x0a => format!("v{major}.{minor}.{update}"),
+        // eDonkeyHybrid drops a zero update.
+        0x32 if update == 0 => format!("v{major}.{minor}"),
+        0x32 => format!("v{major}.{minor}.{update}"),
+        // lphant: the major one lower, the minor two digits, the update a letter.
+        0x14 => format!(" v{}.{minor:02}{}", major.saturating_sub(1), letter(update)),
+        // eMule Plus: trailing zeros left out, 'a' meaning 1.
+        5 => {
+            let mut out = format!("v{major}");
+            if minor != 0 {
+                out += &format!(".{minor}");
+            }
+            if update != 0 {
+                out.push(letter(update - 1));
+            }
+            out
+        }
+        // eMule and its kind: the update a letter, 'a' meaning 0.
+        _ => format!("v{major}.{minor}{}", letter(update)),
+    }
+}
+
+/// `Get_EC_Response_ClientHistory`: one tag per peer with credits, its
+/// totals, ratio and last-seen date, and what the metadata block remembers
+/// of it when it has any.
+pub fn client_history_reply(entries: &[remule_core::credits::HistoryEntry]) -> Packet {
+    let mut p = Packet::new(EC_OP_CLIENT_HISTORY);
+    for (r, meta) in entries {
+        let mut t = Tag::hash(EC_TAG_CLIENT, r.key.0)
+            .with(Tag::int(EC_TAG_CLIENT_UPLOAD_TOTAL, r.uploaded))
+            .with(Tag::int(EC_TAG_CLIENT_DOWNLOAD_TOTAL, r.downloaded))
+            .with(Tag::double(
+                EC_TAG_CLIENT_SCORE_RATIO,
+                r.credit_ratio().into(),
+            ))
+            .with(Tag::int(EC_TAG_CLIENT_LAST_SEEN, r.last_seen.into()));
+        if let Some(m) = meta {
+            t = t
+                .with(Tag::int(EC_TAG_CLIENT_FIRST_SEEN, m.first_seen.into()))
+                .with(Tag::int(EC_TAG_CLIENT_SESSIONS, m.sessions.into()));
+            if !m.name.is_empty() {
+                t = t.with(Tag::string(EC_TAG_CLIENT_NAME, &m.name));
+            }
+            t = t
+                .with(Tag::int(EC_TAG_CLIENT_USER_IP, m.last_ip.into()))
+                .with(Tag::int(EC_TAG_CLIENT_USER_PORT, m.last_port.into()))
+                .with(Tag::int(EC_TAG_CLIENT_KAD_PORT, m.kad_port.into()))
+                .with(Tag::int(EC_TAG_CLIENT_SOFTWARE, m.client_soft.into()));
+            if !m.mod_version.is_empty() {
+                t = t.with(Tag::string(EC_TAG_CLIENT_MOD_VERSION, &m.mod_version));
+            }
+            t = t
+                .with(Tag::string(
+                    EC_TAG_CLIENT_SOFT_VER_STR,
+                    &format_client_version(m.client_soft, m.version),
+                ))
+                .with(Tag::int(EC_TAG_CLIENT_FROM, m.source_from.into()))
+                .with(Tag::int(
+                    EC_TAG_CLIENT_OBFUSCATION_STATUS,
+                    m.obfuscation.into(),
+                ));
+        }
+        p = p.with(t);
+    }
+    p
+}
+
+/// A category command's answer: a kept folder with its category and
+/// path (which clients read as applied), a refusal with its category or
+/// the folder refused (reason 3, outside the allowed roots).
+fn category_reply(r: crate::prefs::CategoryResult) -> Packet {
+    use crate::prefs::CategoryResult;
+    match r {
+        CategoryResult::Done => Packet::new(EC_OP_NOOP),
+        CategoryResult::PathKept { index, path } => Packet::new(EC_OP_FAILED)
+            .with(Tag::int(EC_TAG_CATEGORY, index.into()))
+            .with(Tag::string(EC_TAG_CATEGORY_PATH, &path)),
+        CategoryResult::Refused {
+            index,
+            folder,
+            message,
+        } => {
+            let mut p = Packet::new(EC_OP_FAILED);
+            if let Some(dir) = folder {
+                p = p.with(Tag::string(EC_TAG_SHAREDDIR_REJECTED, &dir).with(Tag::int(
+                    EC_TAG_SHAREDDIR_ERROR,
+                    crate::prefs::SHAREDDIR_ERR_OUTSIDE_ROOTS,
+                )));
+            }
+            if let Some(i) = index {
+                p = p.with(Tag::int(EC_TAG_CATEGORY, i.into()));
+            }
+            p.with(Tag::string(EC_TAG_STRING, message))
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -609,6 +727,7 @@ async fn add_links(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> Pa
 async fn partfile_cmd(
     req: &Packet,
     s: &Status,
+    categories: u32,
     control: &mpsc::UnboundedSender<Control>,
 ) -> Packet {
     let mut response: Option<Packet> = None;
@@ -650,9 +769,8 @@ async fn partfile_cmd(
                 return failed("The selected download has changed. Refresh and try again.");
             }
         }
-        // Only the one category there is, as aMule keeps none of its own.
         if let FileOp::Category(c) = op {
-            if c >= 1 {
+            if c >= categories {
                 response.get_or_insert_with(|| failed(&format!("No such category: {c}")));
                 continue;
             }
@@ -743,6 +861,27 @@ pub async fn answer(
             },
             false,
         ),
+        EC_OP_FRIEND => {
+            let (reply, rx) = oneshot::channel();
+            let p = match control.send(Control::Friend {
+                req: req.clone(),
+                reply,
+            }) {
+                Ok(()) => rx
+                    .await
+                    .unwrap_or_else(|_| failed("Already shutting down.")),
+                Err(_) => failed("Already shutting down."),
+            };
+            (p, false)
+        }
+        EC_OP_GET_CLIENT_HISTORY => {
+            let (reply, rx) = oneshot::channel();
+            let entries = match control.send(Control::ClientHistory(reply)) {
+                Ok(()) => rx.await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            (client_history_reply(&entries), false)
+        }
         EC_OP_IPFILTER_RELOAD => {
             let _ = control.send(Control::IpFilterReload);
             (Packet::new(EC_OP_NOOP), false)
@@ -855,7 +994,34 @@ pub async fn answer(
         | EC_OP_PARTFILE_STOP
         | EC_OP_PARTFILE_DELETE
         | EC_OP_PARTFILE_PRIO_SET
-        | EC_OP_PARTFILE_SET_CAT => (partfile_cmd(req, s, control).await, false),
+        | EC_OP_PARTFILE_SET_CAT => {
+            let categories = lock(conn.prefs).category_count();
+            (partfile_cmd(req, s, categories, control).await, false)
+        }
+        EC_OP_CREATE_CATEGORY | EC_OP_UPDATE_CATEGORY => {
+            // One category, or nothing to do.
+            if req.tags.len() != 1 {
+                return (Packet::new(EC_OP_NOOP), false);
+            }
+            let mut p = lock(conn.prefs);
+            let r = if req.opcode == EC_OP_CREATE_CATEGORY {
+                p.create_category(&req.tags[0])
+            } else {
+                p.update_category_from(&req.tags[0])
+            };
+            (category_reply(r), false)
+        }
+        EC_OP_DELETE_CATEGORY => {
+            if req.tags.len() != 1 {
+                return (failed("Malformed category request."), false);
+            }
+            let index = req.tags[0].as_int();
+            let r = lock(conn.prefs).delete_category(index);
+            if r == crate::prefs::CategoryResult::Done {
+                let _ = control.send(Control::CategoryRemoved(index as u32));
+            }
+            (category_reply(r), false)
+        }
         op if crate::ec_servers::is_server_request(op) => {
             (crate::ec_servers::ask(req, control).await, false)
         }
@@ -863,6 +1029,7 @@ pub async fn answer(
         | EC_OP_SHAREDFILES_RELOAD
         | EC_OP_SHARED_SET_PRIO
         | EC_OP_GET_SHARED_DIRS
+        | EC_OP_SET_SHARED_DIRS
         | EC_OP_KNOWNFILE_DELETE
         | EC_OP_VERIFY_LOCAL_DATA
         | EC_OP_SHARED_FILE_SET_COMMENT
@@ -970,6 +1137,7 @@ fn changes_downloads(opcode: u8) -> bool {
             | EC_OP_PARTFILE_DELETE
             | EC_OP_PARTFILE_PRIO_SET
             | EC_OP_PARTFILE_SET_CAT
+            | EC_OP_DELETE_CATEGORY
             | EC_OP_DOWNLOAD_SEARCH_RESULT
     )
 }

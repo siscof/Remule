@@ -64,6 +64,16 @@ pub struct ServerInfo {
     pub session_id: u64,
     pub large_tag_count: bool,
     pub can_search_all: bool,
+    /// Every tag `EC_OP_AUTH_OK` carried, so a caller can see which of the
+    /// `EC_TAG_CAN_*` capabilities it asked for the daemon echoed.
+    pub echoed: Vec<u16>,
+}
+
+impl ServerInfo {
+    /// Whether the daemon echoed this capability at login.
+    pub fn echoed(&self, capability: u16) -> bool {
+        self.echoed.contains(&capability)
+    }
 }
 
 /// An authenticated EC connection.
@@ -292,6 +302,7 @@ impl Client {
             session_id: ok.tag(EC_TAG_SESSION_ID).map_or(0, Tag::as_int),
             large_tag_count: self.tx_large_count,
             can_search_all: ok.tag(EC_TAG_CAN_SEARCH_ALL).is_some(),
+            echoed: ok.tags.iter().map(|t| t.name).collect(),
         };
         Ok(())
     }

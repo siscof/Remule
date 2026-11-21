@@ -139,10 +139,15 @@ jobs:
           mkdir -p /opt/amulecmd/tree/unittests /opt/amulecmd/tree/src/webapi
           cp -R unittests/curl-tests /opt/amulecmd/tree/unittests/
           cp -R src/webapi/static /opt/amulecmd/tree/src/webapi/
-      - name: Build remuled
-        run: cargo build --release -p remuled
+      - name: Build remuled and remulecmd
+        run: cargo build --release -p remuled -p remulecmd
       - name: amulecmd drives remuled
         run: bash scripts/interop/amulecmd-drives-remuled.sh
+        env:
+          AMULECMD: /opt/amulecmd/amulecmd
+      # MIGRATION_PLAN.md 11.9: remulecmd prints what amulecmd prints.
+      - name: remulecmd matches amulecmd
+        run: bash scripts/interop/remulecmd-matches-amulecmd.sh
         env:
           AMULECMD: /opt/amulecmd/amulecmd
       - name: amulegui drives remuled

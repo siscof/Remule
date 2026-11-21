@@ -1,0 +1,17 @@
+[package]
+name = "remulecmd"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "remulecmd: amulecmd ported to Rust, a text client for amuled or remuled over External Connections"
+
+[[bin]]
+name = "remulecmd"
+path = "src/main.rs"
+
+[dependencies]
+ed2k-formats = { path = "../ed2k-formats" }
+remule-ec = { path = "../remule-ec" }
+
+[dev-dependencies]
+remule-ec = { path = "../remule-ec", features = ["fake-daemon"] }

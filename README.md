@@ -54,7 +54,15 @@ Not yet supported: the rest of External Connections (changing preferences, logs,
 
     powershell -File scripts\package-windows.ps1
 
-builds `distemule-<version>-windows-x64.zip`: `Remule.exe` (the `remule-app` launcher), `remuled.exe`, `remule-gui.exe`, a README for whoever it is shared with, and the license. The C runtime is linked in, so nothing else needs installing. `Remule.exe` keeps its own config folder, `%APPDATA%emule\daemon`, and never touches an aMule install. The first time, it sets that folder up with an External Connections password and a free local port. It then starts `remuled` with no console window and opens `remule-gui` connected to it. When the window is closed, it asks `remuled` over EC to save and stop.
+builds `dist\remule-<version>-windows-x64.zip`: `Remule.exe` (the `remule-app` launcher), `remuled.exe`, `remule-gui.exe`, a README for whoever it is shared with, and the license. The C runtime is linked in, so nothing else needs installing. `Remule.exe` keeps its own config folder, `%APPDATA%\remule\daemon`, and never touches an aMule install. The first time, it sets that folder up with an External Connections password and a free local port. It then starts `remuled` with no console window and opens `remule-gui` connected to it. When the window is closed, it asks `remuled` over EC to save and stop.
+
+## remulecmd: amulecmd in Rust
+
+A port of `amulecmd`, the text client for a running daemon (`amuled` 3.3+ or `remuled`). Same options, same `remote.conf`, same commands, and the same output, so scripts written for amulecmd keep working:
+
+    cargo run --release -p remulecmd -- -h 127.0.0.1 -p 4712 -P PASSWORD -c "show dl"
+
+Without `-c` it opens amulecmd's shell (`help` lists the commands). CI runs about a hundred commands through both `amulecmd` and `remulecmd` against `remuled` and compares what they print.
 
 ## remule-gui: remote GUI for amuled
 
@@ -69,7 +77,7 @@ To try it without a daemon, run the scripted stand-in, which speaks the real EC 
     cargo run -p remule-ec --features fake-daemon --example fake_amuled -- 4712 secret
     cargo run -p remule-gui -- -h 127.0.0.1 -p 4712 -P secret
 
-Crates: `remule-cli` (the `remule` command), `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-hash` (eD2k and AICH hashing), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol: client, and the daemon's side), `remule-gui` (the GUI) and `remuled` (the daemon, and the client `remule download` runs). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
+Crates: `remule-cli` (the `remule` command), `ed2k-types` (eD2k/Kad protocol constants, `Md4Hash`, `UInt128`), `ed2k-codec` (byte reader/writer, tags, packets), `ed2k-hash` (eD2k and AICH hashing), `ed2k-formats` (aMule's on-disk formats: `server.met`, `known.met`, `.part.met`, `nodes.dat`, `clients.met`, `amule.conf` and more), `remule-ec` (EC protocol: client, and the daemon's side), `remule-gui` (the GUI), `remulecmd` (the text client) and `remuled` (the daemon, and the client `remule download` runs). `remule-ec/src/codes.rs` is generated from aMule's `ECCodes.abstract` by `remule-ec/gen_codes.py`.
 
 ## License
 

@@ -28,6 +28,7 @@ pub mod applog;
 pub mod bootstrap;
 pub mod client;
 pub mod config;
+pub mod disk;
 pub mod ec;
 pub mod ec_search;
 pub mod ec_servers;

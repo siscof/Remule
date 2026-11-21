@@ -807,3 +807,153 @@ async fn a_refused_legacy_search_leaves_the_others_running() {
     assert_eq!(p.opcode, EC_OP_FAILED);
     assert!(s.by_id_ed2k_running(9), "still waiting for the server");
 }
+
+/// MIGRATION_PLAN.md 13.M: what remule-gui's EC worker asks of a daemon,
+/// through the same `remule_ec::model` calls, against a running remuled
+/// logged into a scripted server: the stats and connection state, the
+/// servers, a search and its result downloaded, a link added, paused,
+/// resumed and cancelled, the shared files and the log. Each reply is read
+/// as the GUI reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remule_gui_s_requests_against_a_running_daemon() {
+    use remule_ec::model::{PartFileCmd, SearchKind, SearchParams};
+    let (d, ec_port, daemon) = searching_daemon("gui").await;
+    let incoming = d.0.join("Incoming");
+    tokio::task::spawn_blocking(move || {
+        // As the GUI connects: its own name, nothing more advertised.
+        let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
+        assert!(c.info().version.starts_with("remuled"));
+        let until = |c: &mut Client, what: &str, ok: &dyn Fn(&mut Client) -> bool| {
+            for _ in 0..100 {
+                if ok(c) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("never: {what}");
+        };
+
+        // The status bar: connected to the server with a HighID.
+        until(&mut c, "connected", &|c| {
+            c.stats().unwrap().conn.ed2k_connected()
+        });
+        let s = c.stats().unwrap();
+        assert!(!s.conn.low_id());
+        assert_eq!(s.conn.server.as_ref().unwrap().ip, [127, 0, 0, 1]);
+        // The disk space the Downloads and Shared panels show.
+        assert!(s.temp_free.is_some() && s.incoming_free.is_some());
+        // Networks: the server list.
+        let servers = c.servers().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].ip, [127, 0, 0, 1]);
+
+        // Searches: a local search, its progress until done, its results.
+        let note = c
+            .search_start(
+                SearchKind::Local,
+                &SearchParams {
+                    text: "ubuntu".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(note, "Search in progress. Refetch results in a moment!");
+        until(&mut c, "the search finished", &|c| {
+            c.search_progress().unwrap().finished
+        });
+        let p = c.search_progress().unwrap();
+        assert_eq!((p.percent, p.result_count), (Some(100), 2));
+        let results = c.search_results().unwrap();
+        assert_eq!(results.len(), 2);
+        let book = results
+            .iter()
+            .find(|r| r.name == "Ubuntu Book.pdf")
+            .unwrap();
+        assert_eq!((book.size, book.sources), (77_000, 4));
+        // Nothing shown for a file not had yet, as in aMule's list.
+        assert_eq!(book.status_text(), "");
+        // Downloaded: in the transfers list, and the result says so.
+        c.download_search_results(&[book.hash], 0).unwrap();
+        until(&mut c, "the result in the queue", &|c| {
+            c.download_queue()
+                .unwrap()
+                .iter()
+                .any(|f| f.name == "Ubuntu Book.pdf")
+        });
+        let r = c.search_results().unwrap();
+        assert_eq!(
+            r.iter()
+                .find(|r| r.hash == book.hash)
+                .unwrap()
+                .status_text(),
+            "Downloading"
+        );
+
+        // Transfers: a link added, paused, resumed and cancelled.
+        let link = format!("ed2k://|file|GUI%20Test.iso|5000000|{}|/", "AB".repeat(16));
+        c.add_links(&[link]).unwrap();
+        let file = |c: &mut Client| {
+            c.download_queue()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.name == "GUI Test.iso")
+        };
+        let f = file(&mut c).expect("the link is in the queue at once");
+        assert_eq!(f.size, 5_000_000);
+        assert!(f.ed2k_link.contains("GUI%20Test.iso"), "{}", f.ed2k_link);
+        c.partfile_cmd(PartFileCmd::Pause, &[(f.hash, f.ecid)])
+            .unwrap();
+        assert_eq!(file(&mut c).unwrap().status_text(), "Paused");
+        c.partfile_cmd(PartFileCmd::Resume, &[(f.hash, f.ecid)])
+            .unwrap();
+        assert_ne!(file(&mut c).unwrap().status_text(), "Paused");
+        c.set_download_priority(&[(f.hash, f.ecid)], 2).unwrap();
+        assert_eq!(
+            remule_ec::model::priority_text(file(&mut c).unwrap().priority),
+            "High"
+        );
+        c.partfile_cmd(PartFileCmd::Cancel, &[(f.hash, f.ecid)])
+            .unwrap();
+        assert!(file(&mut c).is_none(), "cancelled");
+
+        // Shared files: a file in the incoming folder, after a reload.
+        std::fs::write(incoming.join("gui shared.bin"), vec![7u8; 4096]).unwrap();
+        c.shared_reload().unwrap();
+        until(&mut c, "the shared file", &|c| {
+            c.shared_files()
+                .unwrap()
+                .iter()
+                .any(|f| f.name == "gui shared.bin")
+        });
+        let sf = c
+            .shared_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "gui shared.bin")
+            .unwrap();
+        assert_eq!(sf.size, 4096);
+        c.set_shared_priority(&[sf.hash], 3).unwrap();
+        let sf = c
+            .shared_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "gui shared.bin")
+            .unwrap();
+        assert_eq!(sf.priority, 3);
+
+        // The log, as the Networks page asks for it (no log is kept in a
+        // unit test: nothing installs the tracing subscriber).
+        c.log().unwrap();
+        assert_eq!(
+            c.request(&Packet::new(EC_OP_SHUTDOWN)).unwrap().opcode,
+            EC_OP_NOOP
+        );
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
+}

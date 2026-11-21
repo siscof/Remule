@@ -116,6 +116,10 @@ pub struct Status {
     /// How many changes to the downloads the client had applied when it
     /// took this view ([`DownloadChanges`]).
     pub applied: u64,
+    /// Free space where downloads are kept and where they finish, when
+    /// it can be told.
+    pub temp_free: Option<u64>,
+    pub incoming_free: Option<u64>,
 }
 
 /// Changes to the downloads the client has applied, counted as it applies
@@ -412,6 +416,15 @@ pub fn stats_reply(s: &Status, detail: u8) -> Packet {
             .with(int(EC_TAG_STATS_TOTAL_SENT_BYTES, s.total_sent))
             .with(int(EC_TAG_STATS_TOTAL_RECEIVED_BYTES, s.total_received))
             .with(int(EC_TAG_STATS_SHARED_FILE_COUNT, s.shared_files.into()));
+        // The Downloads and Shared Files panels' disk space.
+        for (tag, free) in [
+            (EC_TAG_STATS_TEMP_FREE_SPACE, s.temp_free),
+            (EC_TAG_STATS_INCOMING_FREE_SPACE, s.incoming_free),
+        ] {
+            if let Some(free) = free {
+                p = p.with(int(tag, free));
+            }
+        }
         // The version check's outcome, once one has finished.
         if let Some(v) = crate::version_check::global().result() {
             p = p

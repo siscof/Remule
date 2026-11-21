@@ -77,11 +77,13 @@ pub struct SharedBase {
     pub rating: u8,
 }
 
-/// `CreateED2kLink(file, false)`: `ed2k://|file|NAME|SIZE|HASH|/`.
+/// `CreateED2kLink(file, false)`: `ed2k://|file|NAME|SIZE|HASH|/`, the
+/// name as `CPath::Cleanup(false)` writes it: no `/` or control
+/// characters, spaces as `%20`.
 pub fn ed2k_link(name: &str, size: u64, hash: &Md4Hash) -> String {
     format!(
         "ed2k://|file|{}|{}|{}|/",
-        remule_core::part_file::clean_file_name(name),
+        ed2k_hash::cleanup_name(name),
         size,
         hash
     )

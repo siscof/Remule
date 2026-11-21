@@ -3586,6 +3586,7 @@ dependencies = [
  "ed2k-server",
  "ed2k-types",
  "flate2",
+ "libc",
  "rand 0.8.5",
  "remule-core",
  "remule-ec",
@@ -3594,6 +3595,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

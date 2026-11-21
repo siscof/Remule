@@ -369,6 +369,8 @@ fn ec_status(i: EcInputs<'_>) -> Status {
         downloads,
         // Set by the caller, which counts the changes.
         applied: 0,
+        temp_free: crate::disk::free_space(&i.c.temp),
+        incoming_free: crate::disk::free_space(&i.c.incoming),
     }
 }
 

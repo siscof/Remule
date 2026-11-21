@@ -799,10 +799,7 @@ pub mod shareddir_err {
 pub fn set_shared_dirs(config: &Path, dirs: &[(String, bool)]) -> Vec<(String, u8)> {
     use ed2k_formats::shareddir_dat::{EXPLICIT_FILE_NAME, RECURSIVE_FILE_NAME};
     let stored = crate::config::shared_dir_intents(config);
-    let roots: Vec<PathBuf> = crate::prefs::allowed_remote_dirs(config)
-        .iter()
-        .map(|r| canonical(Path::new(r)))
-        .collect();
+    let roots = crate::prefs::allowed_remote_dirs(config);
     let mut explicit: Vec<String> = Vec::new();
     let mut recursive: Vec<String> = Vec::new();
     let mut refused = Vec::new();
@@ -835,7 +832,9 @@ pub fn set_shared_dirs(config: &Path, dirs: &[(String, bool)]) -> Vec<(String, u
                 shareddir_err::MISSING
             } else if std::fs::read_dir(path).is_err() {
                 shareddir_err::UNREADABLE
-            } else if !roots.iter().any(|r| canon.starts_with(r)) {
+            } else if !crate::prefs::canonical_for_containment(path)
+                .is_some_and(|c| crate::prefs::within_roots(&c, &roots))
+            {
                 shareddir_err::OUTSIDE_ROOTS
             } else {
                 0
@@ -865,14 +864,7 @@ pub fn set_shared_dirs(config: &Path, dirs: &[(String, bool)]) -> Vec<(String, u
     refused
 }
 
-fn canonical(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_owned())
-}
-
-/// `CPath::IsSameDir`.
-fn same_dir(a: &str, b: &str) -> bool {
-    a == b || canonical(Path::new(a)) == canonical(Path::new(b))
-}
+use crate::prefs::{canonical, same_dir};
 
 const CHANGED: &str = "The selected file has changed or is not a complete file.";
 

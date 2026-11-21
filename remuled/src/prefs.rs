@@ -1714,11 +1714,8 @@ impl PrefStore {
     /// `IsRemoteDirChangeAllowed`: inside one of the allowed roots, as its
     /// canonical path. None allowed when no roots are configured.
     fn allowed(&self, dir: &str) -> Option<String> {
-        let canonical = canonical(Path::new(dir));
-        self.allowed_roots
-            .iter()
-            .any(|root| canonical.starts_with(self::canonical(Path::new(root))))
-            .then(|| canonical.display().to_string())
+        let canonical = canonical_for_containment(Path::new(dir))?;
+        within_roots(&canonical, &self.allowed_roots).then(|| canonical.display().to_string())
     }
 
     fn set_server_urls(&mut self, urls: Vec<String>) {
@@ -1852,12 +1849,58 @@ fn shared_list(config: &Path) -> Vec<String> {
     d.explicit.into_iter().chain(d.recursive).collect()
 }
 
-fn canonical(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_owned())
+/// `CPath::CanonicalForContainment(true)`: absolute, the deepest folder
+/// that exists resolved by the filesystem (symlinks, junctions, short
+/// names) and the components below it put back, so a folder not made yet
+/// can be checked. `None` for a path with a `..` in it (`IsContainedIn`
+/// refuses those rather than resolving them) or one whose existing part
+/// cannot be resolved.
+pub fn canonical_for_containment(p: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if p.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    let abs = if p.is_absolute() {
+        p.to_owned()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let mut existing = abs.as_path();
+    let mut tail = Vec::new();
+    while !existing.is_dir() {
+        tail.push(existing.file_name()?.to_owned());
+        existing = existing.parent()?;
+    }
+    let mut out = without_verbatim_prefix(existing.canonicalize().ok()?);
+    for c in tail.iter().rev() {
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// Windows' `\\?\C:\...` from `canonicalize`, written as `C:\...`.
+fn without_verbatim_prefix(p: PathBuf) -> PathBuf {
+    match p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => p,
+    }
+}
+
+/// Inside one of the roots, both compared as `canonical_for_containment`
+/// gives them (`IsRemoteDirChangeAllowed`). None configured, none inside.
+pub fn within_roots(canonical: &Path, roots: &[String]) -> bool {
+    roots.iter().any(|r| {
+        canonical_for_containment(Path::new(r)).is_some_and(|root| canonical.starts_with(root))
+    })
+}
+
+/// A path as compared and stored: its containment form, else as given.
+pub fn canonical(p: &Path) -> PathBuf {
+    canonical_for_containment(p).unwrap_or_else(|| p.to_owned())
 }
 
 /// `CPath::IsSameDir`.
-fn same_dir(a: &str, b: &str) -> bool {
+pub fn same_dir(a: &str, b: &str) -> bool {
     a == b || canonical(Path::new(a)) == canonical(Path::new(b))
 }
 

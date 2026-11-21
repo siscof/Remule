@@ -386,7 +386,7 @@ fn folders_move_only_inside_the_allowed_roots() {
     assert_eq!(r.opcode, EC_OP_NOOP);
     assert_eq!(
         dirs(&s),
-        inside.canonicalize().unwrap().display().to_string()
+        crate::prefs::canonical(&inside).display().to_string()
     );
 }
 
@@ -416,4 +416,40 @@ fn server_list_urls_and_the_ip_filter_url_are_kept() {
         conf(&d.0).get("/eMule/IPFilterURL"),
         Some("http://example/ipfilter.dat")
     );
+}
+
+#[test]
+fn containment_is_judged_as_amule_judges_it() {
+    use crate::prefs::{canonical_for_containment, within_roots};
+    let d = TempDir::new("contain");
+    let root = d.0.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let roots = [root.display().to_string()];
+    // Not made yet: its existing part resolved, the rest put back.
+    let new = canonical_for_containment(&root.join("a").join("b")).unwrap();
+    assert!(new.ends_with(Path::new("a").join("b")));
+    assert!(within_roots(&new, &roots));
+    // A `..` is refused, whatever it would resolve to.
+    assert_eq!(
+        canonical_for_containment(&root.join("..").join("root")),
+        None
+    );
+    assert_eq!(
+        canonical_for_containment(&root.join("x").join("..").join("..")),
+        None
+    );
+    // Beside the root is outside it.
+    let beside = canonical_for_containment(&d.0.join("rootless")).unwrap();
+    assert!(!within_roots(&beside, &roots));
+    // No roots, nothing inside.
+    assert!(!within_roots(&new, &[]));
+    #[cfg(unix)]
+    {
+        // A symlink inside a root that leads out of it.
+        let out = d.0.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::os::unix::fs::symlink(&out, root.join("link")).unwrap();
+        let through = canonical_for_containment(&root.join("link").join("x")).unwrap();
+        assert!(!within_roots(&through, &roots));
+    }
 }

@@ -189,14 +189,14 @@ fn categories_are_created_updated_deleted_and_saved() {
     assert_eq!(c1.child_int(EC_TAG_CATEGORY_COLOR), 0xff00);
     assert_eq!(
         c1.child_str(EC_TAG_CATEGORY_PATH),
-        music.canonicalize().unwrap().display().to_string()
+        crate::prefs::canonical(&music).display().to_string()
     );
 
     // Updated; an unknown one refused.
     let mut t = category(
         1,
         "Tunes",
-        &music.canonicalize().unwrap().display().to_string(),
+        &crate::prefs::canonical(&music).display().to_string(),
     );
     t.children[1] = Tag::string(EC_TAG_CATEGORY_COMMENT, "changed");
     assert_eq!(s.update_category_from(&t), CategoryResult::Done);
@@ -272,7 +272,7 @@ fn shared_folders_are_set_as_amule_sets_them() {
         ]
     );
     let read = |name: &str| std::fs::read_to_string(d.0.join(name)).unwrap();
-    let canon = |p: &Path| s(&p.canonicalize().unwrap());
+    let canon = |p: &Path| s(&crate::prefs::canonical(p));
     assert_eq!(
         read("shareddir-explicit.dat"),
         format!("{}\n{}\n", s(&outside), canon(&a))

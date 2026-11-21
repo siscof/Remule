@@ -16,7 +16,7 @@ use remule_ec::{Client, ConnectOptions, Packet, Tag};
 
 use crate::ec::{self, Download, ServerStatus, Status};
 use crate::ec_shared::SharedBase;
-use crate::ec_update::{prefs_reply, EcPrefs, UpdateData, UpdateServer, UpdateState, ValueMap};
+use crate::ec_update::{UpdateData, UpdateServer, UpdateState, ValueMap};
 
 fn download(ecid: u32, gaps: Vec<(u64, u64)>) -> Download {
     Download {
@@ -114,6 +114,7 @@ fn updates_carry_changes_by_ecid_and_bars_as_diffs() {
     let data = UpdateData {
         shared: vec![shared(3)],
         servers: vec![server(9)],
+        friends: Vec::new(),
     };
     let mut dl = vec![
         download(5, vec![(0, 29_999_999)]),
@@ -209,59 +210,6 @@ fn the_connection_state_names_the_server_by_ecid_when_incremental() {
     let t = ec::connstate_tag(&s, EC_DETAIL_INC_UPDATE);
     let srv = t.child(EC_TAG_SERVER).unwrap();
     assert_eq!((srv.as_int(), srv.children.len()), (41, 0));
-}
-
-fn prefs() -> EcPrefs {
-    EcPrefs {
-        nick: "me".into(),
-        user_hash: [7; 16],
-        upload_capacity: 2500,
-        download_capacity: 12500,
-        max_upload: 50,
-        tcp_port: 4662,
-        udp_port: 4672,
-        udp_enabled: false,
-        max_connections: 500,
-        autoconnect: true,
-        ed2k: true,
-        ..Default::default()
-    }
-}
-
-#[test]
-fn preferences_are_the_pages_asked_for() {
-    let ask = |sel: u32| {
-        prefs_reply(
-            &Packet::new(EC_OP_GET_PREFERENCES)
-                .with_detail(EC_DETAIL_UPDATE)
-                .with(Tag::int(EC_TAG_SELECT_PREFS, sel.into())),
-            &prefs(),
-        )
-    };
-    let r = ask(EC_PREFS_GENERAL | EC_PREFS_CONNECTIONS | EC_PREFS_CATEGORIES);
-    assert_eq!(r.opcode, EC_OP_SET_PREFERENCES);
-    assert_eq!(
-        r.tag(EC_TAG_DETAIL_LEVEL).unwrap().as_int(),
-        u64::from(EC_DETAIL_UPDATE)
-    );
-    let g = r.tag(EC_TAG_PREFS_GENERAL).unwrap();
-    assert_eq!(g.child_str(EC_TAG_USER_NICK), "me");
-    assert_eq!(g.child(EC_TAG_USER_HASH).unwrap().as_hash(), Some([7; 16]));
-    let c = r.tag(EC_TAG_PREFS_CONNECTIONS).unwrap();
-    assert_eq!(c.child_int(EC_TAG_CONN_MAX_UL), 50);
-    assert_eq!(c.child_int(EC_TAG_CONN_UDP_PORT), 4672);
-    assert_eq!(c.child_int(EC_TAG_CONN_MAX_CONN), 500);
-    // Flags are present-or-absent.
-    assert!(c.has(EC_TAG_CONN_UDP_DISABLE));
-    assert!(c.has(EC_TAG_CONN_AUTOCONNECT));
-    assert!(!c.has(EC_TAG_CONN_RECONNECT));
-    assert!(c.has(EC_TAG_NETWORK_ED2K) && !c.has(EC_TAG_NETWORK_KADEMLIA));
-    // One category only, as with aMule's: none sent.
-    assert!(r.tag(EC_TAG_PREFS_CATEGORIES).is_none());
-    // Only what was asked.
-    let r = ask(EC_PREFS_GENERAL);
-    assert!(r.tag(EC_TAG_PREFS_CONNECTIONS).is_none());
-    assert!(r.tag(EC_TAG_PREFS_GENERAL).is_some());
 }
 
 struct TempDir(PathBuf);
@@ -399,6 +347,7 @@ fn the_partial_update_protocol_leaves_out_what_is_unchanged_and_names_what_is_go
     let data = UpdateData {
         shared: vec![shared(3)],
         servers: Vec::new(),
+        friends: Vec::new(),
     };
     let mut dl = vec![download(5, vec![(0, 9)]), download(2, vec![(0, 9)])];
     let files = |p: &Packet| {

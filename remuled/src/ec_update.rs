@@ -102,6 +102,7 @@ pub struct UpdateServer {
 pub struct UpdateData {
     pub shared: Vec<SharedBase>,
     pub servers: Vec<UpdateServer>,
+    pub friends: Vec<crate::friends::FriendView>,
 }
 
 /// One connection's view: what it was sent of each object.
@@ -144,7 +145,7 @@ impl UpdateState {
     /// order with what changed (a file with nothing new is a bare ECID,
     /// which a client that infers removal from absence reads as "still
     /// there"), then the clients (none are tracked yet), the servers and
-    /// the friends (none). A file seen for the first time starts from
+    /// the friends. A file seen for the first time starts from
     /// nothing; one gone is forgotten.
     ///
     /// With the partial-update protocol (`partial`), a file with nothing new
@@ -215,93 +216,13 @@ impl UpdateState {
             let map = self.maps.entry(s.ecid).or_default();
             servers.children.push(map.filter(server_tag(s)));
         }
-        p.with(servers).with(Tag::empty(EC_TAG_FRIEND))
+        let mut friends = Tag::empty(EC_TAG_FRIEND);
+        for f in &data.friends {
+            let map = self.maps.entry(f.ecid).or_default();
+            friends
+                .children
+                .push(map.filter(crate::friends::friend_tag(f)));
+        }
+        p.with(servers).with(friends)
     }
-}
-
-/// The preferences `remuled` can tell, as `amule.conf` gives them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct EcPrefs {
-    pub nick: String,
-    pub user_hash: [u8; 16],
-    /// kB/s, for the graphs.
-    pub upload_capacity: u32,
-    pub download_capacity: u32,
-    /// kB/s, 0 for no limit.
-    pub max_upload: u32,
-    pub max_download: u32,
-    pub slot_allocation: u32,
-    pub tcp_port: u16,
-    pub udp_port: u16,
-    pub udp_enabled: bool,
-    pub max_sources_per_file: u16,
-    pub max_connections: u16,
-    pub autoconnect: bool,
-    pub reconnect: bool,
-    pub ed2k: bool,
-    pub kad: bool,
-    pub bind_address: String,
-    pub bind_interface: String,
-    pub upnp_enabled: bool,
-    pub upnp_tcp_port: u16,
-}
-
-/// `CEC_Prefs_Packet(selection, EC_DETAIL_UPDATE, ...)`: the general and
-/// connection pages of the selection. The other pages are not kept yet
-/// and are left out, which a client reads as "keep your own".
-pub fn prefs_reply(req: &Packet, p: &EcPrefs) -> Packet {
-    let selection = req.tag(EC_TAG_SELECT_PREFS).map_or(0, Tag::as_int) as u32;
-    let mut out = Packet::new(EC_OP_SET_PREFERENCES)
-        .with(Tag::int(EC_TAG_DETAIL_LEVEL, EC_DETAIL_UPDATE.into()));
-    let int = |n: u16, v: u64| Tag::int(n, v);
-    let flag = |n: u16, on: bool| on.then(|| Tag::empty(n));
-    if selection & EC_PREFS_GENERAL != 0 {
-        out = out.with(
-            Tag::empty(EC_TAG_PREFS_GENERAL)
-                .with(Tag::string(EC_TAG_USER_NICK, &p.nick))
-                .with(Tag::hash(EC_TAG_USER_HASH, p.user_hash))
-                .with(Tag::string(EC_TAG_USER_HOST, ""))
-                .with(int(EC_TAG_GENERAL_CHECK_NEW_VERSION, 0))
-                // No version check, no UPnP in this build.
-                .with(int(EC_TAG_GENERAL_VERSION_CHECK_AVAILABLE, 0))
-                .with(int(EC_TAG_GENERAL_UPNP_AVAILABLE, 0)),
-        );
-    }
-    if selection & EC_PREFS_CONNECTIONS != 0 {
-        let mut c = Tag::empty(EC_TAG_PREFS_CONNECTIONS)
-            .with(int(EC_TAG_CONN_UL_CAP, p.upload_capacity.into()))
-            .with(int(EC_TAG_CONN_DL_CAP, p.download_capacity.into()))
-            .with(int(EC_TAG_CONN_MAX_UL, p.max_upload.into()))
-            .with(int(EC_TAG_CONN_MAX_DL, p.max_download.into()))
-            .with(int(EC_TAG_CONN_SLOT_ALLOCATION, p.slot_allocation.into()))
-            .with(int(EC_TAG_CONN_TCP_PORT, p.tcp_port.into()))
-            .with(int(EC_TAG_CONN_UDP_PORT, p.udp_port.into()));
-        let push = |c: &mut Tag, t: Option<Tag>| c.children.extend(t);
-        push(&mut c, flag(EC_TAG_CONN_UDP_DISABLE, !p.udp_enabled));
-        c = c
-            .with(int(
-                EC_TAG_CONN_MAX_FILE_SOURCES,
-                p.max_sources_per_file.into(),
-            ))
-            .with(int(EC_TAG_CONN_MAX_CONN, p.max_connections.into()));
-        push(&mut c, flag(EC_TAG_CONN_AUTOCONNECT, p.autoconnect));
-        push(&mut c, flag(EC_TAG_CONN_RECONNECT, p.reconnect));
-        push(&mut c, flag(EC_TAG_NETWORK_ED2K, p.ed2k));
-        push(&mut c, flag(EC_TAG_NETWORK_KADEMLIA, p.kad));
-        c = c
-            .with(Tag::string(EC_TAG_CONN_BIND_ADDRESS, &p.bind_address))
-            .with(Tag::string(EC_TAG_CONN_BIND_INTERFACE, &p.bind_interface))
-            // No proxy is used.
-            .with(int(EC_TAG_PROXY_ENABLE, 0))
-            .with(int(EC_TAG_PROXY_TYPE, 0))
-            .with(Tag::string(EC_TAG_PROXY_HOST, ""))
-            .with(int(EC_TAG_PROXY_PORT, 0))
-            .with(int(EC_TAG_PROXY_AUTH, 0))
-            .with(Tag::string(EC_TAG_PROXY_USER, ""))
-            .with(Tag::string(EC_TAG_PROXY_PASSWORD, ""))
-            .with(int(EC_TAG_CONN_UPNP_ENABLED, p.upnp_enabled.into()))
-            .with(int(EC_TAG_CONN_UPNP_TCP_PORT, p.upnp_tcp_port.into()));
-        out = out.with(c);
-    }
-    out
 }

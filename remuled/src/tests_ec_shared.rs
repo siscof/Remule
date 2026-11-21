@@ -53,6 +53,8 @@ fn base() -> SharedBase {
         last_upload: 1_700_000_000,
         shared_since: 1_600_000_000,
         verify: None,
+        comment: "mine".into(),
+        rating: 4,
     }
 }
 
@@ -167,6 +169,7 @@ fn ecids_are_one_counter_and_last_while_shared() {
     let dirs = ReloadDirs {
         dirs: vec![share.clone()],
         reserved: Vec::new(),
+        incoming: None,
     };
     ec_shared::reload_now(&shares, &dirs);
     let mut st = SharedState::default();
@@ -206,6 +209,7 @@ async fn priorities_are_set_as_amule_sets_them() {
     let dirs = ReloadDirs {
         dirs: vec![share.clone()],
         reserved: Vec::new(),
+        incoming: None,
     };
     ec_shared::reload_now(&shares, &dirs);
     let hash = shares.lock().unwrap().files()[0].0.hash;
@@ -385,6 +389,66 @@ async fn an_ec_client_lists_prioritises_and_reloads_shared_files() {
         assert_eq!(l.tags.len(), 1, "out of the list");
         assert_eq!(l.tags[0].child_str(EC_TAG_PARTFILE_NAME), "first.txt");
 
+        // The user's comment and rating.
+        let r = c
+            .request(
+                &Packet::new(EC_OP_SHARED_FILE_SET_COMMENT)
+                    .with(Tag::hash(EC_TAG_KNOWNFILE, hash))
+                    .with(Tag::string(EC_TAG_KNOWNFILE_COMMENT, "nice file"))
+                    .with(Tag::int(EC_TAG_KNOWNFILE_RATING, 4)),
+            )
+            .unwrap();
+        assert_eq!(r.opcode, EC_OP_NOOP);
+        let l = list(&mut c);
+        assert_eq!(l.tags[0].child_str(EC_TAG_KNOWNFILE_COMMENT), "nice file");
+        assert_eq!(l.tags[0].child_int(EC_TAG_KNOWNFILE_RATING), 4);
+
+        // Renamed in its folder; never out of it.
+        let rename = |hash: [u8; 16], name: &str| {
+            Packet::new(EC_OP_RENAME_FILE)
+                .with(Tag::hash(EC_TAG_KNOWNFILE, hash))
+                .with(Tag::string(EC_TAG_PARTFILE_NAME, name))
+        };
+        for (h, name, why) in [
+            (hash, "../out.txt", "Unable to rename file."),
+            (hash, "", "Invalid file name."),
+            ([9; 16], "x.txt", "File not found."),
+        ] {
+            let r = c.request(&rename(h, name)).unwrap();
+            assert_eq!(
+                (r.opcode, r.message().unwrap().as_str()),
+                (EC_OP_FAILED, why)
+            );
+        }
+        let r = c.request(&rename(hash, "renamed.txt")).unwrap();
+        assert_eq!(r.opcode, EC_OP_NOOP);
+        assert!(share2.join("renamed.txt").exists() && !share2.join("first.txt").exists());
+        let l = list(&mut c);
+        assert_eq!(l.tags[0].child_str(EC_TAG_PARTFILE_NAME), "renamed.txt");
+        assert_eq!(l.tags[0].as_int(), ecid, "the same file");
+
+        // Verified: answered at once, the outcome in the log.
+        let r = c
+            .request(&Packet::new(EC_OP_VERIFY_LOCAL_DATA).with(Tag::hash(EC_TAG_KNOWNFILE, hash)))
+            .unwrap();
+        assert_eq!(r.opcode, EC_OP_NOOP);
+        // Recorded once done, as the file's verify tags.
+        let mut verified = None;
+        for _ in 0..50 {
+            let l = list(&mut c);
+            if let Some(t) = l.tags[0].child(EC_TAG_KNOWNFILE_VERIFY_DATE) {
+                verified = Some((
+                    t.as_int(),
+                    l.tags[0].child_str(EC_TAG_KNOWNFILE_VERIFY_CORRUPT_MD4),
+                ));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (date, md4) = verified.expect("the check was never recorded");
+        assert!(date > 0);
+        assert_eq!(md4, "", "nothing corrupt");
+
         assert_eq!(
             c.request(&Packet::new(EC_OP_SHUTDOWN)).unwrap().opcode,
             EC_OP_NOOP
@@ -403,10 +467,48 @@ async fn an_ec_client_lists_prioritises_and_reloads_shared_files() {
         .records
         .iter()
         .filter_map(|r| KnownFile::from_record(r).ok())
-        .find(|f| f.name == "first.txt")
+        .find(|f| f.name == "renamed.txt")
         .unwrap();
     assert_eq!(
         (first.up_priority, first.auto_priority),
         (priority::VERY_HIGH, false)
     );
+    // The check is recorded, clean.
+    assert_ne!(first.verify_date, 0);
+    assert_eq!(first.verify_corrupt_md4, "");
+    // The comment is in amule.conf, under the file's hash, as aMule keeps it.
+    let conf = ed2k_formats::amule_conf::ConfFile::from_bytes(
+        &std::fs::read(amule.join("amule.conf")).unwrap(),
+    );
+    assert_eq!(
+        conf.get(&format!("/{}/Comment", first.hash)),
+        Some("nice file")
+    );
+    assert_eq!(conf.get(&format!("/{}/Rate", first.hash)), Some("4"));
+}
+
+#[test]
+fn comments_are_read_from_amule_conf() {
+    let d = TempDir::new("comments");
+    let share = d.0.join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    std::fs::write(share.join("c.bin"), b"commented").unwrap();
+    let shares = Mutex::new(SharedFiles::load(&d.0).unwrap());
+    let dirs = ReloadDirs {
+        dirs: vec![share.clone()],
+        reserved: Vec::new(),
+        incoming: None,
+    };
+    ec_shared::reload_now(&shares, &dirs);
+    let hash = shares.lock().unwrap().files()[0].0.hash;
+    std::fs::write(
+        d.0.join("amule.conf"),
+        format!("[eMule]\nNick=x\n[{hash}]\nComment=hello\nRate=9\n"),
+    )
+    .unwrap();
+    let mut st = SharedState::default();
+    st.load_comments(&d.0);
+    let f = &st.list(&shares.lock().unwrap())[0];
+    // A rating past 5 is read as 5.
+    assert_eq!((f.comment.as_str(), f.rating), ("hello", 5));
 }

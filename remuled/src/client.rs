@@ -789,6 +789,11 @@ pub async fn run(
             ));
             ec_view = Some(tx);
             ec_control = Some(ctl_rx);
+            if e.prefs.check_new_version() {
+                tokio::spawn(crate::version_check::run_daily(
+                    crate::version_check::global(),
+                ));
+            }
         }
     }
     // For the EC view: the server logged into and since when, when Kad
@@ -798,8 +803,10 @@ pub async fn run(
     let mut last_traffic = Totals::default();
     let mut download_ids = DownloadIds::default();
     // The search external connections run.
-    let mut searches = ec_search::SearchList::default();
+    let mut searches = ec_search::Searches::default();
     let mut shared_state = crate::ec_shared::SharedState::default();
+    shared_state.load_comments(&c.config);
+    let mut friends = crate::friends::FriendList::load(&c.config);
     // The servers' ECIDs, kept while they are listed.
     let mut server_ids = ServerIds::default();
     // What the statistics tree shows that is not kept elsewhere.
@@ -807,6 +814,7 @@ pub async fn run(
     let reload_dirs = crate::ec_shared::ReloadDirs {
         dirs: c.share.iter().chain([&c.incoming]).cloned().collect(),
         reserved: vec![c.temp.clone(), c.config.clone()],
+        incoming: Some((c.config.clone(), c.incoming.clone())),
     };
 
     let start = Instant::now();
@@ -1003,7 +1011,7 @@ pub async fn run(
                         let _ = reply.send(r);
                         tick.reset_immediately();
                     }
-                    Some(Control::Search { req, reply }) => {
+                    Some(Control::Search { req, ctx, reply }) => {
                         let net = ec_search::Net { server: server.as_ref(), kad: kad_node.as_ref().map(|k| &k.handle) };
                         let status = |h: &Md4Hash| {
                             if wanted.iter().any(|(w, _)| w == h) {
@@ -1014,7 +1022,7 @@ pub async fn run(
                                 ec_search::download_status::NEW
                             }
                         };
-                        let (packet, todo) = ec_search::serve(&req, &mut searches, net, &status).await;
+                        let (packet, todo, started_id) = ec_search::serve(&req, &mut searches, ctx, net, &status).await;
                         let started = !todo.is_empty();
                         for d in todo {
                             let add = new_download(&c, &wanted, shares.as_ref(), NewDownload {
@@ -1030,7 +1038,7 @@ pub async fn run(
                                 }).await;
                             }
                         }
-                        let _ = reply.send(packet);
+                        let _ = reply.send((packet, started_id));
                         if started {
                             tick.reset_immediately();
                         }
@@ -1112,6 +1120,32 @@ pub async fn run(
                         }
                         tick.reset_immediately();
                     }
+                    Some(Control::ClientHistory(reply)) => {
+                        let (tx, rx) = oneshot::channel();
+                        if cmd.send(Command::CreditHistory(tx)).is_ok() {
+                            tokio::spawn(async move {
+                                let _ = reply.send(rx.await.unwrap_or_default());
+                            });
+                        }
+                    }
+                    Some(Control::Friend { req, reply }) => {
+                        let _ = reply.send(friends.answer(&req));
+                    }
+                    Some(Control::CategoryRemoved(cat)) => {
+                        let _ = cmd.send(Command::RemoveCategory(cat));
+                        tick.reset_immediately();
+                    }
+                    Some(Control::IpFilterReload) => {
+                        if let Some(f) = c.ip_filter.clone() {
+                            let dir = c.config.clone();
+                            tokio::task::spawn_blocking(move || crate::config::reload_ip_filter(&dir, &f));
+                        }
+                    }
+                    Some(Control::IpFilterUpdate(url)) => {
+                        if let Some(f) = c.ip_filter.clone() {
+                            tokio::spawn(update_ip_filter(c.config.clone(), url, f));
+                        }
+                    }
                     Some(Control::Shared(req)) => {
                         shared_state.handle(req, shares.as_ref(), &reload_dirs, &c.config);
                     }
@@ -1174,7 +1208,7 @@ pub async fn run(
                             }
                             Some(crate::ec_update::UpdateServer { ecid: server_ids.id(addr), info, tcp_flags })
                         }).collect();
-                        let _ = reply.send(crate::ec_update::UpdateData { shared, servers });
+                        let _ = reply.send(crate::ec_update::UpdateData { shared, servers, friends: friends.view() });
                     }
                     None => ec_control = None,
                 }
@@ -1394,4 +1428,26 @@ pub async fn run(
     summary.totals = statistics.totals();
     info!("{}", crate::stats::summary(&statistics, now));
     Ok(summary)
+}
+
+/// `CIPFilter::Update` and `DownloadFinished`: `ipfilter.dat` fetched to
+/// `ipfilter.download`, put in place, and the filter read again.
+async fn update_ip_filter(dir: PathBuf, url: String, filter: Arc<AddressFilter>) {
+    let body = match crate::http::fetch(&url).await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!("ipfilter.dat from {url}: {e}");
+            warn!("Failed to download ipfilter.dat from {url}");
+            return;
+        }
+    };
+    let (download, dat) = (dir.join("ipfilter.download"), dir.join("ipfilter.dat"));
+    if let Err(e) = std::fs::write(&download, &body).and_then(|_| std::fs::rename(&download, &dat))
+    {
+        warn!("Failed to replace ipfilter.dat file, aborting update: {e}");
+        return;
+    }
+    info!("Successfully updated ipfilter.dat");
+    let _ =
+        tokio::task::spawn_blocking(move || crate::config::reload_ip_filter(&dir, &filter)).await;
 }

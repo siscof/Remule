@@ -5,6 +5,7 @@
 //! * [`config`]: an aMule config directory turned into a client's settings.
 //! * [`client`]: the running client (also behind `remule download`).
 //! * [`kad`]: a Kad node started from, and saved to, aMule's files.
+//! * [`friends`]: the friend list, `emfriends.met`.
 //! * [`firewall`]: whether others can reach us; answering Kad's firewall
 //!   checks over TCP.
 //! * [`applog`]: the log as External Connections read it.
@@ -19,6 +20,9 @@
 //! * [`ec_shared`]: shared files over external connections.
 //! * [`ec_stats`]: the statistics tree.
 //! * [`ec_update`]: `amulegui`'s incremental updates, and the preferences.
+//! * [`prefs`]: the preferences over external connections, kept in
+//!   `amule.conf`.
+//! * [`version_check`]: whether a newer release is out.
 
 pub mod applog;
 pub mod bootstrap;
@@ -31,11 +35,14 @@ pub mod ec_shared;
 pub mod ec_stats;
 pub mod ec_update;
 pub mod firewall;
+pub mod friends;
 pub mod graphs;
 pub mod http;
 pub mod kad;
+pub mod prefs;
 pub mod server_conn;
 pub mod stats;
+pub mod version_check;
 
 #[cfg(test)]
 mod tests;
@@ -45,6 +52,8 @@ mod tests_applog;
 mod tests_bootstrap;
 #[cfg(test)]
 mod tests_ec;
+#[cfg(test)]
+mod tests_ec_more;
 #[cfg(test)]
 mod tests_ec_search;
 #[cfg(test)]
@@ -59,5 +68,7 @@ mod tests_ec_update;
 mod tests_firewall;
 #[cfg(test)]
 mod tests_graphs;
+#[cfg(test)]
+mod tests_prefs;
 #[cfg(test)]
 mod tests_server_conn;

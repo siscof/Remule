@@ -20,6 +20,9 @@ use ed2k_types::Md4Hash;
 /// `clients.met`
 pub const CLIENTS_MET: &str = "clients.met";
 
+/// A peer's credits, and what the metadata block remembers of it.
+pub type HistoryEntry = (CreditRecord, Option<ed2k_formats::clients_met::ClientMeta>);
+
 /// The credits.
 #[derive(Debug)]
 pub struct Credits {
@@ -120,6 +123,25 @@ impl Credits {
             .get(hash)
             .map_or((0, 0), |r| (r.downloaded, r.uploaded));
         score_ratio(ident, crypto_available, down, up)
+    }
+
+    /// Every peer with credits, with what `clients.met`'s metadata block
+    /// remembers of it (`GetAllCredits`, `GetMeta`), by hash.
+    pub fn history(&self) -> Vec<HistoryEntry> {
+        let meta: HashMap<Md4Hash, ed2k_formats::clients_met::ClientMeta> =
+            ed2k_formats::clients_met::read_trailer(&self.trailing)
+                .entries()
+                .iter()
+                .filter(|e| e.meta.is_populated())
+                .map(|e| (e.key, e.meta.clone()))
+                .collect();
+        let mut out: Vec<_> = self
+            .records
+            .values()
+            .map(|r| (r.clone(), meta.get(&r.key).cloned()))
+            .collect();
+        out.sort_by_key(|(r, _)| r.key.0);
+        out
     }
 
     pub fn is_dirty(&self) -> bool {

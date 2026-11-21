@@ -34,8 +34,8 @@ pub struct EcSettings {
     /// requests check.
     pub ed2k: bool,
     pub kad: bool,
-    /// What `EC_OP_GET_PREFERENCES` tells.
-    pub prefs: crate::ec_update::EcPrefs,
+    /// The preferences ([`crate::prefs`]).
+    pub prefs: crate::prefs::PrefStore,
 }
 
 /// The connected server, as the EC server tag tells it.
@@ -269,7 +269,9 @@ pub enum Control {
     /// ([`crate::ec_search`]).
     Search {
         req: Packet,
-        reply: oneshot::Sender<Packet>,
+        ctx: crate::ec_search::Ctx,
+        /// The reply, and the ID of a search it started.
+        reply: oneshot::Sender<(Packet, Option<u32>)>,
     },
     /// A server or network request ([`crate::ec_servers`]), answered by
     /// the client loop.
@@ -282,6 +284,21 @@ pub enum Control {
     Update(oneshot::Sender<crate::ec_update::UpdateData>),
     /// The statistics tree's data ([`crate::ec_stats`]).
     StatsTree(oneshot::Sender<crate::ec_stats::TreeData>),
+    /// `EC_OP_FRIEND`, answered by the client loop, which keeps the
+    /// friends ([`crate::friends`]).
+    Friend {
+        req: Packet,
+        reply: oneshot::Sender<Packet>,
+    },
+    /// The credit history (`EC_OP_GET_CLIENT_HISTORY`).
+    ClientHistory(oneshot::Sender<Vec<remule_core::credits::HistoryEntry>>),
+    /// `ResetCatParts`: a category was deleted.
+    CategoryRemoved(u32),
+    /// `NotifyAlways_IPFilter_Reload`: the IP filter read again.
+    IpFilterReload,
+    /// `CIPFilter::Update`: `ipfilter.dat` fetched from this URL, then
+    /// the filter read again.
+    IpFilterUpdate(String),
 }
 
 fn detail(req: &Packet) -> u8 {
@@ -385,6 +402,15 @@ pub fn stats_reply(s: &Status, detail: u8) -> Packet {
             .with(int(EC_TAG_STATS_TOTAL_SENT_BYTES, s.total_sent))
             .with(int(EC_TAG_STATS_TOTAL_RECEIVED_BYTES, s.total_received))
             .with(int(EC_TAG_STATS_SHARED_FILE_COUNT, s.shared_files.into()));
+        // The version check's outcome, once one has finished.
+        if let Some(v) = crate::version_check::global().result() {
+            p = p
+                .with(Tag::string(EC_TAG_GENERAL_VERSION_CHECK_LATEST, &v.latest))
+                .with(int(EC_TAG_GENERAL_VERSION_CHECK_TIMESTAMP, v.at));
+            if v.outdated {
+                p = p.with(Tag::empty(EC_TAG_GENERAL_VERSION_CHECK_OUTDATED));
+            }
+        }
     }
     if detail != EC_DETAIL_UPDATE {
         let (ed2k_users, ed2k_files) = s.server.as_ref().map_or((0, 0), |sv| (sv.users, sv.files));
@@ -424,6 +450,170 @@ pub fn stats_reply(s: &Status, detail: u8) -> Packet {
         }
     }
     p.with(connstate_tag(s, detail))
+}
+
+/// `MakeKadBuddyTag`: the buddy counters, serving and own, in aMule's order.
+pub fn kad_buddy_tag() -> Tag {
+    let mut t = Tag::empty(EC_TAG_KAD_BUDDY);
+    t.children = [
+        EC_TAG_KAD_BUDDY_PENDING,
+        EC_TAG_KAD_BUDDY_SERVING_REQUESTS,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERED,
+        EC_TAG_KAD_BUDDY_SERVING_REFUSED_FIREWALLED,
+        EC_TAG_KAD_BUDDY_SERVING_REFUSED_FULL,
+        EC_TAG_KAD_BUDDY_SERVING_REFUSED_CONFLICT,
+        EC_TAG_KAD_BUDDY_SERVING_RATE_LIMITED,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERS_EXPIRED,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERS_SUPERSEDED,
+        EC_TAG_KAD_BUDDY_SERVING_OFFERS_DUPLICATE,
+        EC_TAG_KAD_BUDDY_SERVING_STARTED,
+        EC_TAG_KAD_BUDDY_SERVING_RELEASED_EXTRA,
+        EC_TAG_KAD_BUDDY_SERVING_ENDED,
+        EC_TAG_KAD_BUDDY_SERVING_TIMED_OUT,
+        EC_TAG_KAD_BUDDY_SERVING_SECONDS,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACK_BYTES,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS_NO_BUDDY,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS_MISMATCHED,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACKS_RATE_LIMITED,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS,
+        EC_TAG_KAD_BUDDY_SERVING_REASK_BYTES,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS_NO_BUDDY,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS_MISMATCHED,
+        EC_TAG_KAD_BUDDY_SERVING_REASKS_MALFORMED,
+        EC_TAG_KAD_BUDDY_SERVING_RELAY_BYTES_PEAK,
+        EC_TAG_KAD_BUDDY_SERVING_CALLBACK_REQUESTS_PEAK,
+        EC_TAG_KAD_BUDDY_OWN_SEARCHES,
+        EC_TAG_KAD_BUDDY_OWN_REQUESTS,
+        EC_TAG_KAD_BUDDY_OWN_REQUESTS_SKIPPED,
+        EC_TAG_KAD_BUDDY_OWN_OFFERS,
+        EC_TAG_KAD_BUDDY_OWN_CONNECT_ATTEMPTS,
+        EC_TAG_KAD_BUDDY_OWN_CONNECT_FAILURES,
+        EC_TAG_KAD_BUDDY_OWN_CONNECTED,
+        EC_TAG_KAD_BUDDY_OWN_ENDED,
+        EC_TAG_KAD_BUDDY_OWN_TIMED_OUT,
+        EC_TAG_KAD_BUDDY_OWN_SECONDS,
+        EC_TAG_KAD_BUDDY_OWN_CALLBACKS,
+        EC_TAG_KAD_BUDDY_OWN_REASKS,
+        EC_TAG_KAD_BUDDY_OWN_NEEDED_SECONDS,
+        EC_TAG_KAD_BUDDY_OWN_MISSING_SECONDS,
+    ]
+    .into_iter()
+    .map(|n| Tag::int(n, 0))
+    .collect();
+    t
+}
+
+/// `FormatPackedClientVersion`: `major * 100000 + minor * 1000 + update *
+/// 100`, written as each client family writes its version.
+pub fn format_client_version(soft: u8, packed: u32) -> String {
+    let (major, minor, update) = (
+        packed / 100_000,
+        (packed % 100_000) / 1000,
+        (packed % 1000) / 100,
+    );
+    let letter = |n: u32| char::from_u32(u32::from(b'a') + n).unwrap_or('?');
+    match soft {
+        // aMule, lxMule, Hydranode and the MLDonkeys: three numbers.
+        3 | 2 | 6 | 0x34 | 0x98 | 0x0a => format!("v{major}.{minor}.{update}"),
+        // eDonkeyHybrid drops a zero update.
+        0x32 if update == 0 => format!("v{major}.{minor}"),
+        0x32 => format!("v{major}.{minor}.{update}"),
+        // lphant: the major one lower, the minor two digits, the update a letter.
+        0x14 => format!(" v{}.{minor:02}{}", major.saturating_sub(1), letter(update)),
+        // eMule Plus: trailing zeros left out, 'a' meaning 1.
+        5 => {
+            let mut out = format!("v{major}");
+            if minor != 0 {
+                out += &format!(".{minor}");
+            }
+            if update != 0 {
+                out.push(letter(update - 1));
+            }
+            out
+        }
+        // eMule and its kind: the update a letter, 'a' meaning 0.
+        _ => format!("v{major}.{minor}{}", letter(update)),
+    }
+}
+
+/// `Get_EC_Response_ClientHistory`: one tag per peer with credits, its
+/// totals, ratio and last-seen date, and what the metadata block remembers
+/// of it when it has any.
+pub fn client_history_reply(entries: &[remule_core::credits::HistoryEntry]) -> Packet {
+    let mut p = Packet::new(EC_OP_CLIENT_HISTORY);
+    for (r, meta) in entries {
+        let mut t = Tag::hash(EC_TAG_CLIENT, r.key.0)
+            .with(Tag::int(EC_TAG_CLIENT_UPLOAD_TOTAL, r.uploaded))
+            .with(Tag::int(EC_TAG_CLIENT_DOWNLOAD_TOTAL, r.downloaded))
+            .with(Tag::double(
+                EC_TAG_CLIENT_SCORE_RATIO,
+                r.credit_ratio().into(),
+            ))
+            .with(Tag::int(EC_TAG_CLIENT_LAST_SEEN, r.last_seen.into()));
+        if let Some(m) = meta {
+            t = t
+                .with(Tag::int(EC_TAG_CLIENT_FIRST_SEEN, m.first_seen.into()))
+                .with(Tag::int(EC_TAG_CLIENT_SESSIONS, m.sessions.into()));
+            if !m.name.is_empty() {
+                t = t.with(Tag::string(EC_TAG_CLIENT_NAME, &m.name));
+            }
+            t = t
+                .with(Tag::int(EC_TAG_CLIENT_USER_IP, m.last_ip.into()))
+                .with(Tag::int(EC_TAG_CLIENT_USER_PORT, m.last_port.into()))
+                .with(Tag::int(EC_TAG_CLIENT_KAD_PORT, m.kad_port.into()))
+                .with(Tag::int(EC_TAG_CLIENT_SOFTWARE, m.client_soft.into()));
+            if !m.mod_version.is_empty() {
+                t = t.with(Tag::string(EC_TAG_CLIENT_MOD_VERSION, &m.mod_version));
+            }
+            t = t
+                .with(Tag::string(
+                    EC_TAG_CLIENT_SOFT_VER_STR,
+                    &format_client_version(m.client_soft, m.version),
+                ))
+                .with(Tag::int(EC_TAG_CLIENT_FROM, m.source_from.into()))
+                .with(Tag::int(
+                    EC_TAG_CLIENT_OBFUSCATION_STATUS,
+                    m.obfuscation.into(),
+                ));
+        }
+        p = p.with(t);
+    }
+    p
+}
+
+/// A category command's answer: a kept folder with its category and
+/// path (which clients read as applied), a refusal with its category or
+/// the folder refused (reason 3, outside the allowed roots).
+fn category_reply(r: crate::prefs::CategoryResult) -> Packet {
+    use crate::prefs::CategoryResult;
+    match r {
+        CategoryResult::Done => Packet::new(EC_OP_NOOP),
+        CategoryResult::PathKept { index, path } => Packet::new(EC_OP_FAILED)
+            .with(Tag::int(EC_TAG_CATEGORY, index.into()))
+            .with(Tag::string(EC_TAG_CATEGORY_PATH, &path)),
+        CategoryResult::Refused {
+            index,
+            folder,
+            message,
+        } => {
+            let mut p = Packet::new(EC_OP_FAILED);
+            if let Some(dir) = folder {
+                p = p.with(Tag::string(EC_TAG_SHAREDDIR_REJECTED, &dir).with(Tag::int(
+                    EC_TAG_SHAREDDIR_ERROR,
+                    crate::prefs::SHAREDDIR_ERR_OUTSIDE_ROOTS,
+                )));
+            }
+            if let Some(i) = index {
+                p = p.with(Tag::int(EC_TAG_CATEGORY, i.into()));
+            }
+            p.with(Tag::string(EC_TAG_STRING, message))
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn failed(message: &str) -> Packet {
@@ -539,6 +729,7 @@ async fn add_links(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> Pa
 async fn partfile_cmd(
     req: &Packet,
     s: &Status,
+    categories: u32,
     control: &mpsc::UnboundedSender<Control>,
 ) -> Packet {
     let mut response: Option<Packet> = None;
@@ -580,9 +771,8 @@ async fn partfile_cmd(
                 return failed("The selected download has changed. Refresh and try again.");
             }
         }
-        // Only the one category there is, as aMule keeps none of its own.
         if let FileOp::Category(c) = op {
-            if c >= 1 {
+            if c >= categories {
                 response.get_or_insert_with(|| failed(&format!("No such category: {c}")));
                 continue;
             }
@@ -647,7 +837,8 @@ pub async fn answer(
             };
             (conn.update.reply(&s.downloads, &data, conn.partial), false)
         }
-        EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
+        EC_OP_GET_PREFERENCES => (lock(conn.prefs).reply(req), false),
+        EC_OP_SET_PREFERENCES => (lock(conn.prefs).apply(req), false),
         EC_OP_GET_STATSTREE => {
             let (reply, rx) = oneshot::channel();
             let data = match control.send(Control::StatsTree(reply)) {
@@ -655,13 +846,64 @@ pub async fn answer(
                 Err(_) => Default::default(),
             };
             (
-                crate::ec_stats::tree_reply(req, &data, conn.version, &conn.prefs.nick),
+                crate::ec_stats::tree_reply(req, &data, conn.version, &lock(conn.prefs).nick()),
                 false,
             )
         }
         EC_OP_GET_STATSGRAPHS => {
             let h = conn.history.lock().unwrap_or_else(|e| e.into_inner());
             (crate::graphs::graphs_reply(req, &h), false)
+        }
+        // amuleapi's `POST /version/check`: started, or throttled.
+        EC_OP_VERSION_CHECK => (
+            if crate::version_check::global().start() {
+                Packet::new(EC_OP_NOOP)
+            } else {
+                failed("Version check throttled; try again shortly.")
+            },
+            false,
+        ),
+        EC_OP_FRIEND => {
+            let (reply, rx) = oneshot::channel();
+            let p = match control.send(Control::Friend {
+                req: req.clone(),
+                reply,
+            }) {
+                Ok(()) => rx
+                    .await
+                    .unwrap_or_else(|_| failed("Already shutting down.")),
+                Err(_) => failed("Already shutting down."),
+            };
+            (p, false)
+        }
+        EC_OP_GET_CLIENT_HISTORY => {
+            let (reply, rx) = oneshot::channel();
+            let entries = match control.send(Control::ClientHistory(reply)) {
+                Ok(()) => rx.await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            (client_history_reply(&entries), false)
+        }
+        EC_OP_IPFILTER_RELOAD => {
+            let _ = control.send(Control::IpFilterReload);
+            (Packet::new(EC_OP_NOOP), false)
+        }
+        EC_OP_IPFILTER_UPDATE => {
+            // The URL given, remembered; none, the configured one.
+            let given = req.tags.first().map(Tag::as_str).unwrap_or_default();
+            let url = {
+                let mut p = lock(conn.prefs);
+                if given.is_empty() {
+                    p.ipfilter_url()
+                } else {
+                    p.set_ipfilter_url(&given);
+                    given
+                }
+            };
+            if !url.is_empty() {
+                let _ = control.send(Control::IpFilterUpdate(url));
+            }
+            (Packet::new(EC_OP_NOOP), false)
         }
         EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),
         EC_OP_SHUTDOWN => {
@@ -671,6 +913,12 @@ pub async fn answer(
         EC_OP_STAT_REQ => {
             let d = detail(req);
             let mut p = stats_reply(s, d);
+            // `MakeKadBuddyTag`, when asked for: no buddy is kept or
+            // served yet, so every counter is 0.
+            if d != EC_DETAIL_UPDATE && req.tag(EC_TAG_KAD_BUDDY).is_some() {
+                let at = p.tags.len().saturating_sub(1);
+                p.tags.insert(at, kad_buddy_tag());
+            }
             // `AddLoggerTag`: the lines this connection has not seen, after
             // the banned count, at the GUI's levels.
             if d == EC_DETAIL_FULL || d == EC_DETAIL_INC_UPDATE {
@@ -741,14 +989,45 @@ pub async fn answer(
         EC_OP_GET_DLOAD_QUEUE => (download_queue_reply(req, s), false),
         EC_OP_ADD_LINK => (add_links(req, control).await, false),
         op if crate::ec_search::is_search(op) => {
-            (crate::ec_search::forward(req, control).await, false)
+            let (p, started) = crate::ec_search::forward(req, conn.search, control).await;
+            if let Some(id) = started {
+                conn.search.current = id;
+            }
+            (p, false)
         }
         EC_OP_PARTFILE_PAUSE
         | EC_OP_PARTFILE_RESUME
         | EC_OP_PARTFILE_STOP
         | EC_OP_PARTFILE_DELETE
         | EC_OP_PARTFILE_PRIO_SET
-        | EC_OP_PARTFILE_SET_CAT => (partfile_cmd(req, s, control).await, false),
+        | EC_OP_PARTFILE_SET_CAT => {
+            let categories = lock(conn.prefs).category_count();
+            (partfile_cmd(req, s, categories, control).await, false)
+        }
+        EC_OP_CREATE_CATEGORY | EC_OP_UPDATE_CATEGORY => {
+            // One category, or nothing to do.
+            if req.tags.len() != 1 {
+                return (Packet::new(EC_OP_NOOP), false);
+            }
+            let mut p = lock(conn.prefs);
+            let r = if req.opcode == EC_OP_CREATE_CATEGORY {
+                p.create_category(&req.tags[0])
+            } else {
+                p.update_category_from(&req.tags[0])
+            };
+            (category_reply(r), false)
+        }
+        EC_OP_DELETE_CATEGORY => {
+            if req.tags.len() != 1 {
+                return (failed("Malformed category request."), false);
+            }
+            let index = req.tags[0].as_int();
+            let r = lock(conn.prefs).delete_category(index);
+            if r == crate::prefs::CategoryResult::Done {
+                let _ = control.send(Control::CategoryRemoved(index as u32));
+            }
+            (category_reply(r), false)
+        }
         op if crate::ec_servers::is_server_request(op) => {
             (crate::ec_servers::ask(req, control).await, false)
         }
@@ -756,7 +1035,11 @@ pub async fn answer(
         | EC_OP_SHAREDFILES_RELOAD
         | EC_OP_SHARED_SET_PRIO
         | EC_OP_GET_SHARED_DIRS
-        | EC_OP_KNOWNFILE_DELETE => match crate::ec_shared::answer(req, control).await {
+        | EC_OP_SET_SHARED_DIRS
+        | EC_OP_KNOWNFILE_DELETE
+        | EC_OP_VERIFY_LOCAL_DATA
+        | EC_OP_SHARED_FILE_SET_COMMENT
+        | EC_OP_RENAME_FILE => match crate::ec_shared::answer(req, control).await {
             Some(p) => (p, false),
             None => (failed("Invalid opcode (wrong protocol version?)"), false),
         },
@@ -808,7 +1091,7 @@ pub async fn serve(
 ) {
     let limiter = Arc::new(Mutex::new(AuthLimiter::new(settings.limits)));
     let creds = Arc::new(settings.credentials);
-    let prefs = Arc::new(settings.prefs);
+    let prefs = Arc::new(Mutex::new(settings.prefs));
     let identity = Arc::new(identity);
     // `IsOnShutDown`: one shutdown, whichever connection asks.
     let shutting_down = Arc::new(AtomicBool::new(false));
@@ -860,6 +1143,7 @@ fn changes_downloads(opcode: u8) -> bool {
             | EC_OP_PARTFILE_DELETE
             | EC_OP_PARTFILE_PRIO_SET
             | EC_OP_PARTFILE_SET_CAT
+            | EC_OP_DELETE_CATEGORY
             | EC_OP_DOWNLOAD_SEARCH_RESULT
     )
 }
@@ -870,7 +1154,7 @@ struct Shared<'a> {
     identity: &'a Identity,
     limiter: &'a Mutex<AuthLimiter>,
     shutting_down: &'a AtomicBool,
-    prefs: &'a crate::ec_update::EcPrefs,
+    prefs: &'a Mutex<crate::prefs::PrefStore>,
     history: &'a Mutex<crate::graphs::History>,
 }
 
@@ -883,9 +1167,11 @@ pub struct ConnView<'a> {
     pub log: crate::applog::Cursor,
     /// It speaks the partial-update protocol.
     pub partial: bool,
+    /// How it searches, and the last search it started.
+    pub search: crate::ec_search::Ctx,
     /// What it was sent of each object, for incremental updates.
     pub update: crate::ec_update::UpdateState,
-    pub prefs: &'a crate::ec_update::EcPrefs,
+    pub prefs: &'a Mutex<crate::prefs::PrefStore>,
     /// The statistics graphs' history.
     pub history: &'a Mutex<crate::graphs::History>,
     /// The daemon's version, as `EC_OP_AUTH_OK` gives it.
@@ -904,6 +1190,7 @@ async fn connection(
     let mut cv = ConnView {
         log: crate::applog::global().cursor(),
         partial: false,
+        search: Default::default(),
         update: Default::default(),
         prefs: sh.prefs,
         history: sh.history,
@@ -936,6 +1223,8 @@ async fn connection(
                 let down = sh.shutting_down.load(Ordering::SeqCst);
                 let view = status.borrow_and_update().clone();
                 cv.partial = conn.partial_update();
+                cv.search.multi = conn.multi_search();
+                cv.search.union = conn.progress_union();
                 let (reply, stops) = answer(&req, &view, down, &control, &mut cv).await;
                 // A change to the downloads is answered once the view shows
                 // it, as aMule's are: what the client asks next sees it.

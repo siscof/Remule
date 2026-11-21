@@ -632,3 +632,33 @@ fn an_unreachable_peer_loses_its_slot() {
     );
     assert_eq!(up.queue().slot_count(), 1);
 }
+
+#[test]
+fn the_credit_history_carries_the_metadata_block() {
+    use ed2k_formats::clients_met::{ClientMeta, ClientsMet, CreditRecord, MetaEntry};
+    let dir = crate::tests_part_file::TempDir::new("credit-history");
+    let now = 1_800_000_000;
+    let mut a = CreditRecord::new(Md4Hash([1; 16]));
+    a.uploaded = 10;
+    a.last_seen = now;
+    let mut b = CreditRecord::new(Md4Hash([2; 16]));
+    b.downloaded = 20;
+    b.last_seen = now;
+    let meta = MetaEntry {
+        key: a.key,
+        meta: ClientMeta {
+            name: "a".into(),
+            first_seen: now - 100,
+            sessions: 3,
+            ..Default::default()
+        },
+    };
+    let met = ClientsMet::save(&[a.clone(), b.clone()], &[meta]);
+    std::fs::write(dir.0.join("clients.met"), met.write()).unwrap();
+    let credits = crate::credits::Credits::load(&dir.0, now).unwrap();
+    let h = credits.history();
+    assert_eq!(h.len(), 2);
+    assert_eq!(h[0].0.key, a.key);
+    assert_eq!(h[0].1.as_ref().unwrap().sessions, 3);
+    assert_eq!((h[1].0.downloaded, h[1].1.is_none()), (20, true));
+}

@@ -28,3 +28,14 @@
 23-sse-replay.sh
 47-shared-delete.sh
 12-downloads-add-patch.sh
+01-version-and-errors.sh
+17-shared-priority-patch.sh
+30-shared-verify.sh
+05-read-servers-kad-categories-prefs.sh
+41-shared-content.sh
+15-preferences-patch.sh
+35-ipfilter-actions.sh
+18-categories-crud.sh
+31-shared-directories.sh
+33-known-clients.sh
+34-friends.sh

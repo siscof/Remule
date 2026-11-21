@@ -927,3 +927,46 @@ fn downloads_pause_stop_resume_and_go() {
     assert!(!w.q.resume(&other));
     assert!(w.q.remove(&other, w.now, &mut out).is_none());
 }
+
+#[test]
+fn a_reloaded_ip_filter_is_seen_by_everything_sharing_it() {
+    use crate::ip_filter::AddressFilter;
+    use ed2k_formats::ipfilter::{IpFilter, IpFilterFile};
+    let list = |text: &str| {
+        let f = IpFilterFile::parse(text.as_bytes());
+        IpFilter::build(&[&f])
+    };
+    let shared = Arc::new(AddressFilter::new(list(""), 127, true, true));
+    let other = shared.clone();
+    let ip = std::net::Ipv4Addr::new(10, 1, 2, 3);
+    assert!(!other.blocks_client(ip));
+    shared.replace(AddressFilter::new(
+        list("10.0.0.0 - 10.255.255.255 , 0 , test\n"),
+        127,
+        true,
+        false,
+    ));
+    assert!(other.blocks_client(ip), "the same filter, reloaded");
+    assert!(!other.blocks_server(ip), "servers not filtered now");
+    assert_eq!(other.ban_count(), 1);
+}
+
+#[test]
+fn a_deleted_category_moves_its_downloads_to_the_default_one() {
+    let dir = TempDir::new("queue-category");
+    let mut q = DownloadQueue::new(config(&dir));
+    for (h, cat) in [(1u8, 0u32), (2, 1), (3, 2), (4, 3)] {
+        let mut f = PartFile::create(&dir.temp(), "x", Md4Hash([h; 16]), 100).unwrap();
+        f.set_category(cat);
+        q.add_file(f);
+    }
+    q.remove_category(2);
+    let cat = |h: u8| {
+        q.files()
+            .find(|f| f.hash() == Md4Hash([h; 16]))
+            .unwrap()
+            .info()
+            .category
+    };
+    assert_eq!((cat(1), cat(2), cat(3), cat(4)), (0, 1, 0, 2));
+}

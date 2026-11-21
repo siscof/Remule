@@ -173,6 +173,8 @@ pub struct ServerConn {
     notify: bool,
     /// `m_partialUpdateActive`.
     partial_update: bool,
+    multi_search: bool,
+    progress_union: bool,
     client: Option<(String, String)>,
     log: Vec<String>,
 }
@@ -254,6 +256,8 @@ impl ServerConn {
             srp: None,
             notify: false,
             partial_update: false,
+            multi_search: false,
+            progress_union: false,
             client: None,
             log: Vec::new(),
         }
@@ -281,6 +285,18 @@ impl ServerConn {
     /// incremental updates, and removed ones named.
     pub fn partial_update(&self) -> bool {
         self.partial_update
+    }
+
+    /// The client speaks multi-search: searches are addressed by a
+    /// daemon-allocated `EC_TAG_SEARCH_ID` (`m_multiSearchActive`).
+    pub fn multi_search(&self) -> bool {
+        self.multi_search
+    }
+
+    /// And reads an id-less progress request as every search
+    /// (`m_searchProgressUnionActive`; only with multi-search).
+    pub fn progress_union(&self) -> bool {
+        self.multi_search && self.progress_union
     }
 
     /// Whether the client asked for push notifications (`EC_TAG_CAN_NOTIFY`).
@@ -477,6 +493,8 @@ impl ServerConn {
         }
         self.notify = req.tag(EC_TAG_CAN_NOTIFY).is_some();
         self.partial_update = req.tag(EC_TAG_CAN_PARTIAL_UPDATE).is_some();
+        self.multi_search = req.tag(EC_TAG_CAN_MULTI_SEARCH).is_some();
+        self.progress_union = req.tag(EC_TAG_CAN_SEARCH_PROGRESS_UNION).is_some();
         response
     }
 
@@ -558,12 +576,23 @@ impl ServerConn {
                 // Confirmed, so the client stops reading absence as removal.
                 ok = ok.with(Tag::empty(EC_TAG_CAN_PARTIAL_UPDATE));
             }
-            // `EC_OP_KNOWNFILE_DELETE` is served. The other capabilities
-            // that advertise requests (partial updates, multi-search, chat,
-            // client history, shared dirs, search list, Kad lookups,
-            // search-all, metadata) are echoed once those requests are
-            // served: a client that sees one sends them.
-            return ok.with(Tag::empty(EC_TAG_CAN_DELETE_COMPLETE));
+            if self.multi_search {
+                // Searches by ID; the union progress form nested inside.
+                ok = ok.with(Tag::empty(EC_TAG_CAN_MULTI_SEARCH));
+                if self.progress_union {
+                    ok = ok.with(Tag::empty(EC_TAG_CAN_SEARCH_PROGRESS_UNION));
+                }
+            }
+            // Served unconditionally: the client history, deleting
+            // complete files, the shared folders' configuration, and the
+            // search list. The other capabilities that advertise requests
+            // (chat, Kad lookups, search-all, metadata) are echoed once
+            // those requests are served: a client that sees one sends them.
+            return ok
+                .with(Tag::empty(EC_TAG_CAN_SEARCH_LIST))
+                .with(Tag::empty(EC_TAG_CAN_CLIENT_HISTORY))
+                .with(Tag::empty(EC_TAG_CAN_DELETE_COMPLETE))
+                .with(Tag::empty(EC_TAG_CAN_SHAREDDIRS_CONFIG));
         }
         if present && proof.is_none() {
             return auth_failure(EC_AUTH_FAIL_INCOMPATIBLE, INVALID_HANDSHAKE);

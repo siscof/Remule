@@ -107,7 +107,7 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc gcc-c++ make cmake git curl tar gzip python3 procps-ng \
-            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth             jq iproute
+            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth             jq iproute diffutils
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -157,3 +157,19 @@ jobs:
         env:
           AMULEAPI: /opt/amulecmd/amuleapi
           SUITE: /opt/amulecmd/tree/unittests/curl-tests/amuleapi
+      # MIGRATION_PLAN.md 12.M: aMule's web UI, served by the unmodified
+      # amuleapi, driven in Chromium against remuled.
+      - name: Install Playwright and Chromium
+        run: |
+          dnf install -y --setopt=install_weak_deps=False nodejs npm \
+            nss atk at-spi2-atk cups-libs libdrm libxkbcommon mesa-libgbm alsa-lib \
+            pango libXcomposite libXdamage libXrandr libXfixes
+          mkdir -p /opt/pw && cd /opt/pw && npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.63.0
+          npx playwright install chromium
+      - name: aMule's web UI against remuled
+        run: bash scripts/interop/webui-on-remuled.sh
+        env:
+          NODE_PATH: /opt/pw/node_modules
+          AMULEAPI: /opt/amulecmd/amuleapi
+          STATIC: /opt/amulecmd/tree/src/webapi/static

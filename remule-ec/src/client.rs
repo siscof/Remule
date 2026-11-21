@@ -36,6 +36,9 @@ pub struct ConnectOptions {
     /// Per-reply read timeout. Generous: a daemon serialising a huge shared
     /// list can take a while to answer.
     pub io_timeout: Duration,
+    /// More `EC_TAG_CAN_*` capabilities to advertise at login, for a
+    /// caller that speaks them (none by default).
+    pub capabilities: Vec<u16>,
 }
 
 impl ConnectOptions {
@@ -48,6 +51,7 @@ impl ConnectOptions {
             client_version: env!("CARGO_PKG_VERSION").into(),
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(60),
+            capabilities: Vec::new(),
         }
     }
 }
@@ -181,6 +185,9 @@ impl Client {
             .with(Tag::empty(EC_TAG_CAN_LARGE_TAG_COUNT));
         if local {
             req = req.with(Tag::empty(EC_TAG_PREFER_NO_ZLIB));
+        }
+        for &cap in &opts.capabilities {
+            req = req.with(Tag::empty(cap));
         }
         req = req
             .with(Tag::custom(

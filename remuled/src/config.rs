@@ -236,6 +236,24 @@ pub fn ip_filter(
     ))
 }
 
+/// `CIPFilter::Reload`: the lists and `amule.conf`'s filter settings read
+/// again into `target`, which everything checking addresses shares.
+pub fn reload_ip_filter(dir: &Path, target: &AddressFilter) {
+    let conf = read_opt(&dir.join("amule.conf"))
+        .map(|b| ConfFile::from_bytes(&b))
+        .unwrap_or_default();
+    let (mut notes, mut info) = (Vec::new(), Vec::new());
+    let fresh = ip_filter(dir, &conf, &mut notes, &mut info);
+    for line in info {
+        tracing::info!("{line}");
+    }
+    for line in notes {
+        tracing::warn!("{line}");
+    }
+    target.replace((*fresh).clone());
+    tracing::info!("IP filter is ready");
+}
+
 /// Load `dir` as `amuled` would.
 pub fn load(dir: &Path) -> Result<Loaded, String> {
     if !dir.is_dir() {
@@ -324,8 +342,22 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         ec,
     };
     if let Some(e) = client.ec.as_mut() {
-        e.prefs.user_hash = client.user_hash.0;
-        e.prefs.max_connections = client.max_connections.min(usize::from(u16::MAX)) as u16;
+        e.prefs = crate::prefs::PrefStore::load(
+            dir,
+            &conf,
+            &crate::prefs::Runtime {
+                user_hash: client.user_hash.0,
+                incoming: client.incoming.display().to_string(),
+                temp: client.temp.display().to_string(),
+                shared: client
+                    .share
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect(),
+                max_connections: client.max_connections.min(usize::from(u16::MAX)) as u16,
+                listening: (client.tcp_port, client.udp_port),
+            },
+        );
     }
     Ok(Loaded {
         client,
@@ -333,6 +365,18 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         notes,
         info,
     })
+}
+
+/// `amule.conf` read again, changed by `f` and written back: for what the
+/// daemon itself changes while it runs.
+pub fn update_conf(dir: &Path, f: impl FnOnce(&mut ConfFile)) -> Result<(), String> {
+    let mut conf = match std::fs::read(dir.join("amule.conf")) {
+        Ok(b) => ConfFile::from_bytes(&b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfFile::new(),
+        Err(e) => return Err(format!("{}: {e}", dir.join("amule.conf").display())),
+    };
+    f(&mut conf);
+    save_conf(dir, &conf)
 }
 
 /// `amule.conf` written back, through a temporary file as wxFileConfig does.
@@ -493,31 +537,7 @@ fn ec_settings(
         },
         ed2k: prefs.connect_to_ed2k,
         kad: prefs.connect_to_kad,
-        prefs: crate::ec_update::EcPrefs {
-            nick: prefs.nick.clone(),
-            // The user hash and connection limit are set with the client.
-            user_hash: [0; 16],
-            upload_capacity: limit("/eMule/UploadCapacity", 2500) as u32,
-            download_capacity: limit("/eMule/DownloadCapacity", 12500) as u32,
-            max_upload: prefs.max_upload,
-            max_download: prefs.max_download,
-            slot_allocation: prefs.slot_allocation,
-            tcp_port: prefs.tcp_port,
-            udp_port: prefs.udp_port,
-            udp_enabled: prefs.udp_enabled,
-            max_sources_per_file: prefs.max_sources_per_file,
-            max_connections: 0,
-            autoconnect: prefs.autoconnect,
-            reconnect: prefs.reconnect,
-            ed2k: prefs.connect_to_ed2k,
-            kad: prefs.connect_to_kad,
-            bind_address: conf.get("/eMule/Address").unwrap_or_default().to_owned(),
-            bind_interface: conf
-                .get("/eMule/NetworkInterface")
-                .unwrap_or_default()
-                .to_owned(),
-            upnp_enabled: limit("/eMule/UPnPEnabled", 0) != 0,
-            upnp_tcp_port: limit("/eMule/UPnPTCPPort", 50000) as u16,
-        },
+        // Read with the client, which supplies what amule.conf does not.
+        prefs: Default::default(),
     })
 }

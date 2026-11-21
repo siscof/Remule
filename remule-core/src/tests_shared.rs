@@ -193,3 +193,46 @@ fn a_damaged_known_met_keeps_what_it_can() {
     assert_eq!(s.known_count(), 1);
     assert!(s.is_dirty());
 }
+
+#[test]
+fn a_shared_file_is_renamed_in_its_folder() {
+    use crate::shared::{is_bare_file_name, RenameError};
+    let dir = TempDir::new("shared-rename");
+    let share = dir.incoming();
+    fs::write(share.join("a.bin"), data(3000, 1)).unwrap();
+    fs::write(share.join("taken.bin"), data(10, 2)).unwrap();
+    let mut s = SharedFiles::load(&dir.0).unwrap();
+    let r = s.scan(&opts(&dir), 1);
+    for p in &r.to_hash {
+        let h = SharedFiles::hash(p).unwrap();
+        s.add_hashed(p, &h, mtime(&fs::metadata(p).unwrap()), 1);
+    }
+    let hash = s
+        .files()
+        .iter()
+        .find(|(f, _)| f.name == "a.bin")
+        .unwrap()
+        .0
+        .hash;
+    for bad in ["../x.bin", "sub/x.bin", "x\\y", ".", "..", ""] {
+        assert!(!is_bare_file_name(bad), "{bad}");
+        assert!(matches!(s.rename(&hash, bad), Err(RenameError::NotBare)));
+    }
+    assert!(matches!(
+        s.rename(&hash, "taken.bin"),
+        Err(RenameError::Io(_))
+    ));
+    assert!(matches!(
+        s.rename(&ed2k_types::Md4Hash([3; 16]), "z.bin"),
+        Err(RenameError::NotShared)
+    ));
+    let p = s.rename(&hash, "b.bin").unwrap();
+    assert_eq!(p, share.join("b.bin"));
+    assert!(p.exists() && !share.join("a.bin").exists());
+    let (f, path) = s.get(&hash).unwrap();
+    assert_eq!((f.name.as_str(), path), ("b.bin", p.as_path()));
+    // known.met follows: the next scan finds it known, nothing to hash.
+    s.save().unwrap();
+    let mut again = SharedFiles::load(&dir.0).unwrap();
+    assert!(again.scan(&opts(&dir), 2).to_hash.is_empty());
+}

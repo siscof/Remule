@@ -789,6 +789,11 @@ pub async fn run(
             ));
             ec_view = Some(tx);
             ec_control = Some(ctl_rx);
+            if e.prefs.check_new_version {
+                tokio::spawn(crate::version_check::run_daily(
+                    crate::version_check::global(),
+                ));
+            }
         }
     }
     // For the EC view: the server logged into and since when, when Kad
@@ -800,6 +805,7 @@ pub async fn run(
     // The search external connections run.
     let mut searches = ec_search::SearchList::default();
     let mut shared_state = crate::ec_shared::SharedState::default();
+    shared_state.load_comments(&c.config);
     // The servers' ECIDs, kept while they are listed.
     let mut server_ids = ServerIds::default();
     // What the statistics tree shows that is not kept elsewhere.

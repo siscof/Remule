@@ -28,3 +28,6 @@
 23-sse-replay.sh
 47-shared-delete.sh
 12-downloads-add-patch.sh
+01-version-and-errors.sh
+17-shared-priority-patch.sh
+30-shared-verify.sh

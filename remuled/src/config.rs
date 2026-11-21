@@ -335,6 +335,18 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
     })
 }
 
+/// `amule.conf` read again, changed by `f` and written back: for what the
+/// daemon itself changes while it runs.
+pub fn update_conf(dir: &Path, f: impl FnOnce(&mut ConfFile)) -> Result<(), String> {
+    let mut conf = match std::fs::read(dir.join("amule.conf")) {
+        Ok(b) => ConfFile::from_bytes(&b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfFile::new(),
+        Err(e) => return Err(format!("{}: {e}", dir.join("amule.conf").display())),
+    };
+    f(&mut conf);
+    save_conf(dir, &conf)
+}
+
 /// `amule.conf` written back, through a temporary file as wxFileConfig does.
 fn save_conf(dir: &Path, conf: &ConfFile) -> Result<(), String> {
     let path = dir.join("amule.conf");
@@ -518,6 +530,7 @@ fn ec_settings(
                 .to_owned(),
             upnp_enabled: limit("/eMule/UPnPEnabled", 0) != 0,
             upnp_tcp_port: limit("/eMule/UPnPTCPPort", 50000) as u16,
+            check_new_version: limit("/eMule/NewVersionCheck", 1) != 0,
         },
     })
 }

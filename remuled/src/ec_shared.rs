@@ -10,6 +10,12 @@
 //!   hashed (`CSharedFileList::Reload`); answered at once, as aMule
 //!   schedules it.
 //! * `EC_OP_SHARED_SET_PRIO`: a file's upload priority, or automatic.
+//! * `EC_OP_SHARED_FILE_SET_COMMENT`: the user's comment and rating of a
+//!   file, kept in `amule.conf` as aMule keeps them.
+//! * `EC_OP_RENAME_FILE`: a complete shared file renamed on disk, in its
+//!   own folder.
+//! * `EC_OP_VERIFY_LOCAL_DATA`: a shared file checked against its hashes
+//!   (`CVerifyLocalDataTask`), answered at once; the outcome is logged.
 //! * `EC_OP_GET_SHARED_DIRS`: the shared folders as configured
 //!   (`Get_EC_Response_GetSharedDirs`).
 //!
@@ -22,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use ed2k_formats::amule_conf::ConfFile;
 use ed2k_formats::known_met::{priority, KnownFile};
 use ed2k_types::Md4Hash;
 use remule_core::shared::{mtime, ScanOptions, SharedFiles};
@@ -63,6 +70,9 @@ pub struct SharedBase {
     pub shared_since: u32,
     /// The last "verify local data": date and the two corrupt lists.
     pub verify: Option<(u32, String, String)>,
+    /// The user's own comment and rating (0 to 5, 0 for none).
+    pub comment: String,
+    pub rating: u8,
 }
 
 /// `CreateED2kLink(file, false)`: `ed2k://|file|NAME|SIZE|HASH|/`.
@@ -78,7 +88,7 @@ pub fn ed2k_link(name: &str, size: u64, hash: &Md4Hash) -> String {
 /// `CEC_SharedFile_Tag(file, detail_level, NULL, name)`: a tag named
 /// `name` (`EC_TAG_KNOWNFILE`, or `EC_TAG_PARTFILE` for a download, which
 /// adds its own after). Session upload statistics, complete-source counts,
-/// upload activity, comments and media data are not kept yet: their zeros
+/// upload activity, others' comments and media data are not kept yet: their zeros
 /// and blanks are sent, as for a file nobody asked for.
 pub fn shared_tag(name: u16, b: &SharedBase, detail: u8) -> Tag {
     let int = |n: u16, v: u64| Tag::int(n, v);
@@ -130,8 +140,8 @@ pub fn shared_tag(name: u16, b: &SharedBase, detail: u8) -> Tag {
             EC_TAG_PARTFILE_ED2K_LINK,
             &ed2k_link(&b.name, b.size, &b.hash),
         ));
-        add(Tag::string(EC_TAG_KNOWNFILE_COMMENT, ""));
-        add(int(EC_TAG_KNOWNFILE_RATING, 0));
+        add(Tag::string(EC_TAG_KNOWNFILE_COMMENT, &b.comment));
+        add(int(EC_TAG_KNOWNFILE_RATING, b.rating.into()));
     }
     t
 }
@@ -168,6 +178,8 @@ pub fn shared_base(ecid: u32, f: &KnownFile, path: &Path) -> SharedBase {
                 f.verify_corrupt_aich.clone(),
             )
         }),
+        comment: String::new(),
+        rating: 0,
     }
 }
 
@@ -201,6 +213,23 @@ pub enum SharedRequest {
         name: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// `SetFileCommentRating`: the user's comment and rating of a shared
+    /// file, kept in `amule.conf`.
+    SetComment {
+        hash: Md4Hash,
+        comment: String,
+        rating: u8,
+        reply: oneshot::Sender<()>,
+    },
+    /// `RenameFile`: a complete shared file renamed on disk.
+    Rename {
+        hash: Md4Hash,
+        name: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// `VerifyLocalData`: a shared file read back and checked against its
+    /// hashes, off the client's loop; the outcome is logged.
+    Verify(Md4Hash),
 }
 
 /// Ask the client; `None` when it is gone.
@@ -282,6 +311,67 @@ pub async fn answer(req: &Packet, control: &mpsc::UnboundedSender<Control>) -> O
             Some(d) => shared_dirs_reply(&d),
             None => gone(),
         },
+        EC_OP_SHARED_FILE_SET_COMMENT => {
+            let hash = req
+                .tag(EC_TAG_KNOWNFILE)
+                .filter(|t| t.ty == EC_TAGTYPE_HASH16)
+                .and_then(Tag::as_hash);
+            // aMule reads both safely: missing, they are empty and 0.
+            let comment = req
+                .tag(EC_TAG_KNOWNFILE_COMMENT)
+                .map(Tag::as_str)
+                .unwrap_or_default();
+            let rating = req.tag(EC_TAG_KNOWNFILE_RATING).map_or(0, Tag::as_int) as u8;
+            if let Some(hash) = hash {
+                let r = ask(control, |reply| SharedRequest::SetComment {
+                    hash: Md4Hash(hash),
+                    comment,
+                    rating,
+                    reply,
+                })
+                .await;
+                if r.is_none() {
+                    return Some(gone());
+                }
+            }
+            Packet::new(EC_OP_NOOP)
+        }
+        EC_OP_RENAME_FILE => {
+            let failed = |m: &str| Packet::new(EC_OP_FAILED).with(Tag::string(EC_TAG_STRING, m));
+            let Some(hash) = req
+                .tag(EC_TAG_KNOWNFILE)
+                .filter(|t| t.ty == EC_TAGTYPE_HASH16)
+                .and_then(Tag::as_hash)
+            else {
+                return Some(failed("File not found."));
+            };
+            let name = req
+                .tag(EC_TAG_PARTFILE_NAME)
+                .map(Tag::as_str)
+                .unwrap_or_default();
+            let r = ask(control, |reply| SharedRequest::Rename {
+                hash: Md4Hash(hash),
+                name,
+                reply,
+            })
+            .await;
+            match r {
+                Some(Ok(())) => Packet::new(EC_OP_NOOP),
+                Some(Err(e)) => failed(&e),
+                None => gone(),
+            }
+        }
+        EC_OP_VERIFY_LOCAL_DATA => {
+            // Answered at once whatever it names, as aMule queues the task.
+            if let Some(hash) = req
+                .tag(EC_TAG_KNOWNFILE)
+                .filter(|t| t.ty == EC_TAGTYPE_HASH16)
+                .and_then(Tag::as_hash)
+            {
+                let _ = control.send(Control::Shared(SharedRequest::Verify(Md4Hash(hash))));
+            }
+            Packet::new(EC_OP_NOOP)
+        }
         EC_OP_KNOWNFILE_DELETE => {
             let failed = |m: &str| Packet::new(EC_OP_FAILED).with(Tag::string(EC_TAG_STRING, m));
             let hash = req
@@ -331,6 +421,9 @@ pub struct SharedState {
     reloading: Arc<AtomicBool>,
     /// A reload asked for while one runs: one more walk after it.
     again: Arc<AtomicBool>,
+    /// The user's comments and ratings, by file (`amule.conf`'s groups
+    /// named by hash).
+    comments: HashMap<Md4Hash, (String, u8)>,
 }
 
 /// Where a reload looks.
@@ -387,6 +480,34 @@ impl SharedState {
                 };
                 let _ = reply.send(r);
             }
+            SharedRequest::SetComment {
+                hash,
+                comment,
+                rating,
+                reply,
+            } => {
+                if shares.is_some_and(|s| {
+                    s.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&hash)
+                        .is_some()
+                }) {
+                    self.set_comment(config, hash, comment, rating);
+                }
+                let _ = reply.send(());
+            }
+            SharedRequest::Rename { hash, name, reply } => {
+                let r = match shares {
+                    Some(s) => rename(s, &hash, &name),
+                    None => Err("File not found.".into()),
+                };
+                let _ = reply.send(r);
+            }
+            SharedRequest::Verify(hash) => {
+                if let Some(s) = shares {
+                    verify_local_data(s.clone(), hash);
+                }
+            }
             SharedRequest::Dirs(reply) => {
                 let d = crate::config::shared_dir_intents(config);
                 let _ = reply.send(SharedDirs {
@@ -394,6 +515,63 @@ impl SharedState {
                     recursive: d.recursive,
                 });
             }
+        }
+    }
+
+    /// The comments and ratings `amule.conf` keeps (`CKnownFile::LoadComment`):
+    /// a group per file, named by its hash, with `Comment` and `Rate`.
+    pub fn load_comments(&mut self, config: &Path) {
+        let Ok(bytes) = std::fs::read(config.join("amule.conf")) else {
+            return;
+        };
+        let conf = ConfFile::from_bytes(&bytes);
+        for (path, _) in conf.entries() {
+            let Some(group) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+                continue;
+            };
+            let Ok(hash) = group.0.parse::<Md4Hash>() else {
+                continue;
+            };
+            if group.1 != "Comment" && group.1 != "Rate" {
+                continue;
+            }
+            let get = |k: &str| conf.get(&format!("/{}/{k}", group.0));
+            let comment = get("Comment").unwrap_or_default().to_owned();
+            let rating = get("Rate")
+                .and_then(ed2k_formats::amule_conf::parse_long)
+                .map_or(0, |r| r.clamp(0, 5) as u8);
+            self.comments.insert(hash, (comment, rating));
+        }
+    }
+
+    /// `SetFileCommentRating`: kept, and written to `amule.conf`; neither
+    /// a comment nor a rating removes the file's entries.
+    fn set_comment(&mut self, config: &Path, hash: Md4Hash, comment: String, rating: u8) {
+        if self
+            .comments
+            .get(&hash)
+            .map_or(("", 0), |(c, r)| (c.as_str(), *r))
+            == (comment.as_str(), rating)
+        {
+            return;
+        }
+        let group = format!("/{hash}/");
+        let r = crate::config::update_conf(config, |conf| {
+            if comment.is_empty() && rating == 0 {
+                conf.remove(&format!("{group}Comment"));
+                conf.remove(&format!("{group}Rate"));
+            } else {
+                conf.set(&format!("{group}Comment"), &comment);
+                conf.set(&format!("{group}Rate"), &rating.to_string());
+            }
+        });
+        if let Err(e) = r {
+            warn!("{e}");
+        }
+        if comment.is_empty() && rating == 0 {
+            self.comments.remove(&hash);
+        } else {
+            self.comments.insert(hash, (comment, rating));
         }
     }
 
@@ -447,7 +625,12 @@ impl SharedState {
                 let ecid = *ids
                     .entry(f.hash)
                     .or_insert_with(|| self.ids.get(&f.hash).copied().unwrap_or_else(next_ecid));
-                shared_base(ecid, f, path)
+                let mut b = shared_base(ecid, f, path);
+                if let Some((comment, rating)) = self.comments.get(&f.hash) {
+                    b.comment = comment.clone();
+                    b.rating = *rating;
+                }
+                b
             })
             .collect();
         self.ids = ids;
@@ -474,6 +657,72 @@ impl SharedState {
             reloading.store(false, Ordering::SeqCst);
         });
     }
+}
+
+/// `CSharedFileList::RenameFile` for a complete shared file: on disk,
+/// then in `known.met`.
+fn rename(shares: &Mutex<SharedFiles>, hash: &Md4Hash, name: &str) -> Result<(), String> {
+    use remule_core::shared::RenameError;
+    let mut s = shares.lock().unwrap_or_else(|e| e.into_inner());
+    let old = match s.get(hash) {
+        Some((f, _)) => f.name.clone(),
+        None => return Err("File not found.".into()),
+    };
+    if name.is_empty() {
+        return Err("Invalid file name.".into());
+    }
+    match s.rename(hash, name) {
+        Ok(path) => {
+            info!("Renamed '{old}' to '{}'.", path.display());
+            if let Err(e) = s.save() {
+                warn!("known.met: {e}");
+            }
+            Ok(())
+        }
+        Err(RenameError::NotBare) => {
+            warn!(
+                "Refused to rename '{old}' to '{name}': the new name must be a plain file name, \
+                 not a path."
+            );
+            Err("Unable to rename file.".into())
+        }
+        Err(RenameError::NotShared) => Err("File not found.".into()),
+        Err(RenameError::Io(e)) => {
+            warn!("Could not rename '{old}' to '{name}': {e}");
+            Err("Unable to rename file.".into())
+        }
+    }
+}
+
+/// `CKnownFile::VerifyLocalData` and `CVerifyLocalDataTask`: the check
+/// runs off the client's loop, its outcome is logged as aMule logs it and
+/// recorded in `known.met` if the file is still the one checked.
+pub fn verify_local_data(shares: Arc<Mutex<SharedFiles>>, hash: Md4Hash) {
+    let Some(target) = shares
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .verify_target(&hash)
+    else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        let outcome = remule_core::verify::verify(&target);
+        let (critical, line) = outcome.report(&target.path);
+        if critical {
+            warn!("{line}");
+        } else {
+            info!("{line}");
+        }
+        let Some(record) = outcome.record() else {
+            return;
+        };
+        let mut s = shares.lock().unwrap_or_else(|e| e.into_inner());
+        if s.record_verify(&hash, &target.path, target.size, unix_now(), record) {
+            if let Err(e) = s.save() {
+                warn!("known.met: {e}");
+            }
+        }
+    });
 }
 
 const CHANGED: &str = "The selected file has changed or is not a complete file.";

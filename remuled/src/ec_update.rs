@@ -244,6 +244,8 @@ pub struct EcPrefs {
     pub bind_interface: String,
     pub upnp_enabled: bool,
     pub upnp_tcp_port: u16,
+    /// `/eMule/NewVersionCheck`.
+    pub check_new_version: bool,
 }
 
 /// `CEC_Prefs_Packet(selection, EC_DETAIL_UPDATE, ...)`: the general and
@@ -261,9 +263,12 @@ pub fn prefs_reply(req: &Packet, p: &EcPrefs) -> Packet {
                 .with(Tag::string(EC_TAG_USER_NICK, &p.nick))
                 .with(Tag::hash(EC_TAG_USER_HASH, p.user_hash))
                 .with(Tag::string(EC_TAG_USER_HOST, ""))
-                .with(int(EC_TAG_GENERAL_CHECK_NEW_VERSION, 0))
-                // No version check, no UPnP in this build.
-                .with(int(EC_TAG_GENERAL_VERSION_CHECK_AVAILABLE, 0))
+                .with(int(
+                    EC_TAG_GENERAL_CHECK_NEW_VERSION,
+                    p.check_new_version.into(),
+                ))
+                // The version check is built in; UPnP is not.
+                .with(int(EC_TAG_GENERAL_VERSION_CHECK_AVAILABLE, 1))
                 .with(int(EC_TAG_GENERAL_UPNP_AVAILABLE, 0)),
         );
     }

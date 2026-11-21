@@ -21,6 +21,7 @@
 #   AMULEAPI=amuleapi                aMule's REST API daemon
 #   SUITE=.../curl-tests/amuleapi    aMule's curl suite (with lib/, run-all.sh)
 #   KEEP=1                           keep the work directory
+#   ONLY="30-shared-verify.sh ..."   run only these phases
 
 set -uo pipefail
 
@@ -110,6 +111,9 @@ for f in "$SUITE"/[0-9]*.sh; do
 	done
 	[ -z "$skip" ] && PHASES+=("$f")
 done
+if [ -n "${ONLY:-}" ]; then
+	read -r -a PHASES <<<"$ONLY"
+fi
 echo "running ${#PHASES[@]} phases against remuled"
 
 AMULEAPI_BIN="$AMULEAPI" AMULE_SHARED_DIR="$CONF/Incoming" \

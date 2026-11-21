@@ -84,6 +84,20 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Why a rename was refused.
+#[derive(Debug)]
+pub enum RenameError {
+    /// The new name has a folder in it, or is none (`IsBareFileName`).
+    NotBare,
+    NotShared,
+    Io(io::Error),
+}
+
+/// `CPath::IsBareFileName`: one path component, not `.` or `..`.
+pub fn is_bare_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
 /// Write `data` to `path` through a temporary file (`CFile::write_safe`).
 fn write_safe(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
@@ -273,6 +287,32 @@ impl SharedFiles {
         self.shared.remove(hash).is_some()
     }
 
+    /// `CSharedFileList::RenameFile` for a complete file: renamed on disk
+    /// in its own folder, then in `known.met`. `new_name` must be a plain
+    /// file name, and nothing may be there under it already.
+    pub fn rename(&mut self, hash: &Md4Hash, new_name: &str) -> Result<PathBuf, RenameError> {
+        if !is_bare_file_name(new_name) {
+            return Err(RenameError::NotBare);
+        }
+        let old = self.shared.get(hash).ok_or(RenameError::NotShared)?.clone();
+        let new = old.with_file_name(new_name);
+        if new == old {
+            return Ok(new);
+        }
+        if fs::symlink_metadata(&new).is_ok() {
+            return Err(RenameError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a file of that name is already there",
+            )));
+        }
+        fs::rename(&old, &new).map_err(RenameError::Io)?;
+        if let Some(f) = self.get_mut(hash) {
+            f.name = new_name.to_owned();
+        }
+        self.shared.insert(*hash, new.clone());
+        Ok(new)
+    }
+
     /// A shared file: what is known about it and where it is.
     pub fn get(&self, hash: &Md4Hash) -> Option<(&KnownFile, &Path)> {
         let path = self.shared.get(hash)?;
@@ -305,6 +345,43 @@ impl SharedFiles {
         let (f, _) = self.get(hash)?;
         let root = f.aich_hash.as_deref()?.parse().ok()?;
         self.known2.find(&root).filter(|s| s.fits_size(f.size))
+    }
+
+    /// What "Verify Local Data" checks a shared file against: where it is
+    /// and the hashes it was shared under.
+    pub fn verify_target(&self, hash: &Md4Hash) -> Option<crate::verify::VerifyTarget> {
+        let (f, path) = self.get(hash)?;
+        Some(crate::verify::VerifyTarget {
+            path: path.to_owned(),
+            size: f.size,
+            file_hash: f.hash,
+            part_hashes: f.part_hashes.clone(),
+            aich_blocks: self.aich_set(hash).map(|s| s.block_hashes.clone()),
+        })
+    }
+
+    /// Record a finished check (`CVerifyLocalDataEvent`): only on the file
+    /// it was made on, still shared from `path` at `size`. False when it
+    /// is no longer that file.
+    pub fn record_verify(
+        &mut self,
+        hash: &Md4Hash,
+        path: &Path,
+        size: u64,
+        date: u32,
+        (md4, aich): (String, String),
+    ) -> bool {
+        match self.get(hash) {
+            Some((f, p)) if p == path && f.size == size => {}
+            _ => return false,
+        }
+        let Some(f) = self.get_mut(hash) else {
+            return false;
+        };
+        f.verify_date = date;
+        f.verify_corrupt_md4 = md4;
+        f.verify_corrupt_aich = aich;
+        true
     }
 
     /// Whether `known.met` needs writing.

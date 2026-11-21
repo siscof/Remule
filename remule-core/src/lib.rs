@@ -10,6 +10,8 @@
 //!   connection (`CDownloadQueue`), without IO.
 //! * [`shared`]: the shared files, `known.met` and `known2_64.met`
 //!   (`CSharedFileList`, `CKnownFileList`).
+//! * [`verify`]: "Verify Local Data", a shared file checked against its
+//!   hashes (`CVerifyLocalDataTask`).
 //! * [`upload_queue`]: who gets an upload slot (`CUploadQueue`), without IO.
 //! * [`uploader`]: the upload side of a running client, without IO.
 //! * [`credits`]: upload and download credits, `clients.met`.
@@ -34,6 +36,7 @@ pub mod shared;
 pub mod statistics;
 pub mod upload_queue;
 pub mod uploader;
+pub mod verify;
 
 pub use gap_list::GapList;
 pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, SourceView, Status};
@@ -50,3 +53,5 @@ mod tests_queue;
 mod tests_shared;
 #[cfg(test)]
 mod tests_upload_queue;
+#[cfg(test)]
+mod tests_verify;

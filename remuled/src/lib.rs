@@ -19,6 +19,7 @@
 //! * [`ec_shared`]: shared files over external connections.
 //! * [`ec_stats`]: the statistics tree.
 //! * [`ec_update`]: `amulegui`'s incremental updates, and the preferences.
+//! * [`version_check`]: whether a newer release is out.
 
 pub mod applog;
 pub mod bootstrap;
@@ -36,6 +37,7 @@ pub mod http;
 pub mod kad;
 pub mod server_conn;
 pub mod stats;
+pub mod version_check;
 
 #[cfg(test)]
 mod tests;

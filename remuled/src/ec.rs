@@ -385,6 +385,15 @@ pub fn stats_reply(s: &Status, detail: u8) -> Packet {
             .with(int(EC_TAG_STATS_TOTAL_SENT_BYTES, s.total_sent))
             .with(int(EC_TAG_STATS_TOTAL_RECEIVED_BYTES, s.total_received))
             .with(int(EC_TAG_STATS_SHARED_FILE_COUNT, s.shared_files.into()));
+        // The version check's outcome, once one has finished.
+        if let Some(v) = crate::version_check::global().result() {
+            p = p
+                .with(Tag::string(EC_TAG_GENERAL_VERSION_CHECK_LATEST, &v.latest))
+                .with(int(EC_TAG_GENERAL_VERSION_CHECK_TIMESTAMP, v.at));
+            if v.outdated {
+                p = p.with(Tag::empty(EC_TAG_GENERAL_VERSION_CHECK_OUTDATED));
+            }
+        }
     }
     if detail != EC_DETAIL_UPDATE {
         let (ed2k_users, ed2k_files) = s.server.as_ref().map_or((0, 0), |sv| (sv.users, sv.files));
@@ -663,6 +672,15 @@ pub async fn answer(
             let h = conn.history.lock().unwrap_or_else(|e| e.into_inner());
             (crate::graphs::graphs_reply(req, &h), false)
         }
+        // amuleapi's `POST /version/check`: started, or throttled.
+        EC_OP_VERSION_CHECK => (
+            if crate::version_check::global().start() {
+                Packet::new(EC_OP_NOOP)
+            } else {
+                failed("Version check throttled; try again shortly.")
+            },
+            false,
+        ),
         EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),
         EC_OP_SHUTDOWN => {
             let _ = control.send(Control::Shutdown);
@@ -756,7 +774,10 @@ pub async fn answer(
         | EC_OP_SHAREDFILES_RELOAD
         | EC_OP_SHARED_SET_PRIO
         | EC_OP_GET_SHARED_DIRS
-        | EC_OP_KNOWNFILE_DELETE => match crate::ec_shared::answer(req, control).await {
+        | EC_OP_KNOWNFILE_DELETE
+        | EC_OP_VERIFY_LOCAL_DATA
+        | EC_OP_SHARED_FILE_SET_COMMENT
+        | EC_OP_RENAME_FILE => match crate::ec_shared::answer(req, control).await {
             Some(p) => (p, false),
             None => (failed("Invalid opcode (wrong protocol version?)"), false),
         },

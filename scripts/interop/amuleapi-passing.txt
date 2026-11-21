@@ -33,3 +33,5 @@
 30-shared-verify.sh
 05-read-servers-kad-categories-prefs.sh
 41-shared-content.sh
+15-preferences-patch.sh
+35-ipfilter-actions.sh

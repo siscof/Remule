@@ -19,6 +19,8 @@
 //! * [`ec_shared`]: shared files over external connections.
 //! * [`ec_stats`]: the statistics tree.
 //! * [`ec_update`]: `amulegui`'s incremental updates, and the preferences.
+//! * [`prefs`]: the preferences over external connections, kept in
+//!   `amule.conf`.
 //! * [`version_check`]: whether a newer release is out.
 
 pub mod applog;
@@ -35,6 +37,7 @@ pub mod firewall;
 pub mod graphs;
 pub mod http;
 pub mod kad;
+pub mod prefs;
 pub mod server_conn;
 pub mod stats;
 pub mod version_check;
@@ -61,5 +64,7 @@ mod tests_ec_update;
 mod tests_firewall;
 #[cfg(test)]
 mod tests_graphs;
+#[cfg(test)]
+mod tests_prefs;
 #[cfg(test)]
 mod tests_server_conn;

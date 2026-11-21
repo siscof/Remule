@@ -34,8 +34,8 @@ pub struct EcSettings {
     /// requests check.
     pub ed2k: bool,
     pub kad: bool,
-    /// What `EC_OP_GET_PREFERENCES` tells.
-    pub prefs: crate::ec_update::EcPrefs,
+    /// The preferences ([`crate::prefs`]).
+    pub prefs: crate::prefs::PrefStore,
 }
 
 /// The connected server, as the EC server tag tells it.
@@ -282,6 +282,11 @@ pub enum Control {
     Update(oneshot::Sender<crate::ec_update::UpdateData>),
     /// The statistics tree's data ([`crate::ec_stats`]).
     StatsTree(oneshot::Sender<crate::ec_stats::TreeData>),
+    /// `NotifyAlways_IPFilter_Reload`: the IP filter read again.
+    IpFilterReload,
+    /// `CIPFilter::Update`: `ipfilter.dat` fetched from this URL, then
+    /// the filter read again.
+    IpFilterUpdate(String),
 }
 
 fn detail(req: &Packet) -> u8 {
@@ -485,6 +490,10 @@ pub fn kad_buddy_tag() -> Tag {
     .map(|n| Tag::int(n, 0))
     .collect();
     t
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn failed(message: &str) -> Packet {
@@ -708,7 +717,8 @@ pub async fn answer(
             };
             (conn.update.reply(&s.downloads, &data, conn.partial), false)
         }
-        EC_OP_GET_PREFERENCES => (crate::ec_update::prefs_reply(req, conn.prefs), false),
+        EC_OP_GET_PREFERENCES => (lock(conn.prefs).reply(req), false),
+        EC_OP_SET_PREFERENCES => (lock(conn.prefs).apply(req), false),
         EC_OP_GET_STATSTREE => {
             let (reply, rx) = oneshot::channel();
             let data = match control.send(Control::StatsTree(reply)) {
@@ -716,7 +726,7 @@ pub async fn answer(
                 Err(_) => Default::default(),
             };
             (
-                crate::ec_stats::tree_reply(req, &data, conn.version, &conn.prefs.nick),
+                crate::ec_stats::tree_reply(req, &data, conn.version, &lock(conn.prefs).nick()),
                 false,
             )
         }
@@ -733,6 +743,27 @@ pub async fn answer(
             },
             false,
         ),
+        EC_OP_IPFILTER_RELOAD => {
+            let _ = control.send(Control::IpFilterReload);
+            (Packet::new(EC_OP_NOOP), false)
+        }
+        EC_OP_IPFILTER_UPDATE => {
+            // The URL given, remembered; none, the configured one.
+            let given = req.tags.first().map(Tag::as_str).unwrap_or_default();
+            let url = {
+                let mut p = lock(conn.prefs);
+                if given.is_empty() {
+                    p.ipfilter_url()
+                } else {
+                    p.set_ipfilter_url(&given);
+                    given
+                }
+            };
+            if !url.is_empty() {
+                let _ = control.send(Control::IpFilterUpdate(url));
+            }
+            (Packet::new(EC_OP_NOOP), false)
+        }
         EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),
         EC_OP_SHUTDOWN => {
             let _ = control.send(Control::Shutdown);
@@ -887,7 +918,7 @@ pub async fn serve(
 ) {
     let limiter = Arc::new(Mutex::new(AuthLimiter::new(settings.limits)));
     let creds = Arc::new(settings.credentials);
-    let prefs = Arc::new(settings.prefs);
+    let prefs = Arc::new(Mutex::new(settings.prefs));
     let identity = Arc::new(identity);
     // `IsOnShutDown`: one shutdown, whichever connection asks.
     let shutting_down = Arc::new(AtomicBool::new(false));
@@ -949,7 +980,7 @@ struct Shared<'a> {
     identity: &'a Identity,
     limiter: &'a Mutex<AuthLimiter>,
     shutting_down: &'a AtomicBool,
-    prefs: &'a crate::ec_update::EcPrefs,
+    prefs: &'a Mutex<crate::prefs::PrefStore>,
     history: &'a Mutex<crate::graphs::History>,
 }
 
@@ -964,7 +995,7 @@ pub struct ConnView<'a> {
     pub partial: bool,
     /// What it was sent of each object, for incremental updates.
     pub update: crate::ec_update::UpdateState,
-    pub prefs: &'a crate::ec_update::EcPrefs,
+    pub prefs: &'a Mutex<crate::prefs::PrefStore>,
     /// The statistics graphs' history.
     pub history: &'a Mutex<crate::graphs::History>,
     /// The daemon's version, as `EC_OP_AUTH_OK` gives it.

@@ -789,7 +789,7 @@ pub async fn run(
             ));
             ec_view = Some(tx);
             ec_control = Some(ctl_rx);
-            if e.prefs.check_new_version {
+            if e.prefs.check_new_version() {
                 tokio::spawn(crate::version_check::run_daily(
                     crate::version_check::global(),
                 ));
@@ -1118,6 +1118,17 @@ pub async fn run(
                         }
                         tick.reset_immediately();
                     }
+                    Some(Control::IpFilterReload) => {
+                        if let Some(f) = c.ip_filter.clone() {
+                            let dir = c.config.clone();
+                            tokio::task::spawn_blocking(move || crate::config::reload_ip_filter(&dir, &f));
+                        }
+                    }
+                    Some(Control::IpFilterUpdate(url)) => {
+                        if let Some(f) = c.ip_filter.clone() {
+                            tokio::spawn(update_ip_filter(c.config.clone(), url, f));
+                        }
+                    }
                     Some(Control::Shared(req)) => {
                         shared_state.handle(req, shares.as_ref(), &reload_dirs, &c.config);
                     }
@@ -1400,4 +1411,26 @@ pub async fn run(
     summary.totals = statistics.totals();
     info!("{}", crate::stats::summary(&statistics, now));
     Ok(summary)
+}
+
+/// `CIPFilter::Update` and `DownloadFinished`: `ipfilter.dat` fetched to
+/// `ipfilter.download`, put in place, and the filter read again.
+async fn update_ip_filter(dir: PathBuf, url: String, filter: Arc<AddressFilter>) {
+    let body = match crate::http::fetch(&url).await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!("ipfilter.dat from {url}: {e}");
+            warn!("Failed to download ipfilter.dat from {url}");
+            return;
+        }
+    };
+    let (download, dat) = (dir.join("ipfilter.download"), dir.join("ipfilter.dat"));
+    if let Err(e) = std::fs::write(&download, &body).and_then(|_| std::fs::rename(&download, &dat))
+    {
+        warn!("Failed to replace ipfilter.dat file, aborting update: {e}");
+        return;
+    }
+    info!("Successfully updated ipfilter.dat");
+    let _ =
+        tokio::task::spawn_blocking(move || crate::config::reload_ip_filter(&dir, &filter)).await;
 }

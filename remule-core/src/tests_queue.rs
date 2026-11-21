@@ -927,3 +927,26 @@ fn downloads_pause_stop_resume_and_go() {
     assert!(!w.q.resume(&other));
     assert!(w.q.remove(&other, w.now, &mut out).is_none());
 }
+
+#[test]
+fn a_reloaded_ip_filter_is_seen_by_everything_sharing_it() {
+    use crate::ip_filter::AddressFilter;
+    use ed2k_formats::ipfilter::{IpFilter, IpFilterFile};
+    let list = |text: &str| {
+        let f = IpFilterFile::parse(text.as_bytes());
+        IpFilter::build(&[&f])
+    };
+    let shared = Arc::new(AddressFilter::new(list(""), 127, true, true));
+    let other = shared.clone();
+    let ip = std::net::Ipv4Addr::new(10, 1, 2, 3);
+    assert!(!other.blocks_client(ip));
+    shared.replace(AddressFilter::new(
+        list("10.0.0.0 - 10.255.255.255 , 0 , test\n"),
+        127,
+        true,
+        false,
+    ));
+    assert!(other.blocks_client(ip), "the same filter, reloaded");
+    assert!(!other.blocks_server(ip), "servers not filtered now");
+    assert_eq!(other.ban_count(), 1);
+}

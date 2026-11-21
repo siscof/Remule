@@ -119,20 +119,6 @@ pub fn shared_dirs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `allowed-remote-dirs.dat` (`LoadAllowedRemoteDirRoots`): one folder a
-/// line, blank lines and `#` comments left out.
-pub fn allowed_remote_dirs(dir: &Path) -> Vec<String> {
-    let Some(b) = read_opt(&dir.join("allowed-remote-dirs.dat")) else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&b)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
-}
-
 /// The shared folders as configured (`LoadSharedFolderIntents`): the
 /// explicit ones and the recursive roots, unexpanded.
 pub fn shared_dir_intents(dir: &Path) -> shareddir_dat::SharedDirs {
@@ -250,6 +236,24 @@ pub fn ip_filter(
     ))
 }
 
+/// `CIPFilter::Reload`: the lists and `amule.conf`'s filter settings read
+/// again into `target`, which everything checking addresses shares.
+pub fn reload_ip_filter(dir: &Path, target: &AddressFilter) {
+    let conf = read_opt(&dir.join("amule.conf"))
+        .map(|b| ConfFile::from_bytes(&b))
+        .unwrap_or_default();
+    let (mut notes, mut info) = (Vec::new(), Vec::new());
+    let fresh = ip_filter(dir, &conf, &mut notes, &mut info);
+    for line in info {
+        tracing::info!("{line}");
+    }
+    for line in notes {
+        tracing::warn!("{line}");
+    }
+    target.replace((*fresh).clone());
+    tracing::info!("IP filter is ready");
+}
+
 /// Load `dir` as `amuled` would.
 pub fn load(dir: &Path) -> Result<Loaded, String> {
     if !dir.is_dir() {
@@ -338,15 +342,22 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         ec,
     };
     if let Some(e) = client.ec.as_mut() {
-        e.prefs.user_hash = client.user_hash.0;
-        e.prefs.max_connections = client.max_connections.min(usize::from(u16::MAX)) as u16;
-        e.prefs.dirs.incoming = client.incoming.display().to_string();
-        e.prefs.dirs.temp = client.temp.display().to_string();
-        e.prefs.dirs.shared = client
-            .share
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect();
+        e.prefs = crate::prefs::PrefStore::load(
+            dir,
+            &conf,
+            &crate::prefs::Runtime {
+                user_hash: client.user_hash.0,
+                incoming: client.incoming.display().to_string(),
+                temp: client.temp.display().to_string(),
+                shared: client
+                    .share
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect(),
+                max_connections: client.max_connections.min(usize::from(u16::MAX)) as u16,
+                listening: (client.tcp_port, client.udp_port),
+            },
+        );
     }
     Ok(Loaded {
         client,
@@ -516,7 +527,6 @@ fn ec_settings(
             .and_then(ed2k_formats::amule_conf::parse_long)
             .map_or(default, |v| u64::from(v as u32))
     };
-    let text = |key: &str, default: &str| conf.get(key).unwrap_or(default).to_owned();
     Some(EcSettings {
         addr: SocketAddrV4::new(ip, prefs.ec_port as u16),
         credentials: Credentials::new(Some(verifier)),
@@ -527,61 +537,7 @@ fn ec_settings(
         },
         ed2k: prefs.connect_to_ed2k,
         kad: prefs.connect_to_kad,
-        prefs: crate::ec_update::EcPrefs {
-            nick: prefs.nick.clone(),
-            // The user hash and connection limit are set with the client.
-            user_hash: [0; 16],
-            upload_capacity: limit("/eMule/UploadCapacity", 2500) as u32,
-            download_capacity: limit("/eMule/DownloadCapacity", 12500) as u32,
-            max_upload: prefs.max_upload,
-            max_download: prefs.max_download,
-            slot_allocation: prefs.slot_allocation,
-            tcp_port: prefs.tcp_port,
-            udp_port: prefs.udp_port,
-            udp_enabled: prefs.udp_enabled,
-            max_sources_per_file: prefs.max_sources_per_file,
-            max_connections: 0,
-            autoconnect: prefs.autoconnect,
-            reconnect: prefs.reconnect,
-            ed2k: prefs.connect_to_ed2k,
-            kad: prefs.connect_to_kad,
-            bind_address: conf.get("/eMule/Address").unwrap_or_default().to_owned(),
-            bind_interface: conf
-                .get("/eMule/NetworkInterface")
-                .unwrap_or_default()
-                .to_owned(),
-            upnp_enabled: limit("/eMule/UPnPEnabled", 0) != 0,
-            upnp_tcp_port: limit("/eMule/UPnPTCPPort", 50000) as u16,
-            check_new_version: limit("/eMule/NewVersionCheck", 1) != 0,
-            // The folders are set with the client.
-            dirs: crate::ec_update::DirPrefs {
-                allowed_roots: allowed_remote_dirs(dir),
-                ..Default::default()
-            },
-            remote: crate::ec_update::RemotePrefs {
-                web_enabled: limit("/WebServer/Enabled", 0) != 0,
-                web_port: limit("/WebServer/Port", 4711) as u16,
-                web_gzip: limit("/WebServer/UseGzip", 1) != 0,
-                web_refresh: limit("/WebServer/PageRefreshTime", 120) as u32,
-                web_template: text("/WebServer/Template", ""),
-                api_enabled: limit("/AmuleApi/Enabled", 0) != 0,
-                api_port: limit("/AmuleApi/HttpPort", 4713) as u16,
-                api_bind: text("/AmuleApi/BindAddress", "127.0.0.1"),
-                ec_address: prefs.ec_address.clone(),
-                ec_interface: text("/ExternalConnect/ECNetworkInterface", ""),
-                ec_port: prefs.ec_port as u16,
-                ec_upnp: limit("/ExternalConnect/UPnPECEnabled", 0) != 0,
-            },
-            geoip: crate::ec_update::GeoipPrefs {
-                enabled: limit("/eMule/GeoIPEnabled", 1) != 0,
-                source: crate::ec_update::GeoipPrefs::source_of(&text(
-                    "/eMule/GeoIPSource",
-                    "dbip",
-                )),
-                custom_url: text("/eMule/GeoIPCustomUrl", ""),
-                license: text("/eMule/GeoIPMaxMindLicense", ""),
-                auto_update: limit("/eMule/GeoIPAutoUpdate", 1) != 0,
-            },
-        },
+        // Read with the client, which supplies what amule.conf does not.
+        prefs: Default::default(),
     })
 }

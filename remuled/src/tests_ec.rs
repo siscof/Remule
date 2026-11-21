@@ -339,11 +339,13 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     let _ = reply.send(Default::default());
                     seen.push("stats tree".to_string());
                 }
+                Control::IpFilterReload => seen.push("ipfilter reload".to_string()),
+                Control::IpFilterUpdate(url) => seen.push(format!("ipfilter update {url}")),
             }
         }
         seen
     });
-    let prefs = crate::ec_update::EcPrefs::default();
+    let prefs = std::sync::Mutex::new(crate::prefs::PrefStore::default());
     let history = std::sync::Mutex::new(crate::graphs::History::new());
     let mut cv = ec::ConnView {
         log: crate::applog::global().cursor(),
@@ -379,6 +381,39 @@ async fn requests_are_answered_as_process_request2_does() {
     .await;
     assert_eq!(r.opcode, EC_OP_MISC_DATA);
     assert_eq!(r.tags[0].name, EC_TAG_CONNSTATE);
+    // The Kad buddy counters, only when asked for.
+    let (r, ..) = ask(Packet::new(EC_OP_STAT_REQ), &s, false).await;
+    assert!(r.tag(EC_TAG_KAD_BUDDY).is_none());
+    let (r, ..) = ask(
+        Packet::new(EC_OP_STAT_REQ).with(Tag::empty(EC_TAG_KAD_BUDDY)),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(r.tag(EC_TAG_KAD_BUDDY).unwrap().children.len(), 41);
+    // The IP filter: reloaded; updated from the URL given, or from the
+    // configured one (none here: nothing to fetch).
+    let (r, _, seen) = ask(Packet::new(EC_OP_IPFILTER_RELOAD), &s, false).await;
+    assert_eq!(
+        (r.opcode, seen),
+        (EC_OP_NOOP, vec!["ipfilter reload".to_string()])
+    );
+    let (r, _, seen) = ask(
+        Packet::new(EC_OP_IPFILTER_UPDATE)
+            .with(Tag::string(EC_TAG_STRING, "http://x/ipfilter.dat")),
+        &s,
+        false,
+    )
+    .await;
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(seen, ["ipfilter update http://x/ipfilter.dat"]);
+    let (_, _, seen) = ask(
+        Packet::new(EC_OP_IPFILTER_UPDATE).with(Tag::string(EC_TAG_STRING, "")),
+        &s,
+        false,
+    )
+    .await;
+    assert!(seen.is_empty());
     let (r, ..) = ask(Packet::new(EC_OP_GET_CHAT_SESSIONS), &s, false).await;
     assert_eq!(r.opcode, EC_OP_FAILED);
     assert_eq!(
@@ -893,7 +928,7 @@ async fn the_log_is_read_as_amules_is() {
     let s = busy();
     log.push(tracing::Level::INFO, "an EC log test line");
     // One connection's view: what is new, once.
-    let prefs = crate::ec_update::EcPrefs::default();
+    let prefs = std::sync::Mutex::new(crate::prefs::PrefStore::default());
     let history = std::sync::Mutex::new(crate::graphs::History::new());
     let mut cv = ec::ConnView {
         log: log.cursor(),

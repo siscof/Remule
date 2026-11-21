@@ -3565,6 +3565,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "remulecmd"
+version = "0.1.0"
+dependencies = [
+ "ed2k-formats",
+ "remule-ec",
+]
+
+[[package]]
 name = "remuled"
 version = "0.1.0"
 dependencies = [

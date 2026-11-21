@@ -113,7 +113,17 @@ pub struct Status {
     pub banned: u32,
     /// The download queue, in the client's order.
     pub downloads: Vec<Download>,
+    /// How many changes to the downloads the client had applied when it
+    /// took this view ([`DownloadChanges`]).
+    pub applied: u64,
 }
+
+/// Changes to the downloads the client has applied, counted as it applies
+/// them; each view carries the count it was taken at. A connection that
+/// made a change answers once a view at least that recent is out, so what
+/// its client asks next sees the change (a view published between its
+/// request and the change does not count).
+pub type DownloadChanges = std::sync::atomic::AtomicU64;
 
 /// `PS_*`, as EC reports a download's state.
 pub mod ps {
@@ -292,8 +302,8 @@ pub enum Control {
     },
     /// The credit history (`EC_OP_GET_CLIENT_HISTORY`).
     ClientHistory(oneshot::Sender<Vec<remule_core::credits::HistoryEntry>>),
-    /// `ResetCatParts`: a category was deleted.
-    CategoryRemoved(u32),
+    /// `ResetCatParts`: a category was deleted; answered once applied.
+    CategoryRemoved(u32, oneshot::Sender<()>),
     /// `NotifyAlways_IPFilter_Reload`: the IP filter read again.
     IpFilterReload,
     /// `CIPFilter::Update`: `ipfilter.dat` fetched from this URL, then
@@ -1024,7 +1034,13 @@ pub async fn answer(
             let index = req.tags[0].as_int();
             let r = lock(conn.prefs).delete_category(index);
             if r == crate::prefs::CategoryResult::Done {
-                let _ = control.send(Control::CategoryRemoved(index as u32));
+                let (done, applied) = oneshot::channel();
+                if control
+                    .send(Control::CategoryRemoved(index as u32, done))
+                    .is_ok()
+                {
+                    let _ = applied.await;
+                }
             }
             (category_reply(r), false)
         }
@@ -1088,6 +1104,7 @@ pub async fn serve(
     status: watch::Receiver<Status>,
     control: mpsc::UnboundedSender<Control>,
     history: Arc<Mutex<crate::graphs::History>>,
+    applied: Arc<DownloadChanges>,
 ) {
     let limiter = Arc::new(Mutex::new(AuthLimiter::new(settings.limits)));
     let creds = Arc::new(settings.credentials);
@@ -1115,6 +1132,7 @@ pub async fn serve(
         info!("New external connection accepted");
         let prefs = prefs.clone();
         let history = history.clone();
+        let applied = applied.clone();
         let (limiter, creds, identity, status, control, down) = (
             limiter.clone(),
             creds.clone(),
@@ -1131,6 +1149,7 @@ pub async fn serve(
                 shutting_down: &down,
                 prefs: &prefs,
                 history: &history,
+                applied: &applied,
             };
             let why = connection(stream, peer.ip(), shared, status, control).await;
             debug!("EC {peer}: {why}");
@@ -1164,6 +1183,7 @@ struct Shared<'a> {
     shutting_down: &'a AtomicBool,
     prefs: &'a Mutex<crate::prefs::PrefStore>,
     history: &'a Mutex<crate::graphs::History>,
+    applied: &'a DownloadChanges,
 }
 
 /// `EC_LOG_LINES_PER_MESSAGE`: a big backlog goes over a few polls.
@@ -1237,9 +1257,15 @@ async fn connection(
                 // A change to the downloads is answered once the view shows
                 // it, as aMule's are: what the client asks next sees it.
                 if changes_downloads(req.opcode) && reply.opcode != EC_OP_FAILED {
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(3), status.changed())
-                            .await;
+                    let target = sh.applied.load(Ordering::SeqCst);
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                        while status.borrow_and_update().applied < target {
+                            if status.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
                 }
                 if stops {
                     info!("External Connection: shutdown requested");

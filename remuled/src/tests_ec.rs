@@ -199,6 +199,7 @@ fn busy() -> Status {
         upload_queue: 0,
         banned: 0,
         downloads: Vec::new(),
+        applied: 0,
     }
 }
 
@@ -348,7 +349,10 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     let _ = reply.send(Packet::new(EC_OP_NOOP));
                     seen.push(format!("friend {:#x}", req.opcode));
                 }
-                Control::CategoryRemoved(c) => seen.push(format!("category removed {c}")),
+                Control::CategoryRemoved(c, done) => {
+                    let _ = done.send(());
+                    seen.push(format!("category removed {c}"));
+                }
                 Control::IpFilterUpdate(url) => seen.push(format!("ipfilter update {url}")),
             }
         }

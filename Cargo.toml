@@ -15,6 +15,7 @@ members = [
 	'remule-gui',
 	'remule-net',
 	'remuled',
+	'remulecmd',
 ]
 resolver = "2"
 

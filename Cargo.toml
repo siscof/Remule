@@ -8,6 +8,7 @@ members = [
 	'ed2k-peer',
 	'ed2k-server',
 	'ed2k-types',
+	'remule-app',
 	'remule-cli',
 	'remule-core',
 	'remule-ec',

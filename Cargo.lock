@@ -3473,6 +3473,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "remule-app"
+version = "0.1.0"
+dependencies = [
+ "ed2k-formats",
+ "rand 0.8.5",
+ "remule-ec",
+]
+
+[[package]]
 name = "remule-cli"
 version = "0.1.0"
 dependencies = [

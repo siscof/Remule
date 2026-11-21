@@ -1,0 +1,15 @@
+[package]
+name = "remule-app"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Remule for Windows: starts remuled on its own config folder and opens remule-gui connected to it"
+
+[[bin]]
+name = "remule-app"
+path = "src/main.rs"
+
+[dependencies]
+ed2k-formats = { path = "../ed2k-formats" }
+remule-ec = { path = "../remule-ec" }
+rand = "0.8"

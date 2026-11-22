@@ -1,40 +1,52 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# MIGRATION_PLAN.md 13.M: remule-gui against a running remuled.
+# MIGRATION_PLAN.md 13.M: remule-gui against a running daemon, remuled or
+# the C++ amuled.
 #
-# remuled runs from an aMule config directory logged into a scripted ed2k
+# The daemon runs from an aMule config directory logged into a scripted ed2k
 # server (fake_ed2k_server.py, which also answers searches), sharing one
-# file, with one download added and one search run by remulecmd. remule-gui
-# then opens on each of its pages in turn, under the X display it is given
-# (Xvfb in CI), logs in with the password on its command line, and is left
-# to poll for a few seconds. It must log in (remuled says so), stay up, and
-# not lose the connection; each page is captured as a PNG (ImageMagick's
-# `import`) into SHOTS when that is set.
+# file. First, what remule-gui's EC worker asks of it, through the same
+# remule_ec::model calls (remule-ec's `gui_check` example): the connection
+# and HighID, the server list, a search and its result downloaded, a link
+# added, paused, resumed, set to high and cancelled, a new shared file and
+# its priority, the disk space and the log. Then, with a download added and
+# a search run by remulecmd, remule-gui opens on each of its pages in turn,
+# under the X display it is given (Xvfb in CI), logs in with the password on
+# its command line, and is left to poll for a few seconds. It must log in
+# (the daemon says so), stay up, and not lose the connection; each page is
+# captured as a PNG (ImageMagick's `import`) into SHOTS when that is set.
+# Last, remulecmd shuts the daemon down.
 #
-# Usage: xvfb-run -a -s '-screen 0 1400x900x24' scripts/interop/remule-gui-on-remuled.sh
+# Usage: xvfb-run -a -s '-screen 0 1400x900x24' scripts/interop/remule-gui-on-daemon.sh
 # Environment:
-#   REMULED=target/release/remuled       the daemon
+#   DAEMON=target/release/remuled        the daemon: remuled, or amuled
 #   REMULECMD=target/release/remulecmd   the command-line client
 #   REMULE_GUI=target/release/remule-gui the GUI
+#   GUI_CHECK=target/release/examples/gui_check  remule-ec's gui_check
 #   SHOTS=dir                            where to keep a screenshot per page
 #   KEEP=1                               keep the work directory
 
 set -uo pipefail
 
-REMULED=$(realpath "${REMULED:-target/release/remuled}")
+DAEMON=$(realpath "${DAEMON:-${REMULED:-target/release/remuled}}")
 REMULECMD=$(realpath "${REMULECMD:-target/release/remulecmd}")
 REMULE_GUI=$(realpath "${REMULE_GUI:-target/release/remule-gui}")
+GUI_CHECK=$(realpath "${GUI_CHECK:-target/release/examples/gui_check}")
 HERE=$(dirname "$(realpath "$0")")
 TCP_PORT=4662
 SERVER_PORT=4242
 EC_PORT=4712
 EC_PASS=gui
 
-for b in "$REMULED" "$REMULECMD" "$REMULE_GUI"; do
+for b in "$DAEMON" "$REMULECMD" "$REMULE_GUI" "$GUI_CHECK"; do
 	[ -x "$b" ] || { echo "missing $b (cargo build --release)"; exit 2; }
 done
 [ -n "${DISPLAY:-}" ] || { echo "no DISPLAY: run it under xvfb-run"; exit 2; }
+case "$(basename "$DAEMON")" in
+amuled*) KIND=amuled ;;
+*) KIND=remuled ;;
+esac
 
 WORK=$(mktemp -d)
 CFG="$WORK/amule"
@@ -50,12 +62,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# What the daemon logged: its output, and aMule's logfile.
+daemon_log() {
+	cat "$WORK/daemon.log" "$CFG/logfile" 2>/dev/null
+}
+
 fail() {
 	echo "FAIL: $*"
-	for f in remuled server; do
-		echo "----- $f log (tail) -----"
-		tail -30 "$WORK/$f.log" 2>/dev/null || true
-	done
+	echo "----- $KIND log (tail) -----"
+	daemon_log | tail -40
+	echo "----- server log (tail) -----"
+	tail -30 "$WORK/server.log" 2>/dev/null || true
 	for f in "$WORK"/gui-*.log; do
 		[ -f "$f" ] && { echo "----- $(basename "$f") -----"; tail -20 "$f"; }
 	done
@@ -66,7 +83,7 @@ cmd() {
 	"$REMULECMD" -h 127.0.0.1 -p "$EC_PORT" -P "$EC_PASS" -c "$*"
 }
 
-# --- remuled, as in amulecmd-drives-remuled.sh -------------------------------
+# --- the daemon, as in amulecmd-drives-remuled.sh ----------------------------
 
 EC_DIGEST=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
 cat >"$CFG/amule.conf" <<EOF
@@ -99,18 +116,24 @@ printf '%s\n' "$WORK/share" >"$CFG/shareddir.dat"
 
 python3 "$HERE/fake_ed2k_server.py" 127.0.0.1 "$SERVER_PORT" >"$WORK/server.log" 2>&1 &
 PIDS+=($!)
-"$REMULED" --config-dir "$CFG" >"$WORK/remuled.log" 2>&1 &
-PIDS+=($!)
+if [ "$KIND" = amuled ]; then
+	"$DAEMON" --config-dir "$CFG" --log-stdout >"$WORK/daemon.log" 2>&1 &
+else
+	"$DAEMON" --config-dir "$CFG" >"$WORK/daemon.log" 2>&1 &
+fi
+DAEMON_PID=$!
+PIDS+=($DAEMON_PID)
 for _ in $(seq 60); do
-	grep -q "TCP socket (ECServer) listening" "$WORK/remuled.log" && break
-	sleep 1
-done
-grep -q "TCP socket (ECServer) listening" "$WORK/remuled.log" || fail "remuled never listened for EC"
-for _ in $(seq 30); do
 	cmd status 2>/dev/null | grep -q "Connected to" && break
+	kill -0 "$DAEMON_PID" 2>/dev/null || fail "$KIND exited"
 	sleep 1
 done
-cmd status | grep -q "Connected to" || fail "remuled never logged into the server"
+cmd status | grep -q "Connected to" || fail "$KIND never logged into the server"
+echo "$KIND is up: $(cmd status | grep -m1 "Succeeded")"
+
+# --- what remule-gui asks, at the model level --------------------------------------
+
+"$GUI_CHECK" 127.0.0.1 "$EC_PORT" "$EC_PASS" "$CFG/Incoming" || fail "remule-gui's requests"
 
 # Something on each page: a download and a search's results.
 cmd "add ed2k://|file|remule%20gui%20check.iso|123456789|0123456789ABCDEF0123456789ABCDEF|/" >/dev/null
@@ -120,14 +143,14 @@ sleep 2
 # --- the GUI, page by page -----------------------------------------------------
 
 for page in networks searches transfers shared statistics; do
-	before=$(grep -c "Access granted" "$WORK/remuled.log")
+	before=$(daemon_log | grep -c "Access granted")
 	"$REMULE_GUI" -h 127.0.0.1 -p "$EC_PORT" -P "$EC_PASS" --page "$page" \
 		>"$WORK/gui-$page.log" 2>&1 &
 	gui=$!
 	PIDS+=($gui)
 	sleep 6
 	kill -0 "$gui" 2>/dev/null || fail "remule-gui exited on the $page page"
-	after=$(grep -c "Access granted" "$WORK/remuled.log")
+	after=$(daemon_log | grep -c "Access granted")
 	[ "$after" -gt "$before" ] || fail "remule-gui did not log in ($page)"
 	if [ -n "${SHOTS:-}" ]; then
 		import -window root "$SHOTS/$page.png" 2>/dev/null || echo "no screenshot of $page"
@@ -136,5 +159,14 @@ for page in networks searches transfers shared statistics; do
 	wait "$gui" 2>/dev/null
 	echo "ok: remule-gui logged in and stayed up on the $page page"
 done
-grep -q "Connecting client: remule-gui" "$WORK/remuled.log" || fail "remuled never saw remule-gui by name"
-echo "PASS: remule-gui drove remuled"
+daemon_log | grep -q "Connecting client: remule-gui" || fail "$KIND never saw remule-gui by name"
+
+# --- shutdown ----------------------------------------------------------------------
+
+cmd shutdown >/dev/null
+for _ in $(seq 30); do
+	kill -0 "$DAEMON_PID" 2>/dev/null || break
+	sleep 1
+done
+kill -0 "$DAEMON_PID" 2>/dev/null && fail "$KIND did not stop on shutdown"
+echo "PASS: remule-gui drove $KIND"

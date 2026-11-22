@@ -49,18 +49,21 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      # MIGRATION_PLAN.md 13.M: remule-gui logs into a running remuled and
-      # stays up on each page, under Xvfb.
+      # MIGRATION_PLAN.md 13.M: what remule-gui asks of a running remuled,
+      # then the GUI logged in and up on each page, under Xvfb. The same
+      # script runs against the C++ amuled in amulecmd-interop.
       - name: remule-gui against remuled
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y xvfb libxkbcommon-x11-0 libgl1-mesa-dri
           cargo build -p remuled -p remulecmd -p remule-gui
-          xvfb-run -a -s '-screen 0 1400x900x24' bash scripts/interop/remule-gui-on-remuled.sh
+          cargo build -p remule-ec --example gui_check
+          xvfb-run -a -s '-screen 0 1400x900x24' bash scripts/interop/remule-gui-on-daemon.sh
         env:
-          REMULED: target/debug/remuled
+          DAEMON: target/debug/remuled
           REMULECMD: target/debug/remulecmd
           REMULE_GUI: target/debug/remule-gui
+          GUI_CHECK: target/debug/examples/gui_check
 
   # MIGRATION_PLAN.md 9.M: a released aMule downloads a file that remule
   # shares, on Fedora.
@@ -119,17 +122,17 @@ jobs:
         run: |
           dnf install -y --setopt=install_weak_deps=False \
             gcc gcc-c++ make cmake git curl tar gzip python3 procps-ng \
-            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth             jq iproute diffutils
+            wxGTK-devel cryptopp-devel boost-devel zlib-devel readline-devel             glib2-devel libpng-devel xorg-x11-server-Xvfb xorg-x11-xauth             jq iproute diffutils             libxkbcommon-devel wayland-devel libxcb-devel libxkbcommon-x11 mesa-dri-drivers
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Cache amulecmd, amulegui and amuleapi
+      - name: Cache amulecmd, amulegui, amuleapi and amuled
         id: amulecmd-cache
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-amulegui-amuleapi-fedora-${{ env.AMULE_REF }}
-      - name: Build amulecmd, amulegui and amuleapi
+          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}
+      - name: Build amulecmd, amulegui, amuleapi and amuled
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
           git init -q /tmp/amule-src
@@ -137,22 +140,25 @@ jobs:
           git fetch -q --depth 1 https://github.com/amule-org/amule.git "$AMULE_REF"
           git checkout -q FETCH_HEAD
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_MONOLITHIC=NO -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES -DBUILD_AMULEAPI=YES \
+            -DBUILD_MONOLITHIC=NO -DBUILD_DAEMON=YES -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES -DBUILD_AMULEAPI=YES \
             -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
             -DENABLE_MEDIA_PROBE=OFF -DENABLE_VERSION_CHECK=OFF -DENABLE_BFD=NO \
             -DTRANSLATED_MANPAGES=NO
-          cmake --build build --target amulecmd amulegui amuleapi -j "$(nproc)"
+          cmake --build build --target amulecmd amulegui amuleapi amuled -j "$(nproc)"
           mkdir -p /opt/amulecmd
           cp "$(find build -type f -name amulecmd -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amulegui -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amuleapi -perm -u+x | head -1)" /opt/amulecmd/
+          cp "$(find build -type f -name amuled -perm -u+x | head -1)" /opt/amulecmd/
           # amuleapi's curl suite and static frontend, where run-all.sh
           # looks for them (it climbs three levels from its own folder).
           mkdir -p /opt/amulecmd/tree/unittests /opt/amulecmd/tree/src/webapi
           cp -R unittests/curl-tests /opt/amulecmd/tree/unittests/
           cp -R src/webapi/static /opt/amulecmd/tree/src/webapi/
-      - name: Build remuled and remulecmd
-        run: cargo build --release -p remuled -p remulecmd
+      - name: Build remuled, remulecmd, remule-gui and gui_check
+        run: |
+          cargo build --release -p remuled -p remulecmd -p remule-gui
+          cargo build --release -p remule-ec --example gui_check
       - name: amulecmd drives remuled
         run: bash scripts/interop/amulecmd-drives-remuled.sh
         env:
@@ -167,6 +173,12 @@ jobs:
         env:
           AMULECMD: /opt/amulecmd/amulecmd
           AMULEGUI: /opt/amulecmd/amulegui
+      # MIGRATION_PLAN.md 13.M: remule-gui against the C++ amuled it was
+      # written for: what it asks, then the GUI on each page, under Xvfb.
+      - name: remule-gui against amuled
+        run: xvfb-run -a -s '-screen 0 1400x900x24' bash scripts/interop/remule-gui-on-daemon.sh
+        env:
+          DAEMON: /opt/amulecmd/amuled
       # MIGRATION_PLAN.md 12.1: the unmodified amuleapi in front of remuled,
       # tested with aMule's own curl suite.
       - name: amuleapi's curl suite against remuled

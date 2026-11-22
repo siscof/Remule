@@ -149,8 +149,10 @@ done
 cmd "show shared" | grep "$NAME" >/dev/null || fail "aMule did not share the file"
 
 cmd "connect $IP:$SERVER_PORT" >/dev/null
+# aMule offers its files on its once-a-minute republish tick
+# (CSharedFileList::Process, ED2KREPUBLISHTIME), not on connecting.
 offered=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 150); do
 	grep -qs "offered .*$HASH" "$WORK/server.log" && { offered=1; break; }
 	sleep 1
 done

@@ -88,8 +88,13 @@ cmd() {
 # The fake server on this machine's own address: aMule drops a loopback
 # server from server.met (CServerList::AddServer checks IsGoodIP, which
 # refuses 127.0.0.0/8 whatever FilterLanIPs says).
-SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# The address of the default route (a UDP connect sends nothing).
+SERVER_IP=$(python3 -c 'import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("10.255.255.255", 1))
+print(s.getsockname()[0])' 2>/dev/null)
 SERVER_IP=${SERVER_IP:-127.0.0.1}
+echo "the fake server on $SERVER_IP:$SERVER_PORT"
 
 EC_DIGEST=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
 cat >"$CFG/amule.conf" <<EOF

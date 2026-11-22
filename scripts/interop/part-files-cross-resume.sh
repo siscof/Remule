@@ -239,7 +239,7 @@ echo "ok: aMule stopped at $p% or more; its Temp: $(cd "$DL2/Temp" && ls | tr '\
 start=$(date +%s)
 REMULE_TRACE=1 "$REMULE" download --server "$IP:$SERVER_PORT" \
 	--temp "$DL2/Temp" --incoming "$WORK/remule-incoming2" --config "$WORK/remule-config2" \
-	--port "$REMULE_PORT2"--allow-lan --duration "$TIMEOUT" --status-every 5 \
+	--port "$REMULE_PORT2" --allow-lan --duration "$TIMEOUT" --status-every 5 \
 	>"$WORK/remule-resume.log" 2>&1
 echo "remule exited with $? after $(($(date +%s) - start))s"
 first=$(grep -m1 "% .*$NAME" "$WORK/remule-resume.log")

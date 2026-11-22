@@ -34,6 +34,9 @@ TIMEOUT=${TIMEOUT:-180}
 SLOW=1024
 SERVER_PORT=4242
 REMULE_PORT=4663
+# The second remule, a new user hash, on another port: the source aMule
+# knows the first one's address with the first one's hash.
+REMULE_PORT2=4664
 HERE=$(dirname "$(realpath "$0")")
 EC_PASS=interop
 
@@ -77,6 +80,8 @@ s.connect(("10.255.255.255", 1))
 print(s.getsockname()[0])' 2>/dev/null)
 case "$IP" in
 "" | 127.*) echo "no address but loopback"; exit 2 ;;
+# The ID is the address with its first octet in the low byte: x.y.z.0 is a LowID.
+*.0) echo "$IP would give a LowID"; exit 2 ;;
 esac
 echo "this machine: $IP"
 
@@ -232,9 +237,9 @@ stop_amule 4714
 echo "ok: aMule stopped at $p% or more; its Temp: $(cd "$DL2/Temp" && ls | tr '\n' ' ')"
 
 start=$(date +%s)
-"$REMULE" download --server "$IP:$SERVER_PORT" \
+REMULE_TRACE=1 "$REMULE" download --server "$IP:$SERVER_PORT" \
 	--temp "$DL2/Temp" --incoming "$WORK/remule-incoming2" --config "$WORK/remule-config2" \
-	--port "$REMULE_PORT" --allow-lan --duration "$TIMEOUT" --status-every 5 \
+	--port "$REMULE_PORT2"--allow-lan --duration "$TIMEOUT" --status-every 5 \
 	>"$WORK/remule-resume.log" 2>&1
 echo "remule exited with $? after $(($(date +%s) - start))s"
 first=$(grep -m1 "% .*$NAME" "$WORK/remule-resume.log")

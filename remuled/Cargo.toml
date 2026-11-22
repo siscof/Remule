@@ -13,6 +13,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 ed2k-codec = { path = "../ed2k-codec" }
 ed2k-formats = { path = "../ed2k-formats" }
+ed2k-hash = { path = "../ed2k-hash" }
 ed2k-kad = { path = "../ed2k-kad" }
 ed2k-peer = { path = "../ed2k-peer" }
 ed2k-server = { path = "../ed2k-server" }
@@ -30,4 +31,10 @@ tracing-subscriber = "0.3"
 [dev-dependencies]
 flate2 = "1"
 ed2k-crypto = { path = "../ed2k-crypto" }
-ed2k-hash = { path = "../ed2k-hash" }
+
+# The free space of the temp and incoming folders, for the statistics.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

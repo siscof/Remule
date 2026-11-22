@@ -200,6 +200,8 @@ fn busy() -> Status {
         banned: 0,
         downloads: Vec::new(),
         applied: 0,
+        temp_free: Some(5_000_000_000),
+        incoming_free: None,
     }
 }
 
@@ -291,6 +293,13 @@ fn statistics_follow_the_detail_level() {
     assert_eq!(get(&full, EC_TAG_STATS_UPTIME_SECONDS), Some(3600));
     assert_eq!(get(&full, EC_TAG_STATS_TOTAL_SENT_BYTES), Some(2900));
     assert_eq!(get(&full, EC_TAG_STATS_SHARED_FILE_COUNT), Some(7));
+    // The free space told when known, left out when not.
+    assert_eq!(
+        get(&full, EC_TAG_STATS_TEMP_FREE_SPACE),
+        Some(5_000_000_000)
+    );
+    assert_eq!(get(&full, EC_TAG_STATS_INCOMING_FREE_SPACE), None);
+    assert_eq!(get(&cmd, EC_TAG_STATS_TEMP_FREE_SPACE), None);
     assert_eq!(get(&full, EC_TAG_STATS_UL_SPEED), Some(2048));
     // UPDATE: nothing but the connection state; it always comes last.
     let upd = ec::stats_reply(&s, EC_DETAIL_UPDATE);
@@ -483,9 +492,10 @@ fn downloads_are_told_as_cec_partfile_tag_tells_them() {
     assert_eq!(cmd.child_int(EC_TAG_PARTFILE_PARTMETID), 7);
     assert_eq!(cmd.child_str(EC_TAG_KNOWNFILE_FILENAME), "007.part");
     assert_eq!(cmd.child_str(EC_TAG_KNOWNFILE_PATH), "/tmp/Temp");
+    // The name as `CPath::Cleanup(false)` writes it: spaces as %20.
     assert_eq!(
         cmd.child_str(EC_TAG_PARTFILE_ED2K_LINK),
-        format!("ed2k://|file|file 171.iso|10000000|{}|/", "AB".repeat(16))
+        format!("ed2k://|file|file%20171.iso|10000000|{}|/", "AB".repeat(16))
     );
     // UPDATE: no names, no sizes unless it is transferring, no met ID.
     let upd = ec::partfile_tag(&d, EC_DETAIL_UPDATE);

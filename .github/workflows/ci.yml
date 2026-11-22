@@ -49,6 +49,18 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # MIGRATION_PLAN.md 13.M: remule-gui logs into a running remuled and
+      # stays up on each page, under Xvfb.
+      - name: remule-gui against remuled
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb libxkbcommon-x11-0 libgl1-mesa-dri
+          cargo build -p remuled -p remulecmd -p remule-gui
+          xvfb-run -a -s '-screen 0 1400x900x24' bash scripts/interop/remule-gui-on-remuled.sh
+        env:
+          REMULED: target/debug/remuled
+          REMULECMD: target/debug/remulecmd
+          REMULE_GUI: target/debug/remule-gui
 
   # MIGRATION_PLAN.md 9.M: a released aMule downloads a file that remule
   # shares, on Fedora.

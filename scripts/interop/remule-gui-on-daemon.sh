@@ -96,6 +96,13 @@ ConnectToED2K=1
 Autoconnect=1
 Reconnect=1
 FilterLanIPs=0
+TempDir=$CFG/Temp
+IncomingDir=$CFG/Incoming
+IPFilterAutoLoad=0
+UPnPEnabled=0
+GeoIPEnabled=0
+GeoIPAutoUpdate=0
+NewVersionCheck=0
 [ExternalConnect]
 AcceptExternalConnections=1
 ECAddress=127.0.0.1
@@ -111,6 +118,8 @@ with open(path, "wb") as f:
     f.write(socket.inet_aton("127.0.0.1") + struct.pack("<HI", port, 1))
     f.write(struct.pack("<BHBH", 0x02, 1, 0x01, len(name)) + name)
 EOF
+# Offline: no server list fetched from the default addresses.
+: >"$CFG/addresses.dat"
 head -c 300000 /dev/urandom >"$WORK/share/gui shared file.bin"
 printf '%s\n' "$WORK/share" >"$CFG/shareddir.dat"
 
@@ -124,11 +133,11 @@ fi
 DAEMON_PID=$!
 PIDS+=($DAEMON_PID)
 for _ in $(seq 60); do
-	cmd status 2>/dev/null | grep -q "Connected to" && break
+	cmd status 2>/dev/null | grep "Connected to remule interop server" >/dev/null && break
 	kill -0 "$DAEMON_PID" 2>/dev/null || fail "$KIND exited"
 	sleep 1
 done
-cmd status | grep -q "Connected to" || fail "$KIND never logged into the server"
+cmd status | grep "Connected to remule interop server" >/dev/null || fail "$KIND never logged into the fake server"
 echo "$KIND is up: $(cmd status | grep -m1 "Succeeded")"
 
 # --- what remule-gui asks, at the model level --------------------------------------
@@ -159,7 +168,7 @@ for page in networks searches transfers shared statistics; do
 	wait "$gui" 2>/dev/null
 	echo "ok: remule-gui logged in and stayed up on the $page page"
 done
-daemon_log | grep -q "Connecting client: remule-gui" || fail "$KIND never saw remule-gui by name"
+grep -qs "Connecting client: remule-gui" "$WORK/daemon.log" "$CFG/logfile" || fail "$KIND never saw remule-gui by name"
 
 # --- shutdown ----------------------------------------------------------------------
 

@@ -111,6 +111,10 @@ jobs:
       - name: remule downloads from aMule, obfuscated
         if: matrix.source == 'remule'
         run: bash scripts/interop/remule-downloads-from-amule.sh
+      # MIGRATION_PLAN.md 8.M: each resumes a download the other started.
+      - name: aMule and remule resume each other's .part
+        if: matrix.source == 'remule'
+        run: bash scripts/interop/part-files-cross-resume.sh
 
   # MIGRATION_PLAN.md 11.M: the unmodified C++ amulecmd and amulegui drive
   # remuled. No release has the SRP login yet (it came after 3.2.0), so both

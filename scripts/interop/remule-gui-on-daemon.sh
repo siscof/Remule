@@ -85,6 +85,12 @@ cmd() {
 
 # --- the daemon, as in amulecmd-drives-remuled.sh ----------------------------
 
+# The fake server on this machine's own address: aMule drops a loopback
+# server from server.met (CServerList::AddServer checks IsGoodIP, which
+# refuses 127.0.0.0/8 whatever FilterLanIPs says).
+SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+SERVER_IP=${SERVER_IP:-127.0.0.1}
+
 EC_DIGEST=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
 cat >"$CFG/amule.conf" <<EOF
 [eMule]
@@ -109,13 +115,13 @@ ECAddress=127.0.0.1
 ECPort=$EC_PORT
 ECPassword=$EC_DIGEST
 EOF
-python3 - "$CFG/server.met" "$SERVER_PORT" <<'EOF'
+python3 - "$CFG/server.met" "$SERVER_IP" "$SERVER_PORT" <<'EOF'
 import socket, struct, sys
-path, port = sys.argv[1], int(sys.argv[2])
+path, ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 name = b"remule interop server"
 with open(path, "wb") as f:
     f.write(bytes([0x0E]) + struct.pack("<I", 1))
-    f.write(socket.inet_aton("127.0.0.1") + struct.pack("<HI", port, 1))
+    f.write(socket.inet_aton(ip) + struct.pack("<HI", port, 1))
     f.write(struct.pack("<BHBH", 0x02, 1, 0x01, len(name)) + name)
 EOF
 # Offline: no server list fetched from the default addresses.
@@ -123,7 +129,7 @@ EOF
 head -c 300000 /dev/urandom >"$WORK/share/gui shared file.bin"
 printf '%s\n' "$WORK/share" >"$CFG/shareddir.dat"
 
-python3 "$HERE/fake_ed2k_server.py" 127.0.0.1 "$SERVER_PORT" >"$WORK/server.log" 2>&1 &
+python3 "$HERE/fake_ed2k_server.py" "$SERVER_IP" "$SERVER_PORT" >"$WORK/server.log" 2>&1 &
 PIDS+=($!)
 if [ "$KIND" = amuled ]; then
 	"$DAEMON" --config-dir "$CFG" --log-stdout >"$WORK/daemon.log" 2>&1 &

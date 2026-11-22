@@ -21,6 +21,8 @@ use remule_ec::model::{priority_text, PartFileCmd, SearchKind, SearchParams};
 use remule_ec::{srp, Client, ConnectOptions, Packet};
 
 /// What `fake_ed2k_server.py` finds for every search.
+/// The one server `server.met` lists, `fake_ed2k_server.py`.
+const SERVER_NAME: &str = "remule interop server";
 const RESULT_NAME: &str = "remule interop result.iso";
 const RESULT_SIZE: u64 = 7_340_032;
 const LINK_NAME: &str = "GUI Check.iso";
@@ -65,8 +67,12 @@ fn run(host: &str, port: u16, password: &str, incoming: &Path, shutdown: bool) -
     check(!s.conn.low_id(), "a LowID")?;
     let server = s.conn.server.clone().ok_or("no server in the status")?;
     check(
-        server.ip == [127, 0, 0, 1],
-        format!("server {:?}", server.ip),
+        server.name == SERVER_NAME,
+        format!(
+            "connected to {} ({}), not the fake server",
+            server.name,
+            server.address()
+        ),
     )?;
     // The free space the Downloads and Shared panels show.
     check(
@@ -78,7 +84,10 @@ fn run(host: &str, port: u16, password: &str, incoming: &Path, shutdown: bool) -
     // Networks: the server list.
     let servers = c.servers().map_err(e)?;
     check(servers.len() == 1, format!("{} servers", servers.len()))?;
-    check(servers[0].ip == [127, 0, 0, 1], "the server's address")?;
+    check(
+        servers[0].ip == server.ip && servers[0].port == server.port,
+        "the listed server is not the one connected to",
+    )?;
     println!("ok: the server list: {}", servers[0].name);
 
     // Searches: a local search, its progress until done, its result.

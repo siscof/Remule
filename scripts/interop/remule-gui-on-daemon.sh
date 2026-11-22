@@ -94,6 +94,11 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.connect(("10.255.255.255", 1))
 print(s.getsockname()[0])' 2>/dev/null)
 SERVER_IP=${SERVER_IP:-127.0.0.1}
+# An address ending in .0 makes a LowID (the ID is the address with its first
+# octet in the low byte: below 2^24). remuled takes a loopback server.
+case "$SERVER_IP" in
+*.0) [ "$KIND" = remuled ] && SERVER_IP=127.0.0.1 ;;
+esac
 echo "the fake server on $SERVER_IP:$SERVER_PORT"
 
 EC_DIGEST=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)

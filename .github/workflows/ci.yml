@@ -107,6 +107,10 @@ jobs:
         run: bash scripts/interop/amule-downloads-from-remule.sh
         env:
           SOURCE: ${{ matrix.source }}
+      # MIGRATION_PLAN.md 4.M: the other way, obfuscated; once is enough.
+      - name: remule downloads from aMule, obfuscated
+        if: matrix.source == 'remule'
+        run: bash scripts/interop/remule-downloads-from-amule.sh
 
   # MIGRATION_PLAN.md 11.M: the unmodified C++ amulecmd and amulegui drive
   # remuled. No release has the SRP login yet (it came after 3.2.0), so both

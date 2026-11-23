@@ -83,12 +83,17 @@ struct Expected {
     until: Instant,
 }
 
-/// What a callback asks of the upload side: connect to `addr`, who wants
-/// `file` from us.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CallBack {
-    pub addr: SocketAddrV4,
-    pub file: Md4Hash,
+/// What our buddy passes on for the upload side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForUploader {
+    /// `OP_CALLBACK`: connect to `addr`, who wants `file` from us.
+    CallBack { addr: SocketAddrV4, file: Md4Hash },
+    /// `OP_REASKCALLBACKTCP`: a reask from `from`, answered over UDP there
+    /// as an `OP_REASKFILEPING` would be; `datagram` is that ping.
+    Reask {
+        from: SocketAddrV4,
+        datagram: Vec<u8>,
+    },
 }
 
 /// Both halves of the buddy business.
@@ -253,7 +258,7 @@ impl Buddies {
         conn: ConnId,
         packet: Packet,
         now: Instant,
-    ) -> (Vec<Action>, Vec<CallBack>) {
+    ) -> (Vec<Action>, Vec<ForUploader>) {
         let mut out = Vec::new();
         let mut callbacks = Vec::new();
         let parsed = PeerPacket::parse(packet, Default::default());
@@ -275,11 +280,19 @@ impl Buddies {
                 Ok(PeerPacket::Callback(c)) => {
                     let ours = self.kad_id.map(|id| UInt128::new(u128::MAX) ^ id);
                     if ours.is_some_and(|b| same_buddy_id(c.buddy_id, b)) {
-                        callbacks.push(CallBack {
+                        callbacks.push(ForUploader::CallBack {
                             addr: SocketAddrV4::new(c.ip, c.tcp_port),
                             file: c.file,
                         });
                     }
+                }
+                Ok(PeerPacket::ReaskCallbackTcp { from, ping }) => {
+                    let mut datagram = vec![
+                        ed2k_types::Protocol::Emule as u8,
+                        ed2k_types::ed2k::client_udp::Opcode::ReaskFilePing as u8,
+                    ];
+                    datagram.extend_from_slice(&ping);
+                    callbacks.push(ForUploader::Reask { from, datagram });
                 }
                 _ => {}
             }
@@ -316,6 +329,26 @@ impl Buddies {
                     tcp_port: from.port(),
                 })],
             }],
+            _ => Vec::new(),
+        }
+    }
+
+    /// `OP_REASKCALLBACKUDP` for the buddy we serve (its ID in either
+    /// layout): pass it on over TCP, with the asker's address
+    /// (`OP_REASKCALLBACKTCP`).
+    pub fn relay_reask(
+        &mut self,
+        from: SocketAddrV4,
+        buddy_id: [u8; 16],
+        ping: &[u8],
+    ) -> Vec<Action> {
+        match &self.served {
+            Some((l, id)) if l.up && same_buddy_id(UInt128::from_be_bytes(buddy_id), *id) => {
+                vec![Action::Send {
+                    conn: l.conn,
+                    packets: vec![ed2k_peer::packets::reask_callback_tcp(from, ping)],
+                }]
+            }
             _ => Vec::new(),
         }
     }

@@ -1176,3 +1176,74 @@ fn a_firewalled_source_is_asked_through_its_buddy() {
     w.run(a.into());
     w.tick_until(20, World::completed);
 }
+
+/// A firewalled source we wait in the queue of is reasked through its Kad
+/// buddy (`OP_REASKCALLBACKUDP`: the buddy ID raw, then the ping),
+/// unobfuscated, even as a LowID; its answer comes straight from it.
+#[test]
+fn a_firewalled_source_is_reasked_through_its_buddy() {
+    use crate::download_queue::BuddyRoute;
+    use ed2k_types::UInt128;
+    let dir = TempDir::new("q-buddy-reask");
+    let d = Arc::new(data(SIZE, 21));
+    let h = Arc::new(hashes(&d));
+    let mut c = config(&dir);
+    c.reask = Duration::from_secs(60);
+    c.ours.udp_port = 4672;
+    c.ours.id = 5000; // a LowID
+    let mut q = DownloadQueue::new(c);
+    let pf = PartFile::create(&dir.temp(), "test file.bin", h.ed2k, SIZE).unwrap();
+    assert!(q.add_file(pf));
+    let mut w = World::new(q);
+    let mut s = seeder_at(1, &d, &h, PartStatus::Complete);
+    s.queue_first = true;
+    s.hello.udp_port = 4672;
+    let route = BuddyRoute {
+        kad: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 4672),
+        id: UInt128::new(0xABCD),
+    };
+    let mut ep = s.endpoint();
+    ep.buddy = Some(route);
+    w.add_seeder(s.clone());
+    // As if it had called back and queued us: it connects to us.
+    w.add_source(h.ed2k, ep);
+    let conn = w.q.incoming();
+    let addr = SocketAddr::V4(ep.addr);
+    w.conns.insert(conn, addr);
+    let a = w.q.packet(conn, wire(s.hello.to_hello().unwrap()), w.now);
+    w.run(a.into());
+    w.conns.remove(&conn);
+    let a = w.q.closed(conn, w.now);
+    w.run(a.into());
+    assert_eq!(w.q.sources_of(&h.ed2k)[0].2, SourceState::OnQueue);
+    let udp_before = w.udp.len();
+    for _ in 0..45 {
+        w.tick();
+    }
+    let relayed: Vec<_> = w.udp[udp_before..]
+        .iter()
+        .filter(|u| u.to == route.kad && u.payload.get(1) == Some(&0x94))
+        .collect();
+    assert_eq!(relayed.len(), 1, "{:?}", &w.udp[udp_before..]);
+    assert_eq!(relayed[0].obfuscate_for, None);
+    let UdpPacket::ReaskCallbackUdp { buddy_id, ping } =
+        UdpPacket::parse(&relayed[0].payload, None).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(buddy_id, route.id.to_be_bytes());
+    assert_eq!(&ping[..16], &h.ed2k.0);
+    // Its answer, from its own address and UDP port.
+    let from = SocketAddrV4::new(*ep.addr.ip(), 4672);
+    let ack = UdpPacket::ReaskAck {
+        parts: Some(PartStatus::Complete),
+        rank: 4,
+    };
+    let a = w.q.udp_packet(from, &ack.to_datagram(4), w.now);
+    w.run(a.into());
+    assert!(w.reports.contains(&Report::Queued {
+        file: h.ed2k,
+        addr: ep.addr,
+        rank: Some(4)
+    }));
+}

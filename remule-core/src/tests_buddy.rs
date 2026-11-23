@@ -9,7 +9,7 @@ use ed2k_peer::packets::{buddy_ping, buddy_pong, callback};
 use ed2k_peer::{BuddyCallback, Hello, PeerPacket};
 use ed2k_types::{Md4Hash, UInt128};
 
-use crate::buddy::{other_layout, same_buddy_id, Buddies, CallBack, PING_INTERVAL};
+use crate::buddy::{other_layout, same_buddy_id, Buddies, ForUploader, PING_INTERVAL};
 use crate::download_queue::{Action, ConnId, Report};
 
 fn ours() -> Hello {
@@ -115,7 +115,7 @@ fn our_buddy() {
         let (_, cb) = b.packet(conn, wire(c), t1);
         assert_eq!(
             cb,
-            vec![CallBack {
+            vec![ForUploader::CallBack {
                 addr: requester,
                 file: Md4Hash([7; 16])
             }]
@@ -210,4 +210,52 @@ fn a_buddy_we_serve() {
         [Report::BuddyLost { serving: true, .. }]
     ));
     assert!(!b.serving());
+}
+
+/// A reask for the firewalled node we serve (`OP_REASKCALLBACKUDP`, its ID
+/// in either layout) goes on over TCP with the asker's address
+/// (`OP_REASKCALLBACKTCP`); another ID's does not. On the firewalled side,
+/// that comes out as a ping from the asker, for the upload side.
+#[test]
+fn reasks_through_a_buddy() {
+    use ed2k_peer::packets::reask_callback_tcp;
+    let t0 = Instant::now();
+    // The buddy.
+    let mut b = Buddies::new(ours());
+    let fw_ip = Ipv4Addr::new(192, 0, 2, 50);
+    let fw = Hello::amule(Md4Hash([0x33; 16]), 1234, 4662, "firewalled");
+    let buddy_id = UInt128::new(0x1111_2222_3333_4444);
+    b.expect(buddy_id, fw.user_hash, fw_ip, t0);
+    b.accept(3, &fw, fw_ip, t0);
+    let asker = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 4672);
+    let ping = [[9u8; 16].as_slice(), &[0, 0, 1, 0]].concat();
+    for id in [buddy_id, other_layout(buddy_id)] {
+        let a = b.relay_reask(asker, id.to_be_bytes(), &ping);
+        assert_eq!(
+            sent(&a),
+            vec![PeerPacket::ReaskCallbackTcp {
+                from: asker,
+                ping: ping.clone()
+            }]
+        );
+    }
+    assert!(b.relay_reask(asker, [1; 16], &ping).is_empty());
+
+    // The firewalled side.
+    let mut f = Buddies::new(ours());
+    f.set_kad_id(Some(UInt128::new(5)));
+    let addr = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 4662);
+    f.offer(addr, 4672, Md4Hash([0x22; 16]), 0, 7, t0);
+    let answer = Hello::amule(Md4Hash([0x22; 16]), 0x0700_A8C0, 4662, "buddy");
+    f.packet(7, wire(answer.to_hello_answer().unwrap()), t0);
+    let (_, work) = f.packet(7, wire(reask_callback_tcp(asker, &ping)), t0);
+    let mut datagram = vec![0xC5, 0x90];
+    datagram.extend_from_slice(&ping);
+    assert_eq!(
+        work,
+        vec![ForUploader::Reask {
+            from: asker,
+            datagram
+        }]
+    );
 }

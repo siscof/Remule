@@ -28,6 +28,7 @@ pub mod routing;
 pub mod search;
 pub mod terms;
 pub mod tracking;
+pub mod udp_firewall;
 
 pub use node::{Config, Event, Kad};
 

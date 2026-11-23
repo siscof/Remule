@@ -1283,12 +1283,12 @@ fn a_firewalled_node_finds_a_buddy() {
     for n in &mut net.nodes[1..] {
         n.set_tcp_open();
     }
+    let addrs = net.addrs.clone();
     for i in 0..net.nodes.len() {
-        for j in 0..net.nodes.len() {
+        for (j, &a) in addrs.iter().enumerate() {
             if i == j || (i + j) % 3 != 0 && j != 5 && j != 6 {
                 continue;
             }
-            let a = net.addrs[j];
             let mut v = true;
             net.nodes[i].routing.add(
                 ids[j],
@@ -1379,8 +1379,14 @@ fn callback_requests_reach_the_application() {
         tcp_port: 4711,
     };
     let out = net.nodes[0].handle(net.addrs[1], &req.to_datagram(), 1000);
+    // (The first packet also says Kad is connected.)
+    let events: Vec<Event> = out
+        .events
+        .into_iter()
+        .filter(|e| *e != Event::Connected)
+        .collect();
     assert_eq!(
-        out.events,
+        events,
         vec![Event::CallbackRequest {
             buddy_id: UInt128::new(99),
             file: Md4Hash([7; 16]),

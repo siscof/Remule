@@ -20,6 +20,7 @@ pub mod packets;
 pub mod part_status;
 pub mod secident;
 pub mod sources;
+pub mod udp;
 pub mod upload;
 
 pub use hello::{Hello, MiscOptions1, MiscOptions2, MuleInfo};

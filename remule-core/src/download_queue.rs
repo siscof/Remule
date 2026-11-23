@@ -13,8 +13,9 @@
 //!
 //! Sources come from servers, Kad and source exchange, all through
 //! [`DownloadQueue::add_source`]. Only sources that can be connected to
-//! directly are used: callbacks through a server or a Kad buddy, and UDP
-//! reasks, are not ported yet.
+//! directly are used: callbacks through a server or a Kad buddy are not
+//! ported yet. A source whose queue we wait in is asked again over UDP
+//! first ([`Action::SendUdp`], [`DownloadQueue::udp_packet`]).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -27,6 +28,7 @@ use ed2k_hash::aich::signing_key_v4;
 use ed2k_peer::download::{CloseReason, Event, Output, Session, State};
 use ed2k_peer::secident::{IdentConfig, IdentResult, Identity};
 use ed2k_peer::sources::{source_request_allowed, ExchangedSource, SourceRequestInput};
+use ed2k_peer::udp::UdpPacket;
 use ed2k_peer::{Hello, PartStatus, PeerPacket};
 use ed2k_types::ed2k::MAX_SOURCES_FILE_SOFT;
 use ed2k_types::{AichHash, Md4Hash};
@@ -177,7 +179,19 @@ pub enum Action {
     Close {
         conn: ConnId,
     },
+    /// Send a datagram from our client UDP port.
+    SendUdp(UdpOut),
     Report(Report),
+}
+
+/// A client UDP datagram to send ([`ed2k_peer::udp`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpOut {
+    pub to: SocketAddrV4,
+    /// The plain datagram, protocol byte first.
+    pub payload: Vec<u8>,
+    /// Obfuscate it for this user hash (`ShouldReceiveCryptUDPPackets`).
+    pub obfuscate_for: Option<Md4Hash>,
 }
 
 /// What happened, for the application to show or log.
@@ -277,7 +291,19 @@ struct Source {
     complete: bool,
     aich_root: Option<AichHash>,
     last_source_answer: Option<Instant>,
+    /// Its client UDP port and UDP version, from its hello.
+    udp: Option<(u16, u8)>,
+    /// Obfuscate datagrams to it (`ShouldReceiveCryptUDPPackets`).
+    crypt_udp: bool,
+    /// A UDP reask went out unanswered (`m_bUDPPending`).
+    udp_pending: bool,
+    /// It said its queue is full (`IsRemoteQueueFull`).
+    remote_queue_full: bool,
 }
+
+/// A queued source is reasked over UDP this long before its TCP reask is
+/// due, giving UDP a chance to answer first (`CPartFile::Process`).
+pub const UDP_REASK_EARLY: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
 struct Conn {
@@ -746,6 +772,10 @@ impl DownloadQueue {
                 complete: false,
                 aich_root: None,
                 last_source_answer: None,
+                udp: None,
+                crypt_udp: false,
+                udp_pending: false,
+                remote_queue_full: false,
             },
         );
         out.push(Action::Report(Report::SourceAdded {
@@ -770,6 +800,107 @@ impl DownloadQueue {
             addr: s.endpoint.addr,
             why: why.to_owned(),
         }));
+    }
+
+    /// `CPartFile::Process` for `DS_ONQUEUE` and `UDPReaskForDownload`:
+    /// a queued source with a UDP port is asked again over UDP shortly
+    /// before its TCP reask is due; an answer puts the TCP reask off.
+    /// Only while others can reach us (a HighID), with a UDP port of our
+    /// own, and not when the source is to be asked for sources (that
+    /// needs TCP).
+    fn udp_reasks(&mut self, now: Instant, out: &mut Vec<Action>) {
+        if self.config.ours.udp_port == 0 || self.config.ours.id < 0x0100_0000 {
+            return;
+        }
+        let early = self.config.reask.saturating_sub(UDP_REASK_EARLY);
+        let ids: Vec<u64> = self
+            .sources
+            .iter()
+            .filter(|(_, s)| {
+                s.state == SourceState::OnQueue
+                    && s.conn.is_none()
+                    && !s.udp_pending
+                    && s.udp.is_some()
+                    && s.last_asked
+                        .is_some_and(|t| now.saturating_duration_since(t) > early)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            let s = &self.sources[&id];
+            let Some(e) = self.files.get(&s.file) else {
+                continue;
+            };
+            if e.done || e.file.is_stopped() {
+                continue;
+            }
+            let count = self.source_count(&s.file);
+            if wants_sources(&self.config, e, s, count, now) {
+                continue;
+            }
+            let (port, version) = s.udp.unwrap_or_default();
+            let complete = self
+                .sources
+                .values()
+                .filter(|o| o.file == s.file && o.complete)
+                .count();
+            let ping = UdpPacket::ReaskFilePing {
+                file: s.file,
+                parts: Some(e.file.part_status()),
+                complete_sources: Some(complete.min(u16::MAX as usize) as u16),
+            };
+            let to = SocketAddrV4::new(*s.endpoint.addr.ip(), port);
+            let obfuscate_for = s.endpoint.user_hash.filter(|_| s.crypt_udp);
+            out.push(Action::SendUdp(UdpOut {
+                to,
+                payload: ping.to_datagram(version),
+                obfuscate_for,
+            }));
+            self.sources.get_mut(&id).unwrap().udp_pending = true;
+        }
+    }
+
+    /// A client UDP datagram (decrypted) from `from` that answers a reask
+    /// of ours (`OP_REASKACK`, `OP_QUEUEFULL`, `OP_FILENOTFOUND`): it goes
+    /// to the source waiting for an answer at that address
+    /// (`GetDownloadClientByIP_UDP`).
+    pub fn udp_packet(&mut self, from: SocketAddrV4, datagram: &[u8], now: Instant) -> Vec<Action> {
+        let mut out = Vec::new();
+        let Some((&id, s)) = self.sources.iter().find(|(_, s)| {
+            s.udp_pending
+                && s.endpoint.addr.ip() == from.ip()
+                && s.udp.is_some_and(|(p, _)| p == from.port())
+        }) else {
+            return out;
+        };
+        let version = s.udp.map(|(_, v)| v);
+        let (file, addr) = (s.file, s.endpoint.addr);
+        match UdpPacket::parse(datagram, version) {
+            // `UDPReaskACK`
+            Ok(UdpPacket::ReaskAck { rank, .. }) => {
+                let s = self.sources.get_mut(&id).unwrap();
+                s.udp_pending = false;
+                s.remote_queue_full = false;
+                s.last_asked = Some(now);
+                out.push(Action::Report(Report::Queued {
+                    file,
+                    addr,
+                    rank: Some(u32::from(rank)),
+                }));
+            }
+            Ok(UdpPacket::QueueFull) => {
+                let s = self.sources.get_mut(&id).unwrap();
+                s.udp_pending = false;
+                s.remote_queue_full = true;
+                s.last_asked = Some(now);
+            }
+            // `UDPReaskFNF`
+            Ok(UdpPacket::FileNotFound) => {
+                self.drop_source(id, "file not found (UDP)", now, &mut out);
+            }
+            _ => {}
+        }
+        out
     }
 
     /// Whether a source is due to be asked (`SourceRetryPolicy::IsDue`).
@@ -811,6 +942,8 @@ impl DownloadQueue {
             }
         }
 
+        self.udp_reasks(now, &mut out);
+
         // Connect to the sources that are due, the longest waiting first.
         let room = self.config.max_connections.saturating_sub(self.conns.len());
         let mut due: Vec<(Option<Instant>, u64)> = self
@@ -851,6 +984,7 @@ impl DownloadQueue {
             s.conn = Some(conn);
             s.state = SourceState::Connecting;
             s.last_asked = Some(now);
+            s.udp_pending = false;
             let ep = s.endpoint;
             let obfuscate_for = ep.user_hash.filter(|_| {
                 ep.crypt & crypt::SUPPORTED != 0
@@ -1133,6 +1267,14 @@ impl DownloadQueue {
                 Event::Handshake(h) => {
                     s.endpoint.user_hash.get_or_insert(h.user_hash);
                     start_ident = self.config.identity.is_some();
+                    let udp_version = h.misc1.map_or(0, |m| m.udp_version);
+                    s.udp =
+                        (h.udp_port != 0 && udp_version != 0).then_some((h.udp_port, udp_version));
+                    let theirs = h.misc2.unwrap_or_default();
+                    s.crypt_udp = theirs.supports_crypt
+                        && (theirs.requires_crypt
+                            || theirs.requests_crypt
+                            || self.config.request_obfuscation);
                 }
                 Event::PeerParts(p) => {
                     if let Some(old) = s.parts.take() {

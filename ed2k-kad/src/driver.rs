@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The [`Kad`] node on a tokio UDP socket: one task owns the node and the
 //! socket; the application talks to it through a [`KadHandle`].
+//!
+//! The socket can also be the application's ([`spawn_on`]): aMule has one
+//! client UDP port for Kad and eD2k alike, so whoever owns it hands Kad
+//! the datagrams that are not eD2k and sends what Kad sends.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
@@ -96,11 +100,62 @@ impl Drop for KadHandle {
     }
 }
 
+/// Where the node's datagrams come from and go.
+enum Transport {
+    Socket(UdpSocket, Vec<u8>),
+    Channels {
+        incoming: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+        outgoing: mpsc::UnboundedSender<Datagram>,
+    },
+}
+
+impl Transport {
+    /// The next datagram; `None` when the application's side is gone.
+    async fn recv(&mut self) -> Option<(SocketAddrV4, Vec<u8>)> {
+        match self {
+            Transport::Socket(socket, buf) => loop {
+                match socket.recv_from(buf).await {
+                    Ok((n, SocketAddr::V4(from))) => return Some((from, buf[..n].to_vec())),
+                    Ok(_) => {}
+                    // Windows reports ICMP port-unreachable as a recv error: ignore.
+                    Err(_) => {}
+                }
+            },
+            Transport::Channels { incoming, .. } => incoming.recv().await,
+        }
+    }
+
+    async fn send(&self, out: Vec<Datagram>) {
+        match self {
+            Transport::Socket(socket, _) => send_all(socket, out).await,
+            Transport::Channels { outgoing, .. } => {
+                for d in out {
+                    let _ = outgoing.send(d);
+                }
+            }
+        }
+    }
+}
+
 /// Run the node on `socket`.
 pub fn spawn(kad: Kad, socket: UdpSocket) -> KadHandle {
+    start(kad, Transport::Socket(socket, vec![0u8; 16384]))
+}
+
+/// Run the node on the application's UDP port: datagrams for Kad come in
+/// on `incoming`, Kad's go out on `outgoing`.
+pub fn spawn_on(
+    kad: Kad,
+    incoming: mpsc::Receiver<(SocketAddrV4, Vec<u8>)>,
+    outgoing: mpsc::UnboundedSender<Datagram>,
+) -> KadHandle {
+    start(kad, Transport::Channels { incoming, outgoing })
+}
+
+fn start(kad: Kad, transport: Transport) -> KadHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (ev_tx, ev_rx) = mpsc::channel(1024);
-    let task = tokio::spawn(run(kad, socket, cmd_rx, ev_tx));
+    let task = tokio::spawn(run(kad, transport, cmd_rx, ev_tx));
     KadHandle {
         cmd: cmd_tx,
         events: ev_rx,
@@ -217,31 +272,25 @@ async fn send_all(socket: &UdpSocket, out: Vec<Datagram>) {
 
 async fn run(
     mut kad: Kad,
-    socket: UdpSocket,
+    mut socket: Transport,
     mut cmds: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
 ) {
     let now = unix_now;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let mut buf = vec![0u8; 16384];
     loop {
         tokio::select! {
-            r = socket.recv_from(&mut buf) => {
-                let (n, from) = match r {
-                    Ok(x) => x,
-                    // Windows reports ICMP port-unreachable as a recv error: ignore.
-                    Err(_) => continue,
-                };
-                let SocketAddr::V4(from) = from else { continue };
-                let out = kad.handle(from, &buf[..n], now());
-                send_all(&socket, out.send).await;
+            r = socket.recv() => {
+                let Some((from, datagram)) = r else { return };
+                let out = kad.handle(from, &datagram, now());
+                socket.send(out.send).await;
                 for e in out.events {
                     let _ = events.send(e).await;
                 }
             }
             _ = tick.tick() => {
                 let out = kad.tick(now());
-                send_all(&socket, out.send).await;
+                socket.send(out.send).await;
                 for e in out.events {
                     let _ = events.send(e).await;
                 }
@@ -253,7 +302,7 @@ async fn run(
                     Command::Keyword(p, tx) => {
                         match kad.search_keyword(&p, t) {
                             Ok((id, word, out)) => {
-                                send_all(&socket, out).await;
+                                socket.send(out).await;
                                 let _ = tx.send(Ok((id, word)));
                             }
                             Err(e) => { let _ = tx.send(Err(e)); }
@@ -261,21 +310,21 @@ async fn run(
                     }
                     Command::Sources(h, size, tx) => match kad.search_sources(h, size, t) {
                         Ok((id, out)) => {
-                            send_all(&socket, out).await;
+                            socket.send(out).await;
                             let _ = tx.send(Ok(id));
                         }
                         Err(e) => { let _ = tx.send(Err(e)); }
                     },
                     Command::StoreKeyword(target, files, tx) => match kad.store_keyword(target, files, t) {
                         Ok((id, out)) => {
-                            send_all(&socket, out).await;
+                            socket.send(out).await;
                             let _ = tx.send(Ok(id));
                         }
                         Err(e) => { let _ = tx.send(Err(e)); }
                     },
                     Command::StoreSource(h, size, tags, tx) => match kad.store_source(h, size, tags, t) {
                         Ok((id, out)) => {
-                            send_all(&socket, out).await;
+                            socket.send(out).await;
                             let _ = tx.send(Ok(id));
                         }
                         Err(e) => { let _ = tx.send(Err(e)); }
@@ -285,7 +334,7 @@ async fn run(
                     }
                     Command::Bootstrap(to) => {
                         let d = kad.bootstrap(to, t);
-                        send_all(&socket, vec![d]).await;
+                        socket.send(vec![d]).await;
                     }
                     Command::FirewallAck(ip) => {
                         kad.firewall_ack(ip, t);

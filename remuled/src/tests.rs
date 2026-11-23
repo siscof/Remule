@@ -275,6 +275,7 @@ async fn the_daemon_shares_from_an_amule_directory() {
         share: Vec::new(),
         reachable: false,
         allow_lan: true,
+        reask: Duration::from_secs(900),
         ip_filter: None,
         stop_when_done: true,
         status_every: Duration::from_secs(3600),

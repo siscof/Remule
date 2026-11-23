@@ -7,7 +7,7 @@
 //! [`downloader`](crate::downloader) runs both.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,15 +16,17 @@ use ed2k_crypto::credits::IdentState;
 use ed2k_hash::aich::AichTree;
 use ed2k_peer::packets::{self, AichRecovery};
 use ed2k_peer::secident::{IdentConfig, IdentResult, Identity};
+use ed2k_peer::udp::UdpPacket;
+use ed2k_peer::upload::Shares;
 use ed2k_peer::upload::{Event, Output, UploadSession, UploadState};
-use ed2k_peer::{Hello, PeerPacket};
+use ed2k_peer::{Hello, PartStatus, PeerPacket};
 use ed2k_types::ed2k::{CONNECTION_TIMEOUT, PARTSIZE};
 use ed2k_types::Md4Hash;
 
 use crate::credits::Credits;
-use crate::download_queue::{Action, ConnId, Report};
+use crate::download_queue::{Action, ConnId, Report, UdpOut};
 use crate::shared::SharedFiles;
-use crate::upload_queue::{Answer, Asker, QueueAction, UploadQueue};
+use crate::upload_queue::{Answer, Asker, QueueAction, UdpReask, UploadQueue};
 
 struct Peer {
     session: UploadSession,
@@ -211,16 +213,23 @@ impl Uploader {
         if hello.id < 0x0100_0000 || hello.port == 0 || ip.is_unspecified() {
             return;
         }
-        let theirs = hello.misc2.unwrap_or_default();
-        let ours = self.ours.misc2.unwrap_or_default();
+        let obfuscate = self.obfuscate_for(hello);
         self.callbacks.insert(
             hello.user_hash,
             Callback {
                 addr: SocketAddr::new(ip, hello.port),
-                obfuscate: theirs.supports_crypt
-                    && (theirs.requires_crypt || theirs.requests_crypt || ours.requests_crypt),
+                obfuscate,
             },
         );
+    }
+
+    /// Whether to obfuscate what we send this peer, over TCP or UDP: it
+    /// supports it and either side asks for it.
+    fn obfuscate_for(&self, hello: &Hello) -> bool {
+        let theirs = hello.misc2.unwrap_or_default();
+        let ours = self.ours.misc2.unwrap_or_default();
+        theirs.supports_crypt
+            && (theirs.requires_crypt || theirs.requests_crypt || ours.requests_crypt)
     }
 
     /// A callback connection of ours is up: say hello.
@@ -256,6 +265,63 @@ impl Uploader {
         self.handle_output(conn, output, now)
     }
 
+    /// `OP_REASKFILEPING` from `from` (decrypted), as
+    /// `CClientUDPSocket::ProcessPacket` answers it: `OP_FILENOTFOUND` for a
+    /// file we do not share, `OP_REASKACK` with its rank to a peer waiting
+    /// for that file, `OP_QUEUEFULL` to a stranger when the queue nearly is.
+    /// Answers to a peer we know go obfuscated when it wants that.
+    pub fn udp_reask(&mut self, from: SocketAddrV4, datagram: &[u8], now: Instant) -> Vec<Action> {
+        let Ok(UdpPacket::ReaskFilePing { file, .. }) = UdpPacket::parse(datagram, None) else {
+            return Vec::new();
+        };
+        let ip = IpAddr::V4(*from.ip());
+        let info = {
+            let s = self.shares.lock().unwrap_or_else(|e| e.into_inner());
+            s.shared(&file)
+        };
+        let send = |packet: UdpPacket, version: u8, crypt: Option<Md4Hash>| {
+            vec![Action::SendUdp(UdpOut {
+                to: from,
+                payload: packet.to_datagram(version),
+                obfuscate_for: crypt,
+            })]
+        };
+        let Some(info) = info else {
+            let crypt = match self.queue.udp_reask(ip, from.port(), file, now) {
+                UdpReask::OtherFile { user, crypt_udp } => crypt_udp.then_some(user),
+                _ => None,
+            };
+            return send(UdpPacket::FileNotFound, 0, crypt);
+        };
+        match self.queue.udp_reask(ip, from.port(), file, now) {
+            UdpReask::Waiting {
+                user,
+                rank,
+                udp_version,
+                crypt_udp,
+            } => {
+                // The rest of the ping (its parts, its complete sources)
+                // feeds aMule's statistics only; it is read to check it.
+                if UdpPacket::parse(datagram, Some(udp_version)).is_err() {
+                    return Vec::new();
+                }
+                let parts = match info.parts {
+                    PartStatus::Complete => None,
+                    p => Some(p),
+                };
+                send(
+                    UdpPacket::ReaskAck { parts, rank },
+                    udp_version,
+                    crypt_udp.then_some(user),
+                )
+            }
+            UdpReask::Unknown { queue_full: true } => send(UdpPacket::QueueFull, 0, None),
+            UdpReask::Unknown { queue_full: false }
+            | UdpReask::OtherFile { .. }
+            | UdpReask::Ambiguous => Vec::new(),
+        }
+    }
+
     fn handle_output(&mut self, conn: ConnId, output: Output, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
         let mut send = output.send;
@@ -276,13 +342,23 @@ impl Uploader {
                         .credits
                         .as_ref()
                         .map_or(1.0, |c| c.score_ratio(&p.user_hash, p.ident, crypto));
-                    let hello = p.session.peer();
+                    let hello = p.session.peer().cloned();
+                    let crypt_udp = hello.as_ref().is_some_and(|h| self.obfuscate_for(h));
+                    let Some(p) = self.peers.get_mut(&conn) else {
+                        break;
+                    };
                     let asker = Asker {
                         user_hash: p.user_hash,
                         ip: p.ip,
-                        low_id: hello.is_some_and(|h| h.id < 0x0100_0000),
+                        low_id: hello.as_ref().is_some_and(|h| h.id < 0x0100_0000),
                         score_ratio: ratio,
                         old_emule: false,
+                        udp_port: hello.as_ref().map_or(0, |h| h.udp_port),
+                        udp_version: hello
+                            .as_ref()
+                            .and_then(|h| h.misc1)
+                            .map_or(0, |m| m.udp_version),
+                        crypt_udp,
                     };
                     match self.queue.request(asker, file, prio, auto, self.rate, now) {
                         Answer::Slot => {

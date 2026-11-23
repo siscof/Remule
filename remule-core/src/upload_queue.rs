@@ -65,6 +65,35 @@ pub struct Asker {
     /// An eMule of version 0.19 or older (`m_byEmuleVersion <= 0x19`):
     /// half the score.
     pub old_emule: bool,
+    /// Its client UDP port from its hello (0: none), where its UDP reasks
+    /// come from.
+    pub udp_port: u16,
+    /// Its UDP version (`CT_EMULE_MISCOPTIONS1`): how its reasks and our
+    /// answers are laid out.
+    pub udp_version: u8,
+    /// Answer it obfuscated (`ShouldReceiveCryptUDPPackets`).
+    pub crypt_udp: bool,
+}
+
+/// What the queue makes of a UDP reask (`OP_REASKFILEPING`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpReask {
+    /// A waiting peer asking about the file it waits for: it has asked
+    /// again, and waits at `rank`.
+    Waiting {
+        user: Md4Hash,
+        rank: u16,
+        udp_version: u8,
+        crypt_udp: bool,
+    },
+    /// A waiting peer asking about another file: no answer.
+    OtherFile { user: Md4Hash, crypt_udp: bool },
+    /// Nobody waits from there; `queue_full` when the queue has fewer than
+    /// 50 places left (then `OP_QUEUEFULL`, else no answer).
+    Unknown { queue_full: bool },
+    /// Several wait from that IP, none on that port: no answer (aMule
+    /// waits for a TCP reask).
+    Ambiguous,
 }
 
 /// The answer to an upload request.
@@ -317,6 +346,52 @@ impl UploadQueue {
         }
         self.sort(now);
         Answer::Queued(self.rank_of(&hash).unwrap_or(1))
+    }
+
+    /// `GetWaitingClientByIP_UDP` (ignoring the port when only one peer
+    /// waits from `ip`) and the `OP_REASKFILEPING` half of
+    /// `CClientUDPSocket::ProcessPacket`, for a shared `file`.
+    pub fn udp_reask(&mut self, ip: IpAddr, port: u16, file: Md4Hash, now: Instant) -> UdpReask {
+        let by_port = self
+            .waiting
+            .iter()
+            .position(|w| w.asker.ip == ip && w.asker.udp_port == port);
+        let i = match by_port {
+            Some(i) => i,
+            None => {
+                let same_ip: Vec<usize> = (0..self.waiting.len())
+                    .filter(|&i| self.waiting[i].asker.ip == ip)
+                    .collect();
+                match same_ip[..] {
+                    [i] => i,
+                    [] => {
+                        return UdpReask::Unknown {
+                            queue_full: self.waiting.len() + 50 > self.config.queue_size,
+                        }
+                    }
+                    _ => return UdpReask::Ambiguous,
+                }
+            }
+        };
+        let w = &mut self.waiting[i];
+        if w.file != file {
+            return UdpReask::OtherFile {
+                user: w.asker.user_hash,
+                crypt_udp: w.asker.crypt_udp,
+            };
+        }
+        // `SetUDPPort`, `SetLastUpRequest`.
+        w.asker.udp_port = port;
+        w.last_request = now;
+        let (user, udp_version, crypt_udp) =
+            (w.asker.user_hash, w.asker.udp_version, w.asker.crypt_udp);
+        self.sort(now);
+        UdpReask::Waiting {
+            user,
+            rank: self.rank_of(&user).unwrap_or(1),
+            udp_version,
+            crypt_udp,
+        }
     }
 
     /// `CUploadQueue::Process` / `SortGetBestClient`: drop peers that

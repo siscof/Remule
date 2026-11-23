@@ -3,7 +3,7 @@
 //! reads at start-up, turned into a [`ClientConfig`].
 //!
 //! * `amule.conf`: nick, ports, limits, the temp and incoming directories,
-//!   whether to connect to eD2k and Kad, `FilterLanIPs`.
+//!   whether to connect to eD2k and Kad, `FilterLanIPs`, `UDPDisable`.
 //! * `preferences.dat`: the user hash; made (and written) when missing or
 //!   bad, as aMule does.
 //! * `cryptkey.dat`: the secure-ident key; made when missing.
@@ -289,6 +289,12 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         .get("/eMule/FilterLanIPs")
         .and_then(ed2k_formats::amule_conf::parse_long)
         .is_none_or(|v| v != 0);
+    // `UDPDisable`: no client UDP port, so no UDP reasks and no Kad ("Kad
+    // makes no sense without the Client-UDP socket", `StartKad`).
+    let udp_disabled = conf
+        .get("/eMule/UDPDisable")
+        .and_then(ed2k_formats::amule_conf::parse_long)
+        .is_some_and(|v| v != 0);
 
     let servers = if prefs.connect_to_ed2k {
         match read_opt(&dir.join("server.met")) {
@@ -315,7 +321,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
     let mut conf = conf;
     let ec = ec_settings(dir, &mut conf, &prefs, &mut notes, &mut info);
     let ip_filter = ip_filter(dir, &conf, &mut notes, &mut info);
-    let kad = if prefs.connect_to_kad {
+    let kad = if prefs.connect_to_kad && !udp_disabled {
         if dir.join("nodes.dat").is_file() {
             Some(KadSettings {
                 dir: dir.to_path_buf(),
@@ -341,7 +347,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         reconnect: prefs.reconnect,
         kad,
         tcp_port: prefs.tcp_port,
-        udp_port: prefs.udp_port,
+        udp_port: if udp_disabled { 0 } else { prefs.udp_port },
         nick: prefs.nick.clone(),
         max_connections: prefs
             .max_connections
@@ -353,6 +359,12 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         // Not assumed: a HighID login or Kad's firewall check tell as it runs.
         reachable: false,
         allow_lan: !filter_lan,
+        reask: Duration::from_secs(
+            60 * conf
+                .get("/eMule/SourceReaskMinutes")
+                .and_then(ed2k_formats::amule_conf::parse_long)
+                .map_or(15, |m| m.clamp(15, 60)) as u64,
+        ),
         ip_filter: Some(ip_filter),
         stop_when_done: false,
         status_every: Duration::from_secs(60),

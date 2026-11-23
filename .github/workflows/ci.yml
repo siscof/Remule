@@ -122,6 +122,12 @@ jobs:
       - name: aMule and remule resume each other's .part
         if: matrix.source == 'remule'
         run: bash scripts/interop/part-files-cross-resume.sh
+      # MIGRATION_PLAN.md 8.6: remule, queued by aMule, asks again over UDP.
+      - name: UDP reask, remule asks aMule
+        if: matrix.source == 'remule'
+        run: bash scripts/interop/udp-reask-with-amule.sh
+        env:
+          DIRECTION: remule-asks
       # MIGRATION_PLAN.md 4.M: UDP obfuscation against aMule, on Kad.
       - name: Kad with aMule, obfuscated
         if: matrix.source == 'remule'
@@ -133,7 +139,7 @@ jobs:
   amulecmd-interop:
     runs-on: ubuntu-latest
     container: fedora:latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       AMULE_REF: 688c51eb77654d1fdc2a2967d1dd530c28b74ca5
     steps:
@@ -176,8 +182,16 @@ jobs:
           cp -R src/webapi/static /opt/amulecmd/tree/src/webapi/
       - name: Build remuled, remulecmd, remule-gui and gui_check
         run: |
-          cargo build --release -p remuled -p remulecmd -p remule-gui
+          cargo build --release -p remuled -p remulecmd -p remule-gui -p remule-cli
           cargo build --release -p remule-ec --example gui_check
+      # MIGRATION_PLAN.md 8.6: aMule, queued by remule, asks again over UDP.
+      # Only this aMule has SourceReaskMinutes (15 minutes at the least).
+      - name: UDP reask, aMule asks remule
+        run: bash scripts/interop/udp-reask-with-amule.sh
+        env:
+          DIRECTION: amule-asks
+          AMULED: /opt/amulecmd/amuled
+          AMULECMD: /opt/amulecmd/amulecmd
       - name: amulecmd drives remuled
         run: bash scripts/interop/amulecmd-drives-remuled.sh
         env:

@@ -39,7 +39,7 @@ use crate::search::{keyword_target, Action, Found, Search, SearchKind, SEARCH_TO
 use crate::tracking::{Admission, InTracker};
 use ed2k_codec::{Tag, TagName, TagValue};
 use ed2k_types::kad::{
-    KADEMLIAMAXNOTECOMMENTLEN, KADEMLIAMAXNOTENAMELEN, KADEMLIAMAXSOURCEEXTRABYTES,
+    FindType, KADEMLIAMAXNOTECOMMENTLEN, KADEMLIAMAXNOTENAMELEN, KADEMLIAMAXSOURCEEXTRABYTES,
     KADEMLIAMAXSOURCESTRLEN, KADEMLIAREPUBLISHTIMEK, KADEMLIAREPUBLISHTIMEN,
     KADEMLIAREPUBLISHTIMES,
 };
@@ -209,7 +209,13 @@ pub struct Kad {
     /// Record every datagram as an [`Event::Wire`].
     pub trace_wire: bool,
     wire: Vec<Wire>,
+    /// Legacy challenges out (`CPacketTracking::listChallengeRequests`):
+    /// IP, when, the contact, the challenge.
+    challenges: Vec<(u32, u64, UInt128, UInt128)>,
 }
+
+/// How long a legacy challenge waits for its answer.
+pub const CHALLENGE_TIME: u64 = 180;
 
 /// aMule-order IP of an address.
 fn ip_of(a: &SocketAddrV4) -> u32 {
@@ -246,7 +252,55 @@ impl Kad {
             shown_firewalled: true,
             trace_wire: false,
             wire: Vec::new(),
+            challenges: Vec::new(),
         }
+    }
+
+    /// `HasActiveLegacyChallenge`
+    fn has_active_challenge(&self, ip: u32, now: u64) -> bool {
+        self.challenges
+            .iter()
+            .any(|&(i, t, ..)| i == ip && now.saturating_sub(t) <= CHALLENGE_TIME)
+    }
+
+    /// `SendLegacyChallenge`: a contact older than Kad version 7 has no
+    /// keys to prove its IP, so it is sent a `KADEMLIA2_REQ` for a random
+    /// target, plain; an answer naming that target proves the IP is its
+    /// own. One challenge per IP at a time.
+    fn send_legacy_challenge(
+        &mut self,
+        to: SocketAddrV4,
+        contact: UInt128,
+        now: u64,
+        out: &mut Output,
+    ) {
+        let ip = ip_of(&to);
+        if self.has_active_challenge(ip, now) {
+            return;
+        }
+        let mut challenge = UInt128::new(self.rng.gen());
+        if challenge.is_zero() {
+            challenge = UInt128::new(1);
+        }
+        let req = KadPacket::Req {
+            count: FindType::FindValue.into(),
+            target: challenge,
+            receiver: contact,
+        };
+        // Those versions have no obfuscation.
+        let d = self.packet(&req, to, 0, None, UdpKey::default(), now);
+        out.send.push(d);
+        self.challenges
+            .retain(|&(_, t, ..)| now.saturating_sub(t) <= CHALLENGE_TIME);
+        self.challenges.push((ip, now, contact, challenge));
+    }
+
+    /// `IsLegacyChallenge` for a `KADEMLIA2_RES`: the contact it verifies.
+    fn take_challenge(&mut self, ip: u32, target: UInt128, now: u64) -> Option<UInt128> {
+        let i = self.challenges.iter().position(|&(i, t, _, c)| {
+            i == ip && now.saturating_sub(t) < CHALLENGE_TIME && c == target
+        })?;
+        Some(self.challenges.remove(i).2)
     }
 
     /// The datagrams recorded since the last call (with [`Self::trace_wire`]).
@@ -954,6 +1008,15 @@ impl Kad {
                 let to = SocketAddrV4::new(*from.ip(), port);
                 let d = self.packet(&res, to, h.version, Some(h.id), sender_key, now);
                 out.send.push(d);
+                let unproven = added && !valid_key && !self.has_active_challenge(ip, now);
+                // Version 7 has keys but no HELLO_RES_ACK: a ping, keyed.
+                if unproven && h.version == 7 {
+                    let d = self.packet(&KadPacket::Ping, to, h.version, None, sender_key, now);
+                    out.send.push(d);
+                }
+                if unproven && h.version < 7 {
+                    self.send_legacy_challenge(to, h.id, now, out);
+                }
                 self.firewalled_check(to, h.version, sender_key, now, out);
             }
             KadPacket::HelloRes(h) => {
@@ -962,14 +1025,23 @@ impl Kad {
                     return;
                 }
                 let mut verified = valid_key;
-                self.add_hello_sender(&h, ip, &mut port, sender_key, &mut verified, now);
-                if h.wants_ack() && h.version >= 8 && !sender_key.is_empty() {
-                    let ack = KadPacket::HelloResAck {
-                        id: self.cfg.kad_id,
-                    };
+                let added =
+                    self.add_hello_sender(&h, ip, &mut port, sender_key, &mut verified, now);
+                if h.wants_ack() && h.version >= 8 {
+                    // Without a sender key there is no answering it.
+                    if !sender_key.is_empty() {
+                        let ack = KadPacket::HelloResAck {
+                            id: self.cfg.kad_id,
+                        };
+                        let to = SocketAddrV4::new(*from.ip(), port);
+                        let d = self.packet(&ack, to, h.version, None, sender_key, now);
+                        out.send.push(d);
+                    }
+                } else if added && !valid_key && h.version < 7 {
+                    // An answer to our hello can be spoofed too, by someone
+                    // who knows we said hello.
                     let to = SocketAddrV4::new(*from.ip(), port);
-                    let d = self.packet(&ack, to, h.version, None, sender_key, now);
-                    out.send.push(d);
+                    self.send_legacy_challenge(to, h.id, now, out);
                 }
                 let to = SocketAddrV4::new(*from.ip(), port);
                 self.firewalled_check(to, h.version, sender_key, now, out);
@@ -1007,6 +1079,12 @@ impl Kad {
             KadPacket::Res { target, contacts } => {
                 if !self.was_requested(ip, Opcode::Req, now) {
                     self.stats.unrequested += 1;
+                    return;
+                }
+                // The answer to a legacy challenge: the contact is verified,
+                // and what it lists does not matter.
+                if let Some(id) = self.take_challenge(ip, target, now) {
+                    self.routing.verify(id, ip);
                     return;
                 }
                 let filter_lan = self.routing.filter_lan;

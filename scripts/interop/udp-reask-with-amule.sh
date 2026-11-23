@@ -198,7 +198,7 @@ if [ "$DIRECTION" = remule-asks ]; then
 	echo "----- remule's datagrams with aMule -----"
 	grep "^udp" "$T" | sort | uniq -c
 	grep "queue rank" "$T" | head -5
-	grep -q "^$UP_ADDR: queue rank" "$T" || fail "remule was not queued by aMule"
+	grep -qF "] $UP_ADDR: queue rank" "$T" || fail "remule was not queued by aMule"
 	grep -q "^udp -> $UP_UDP ReaskFilePing obfuscated" "$T" || fail "remule sent aMule no obfuscated UDP reask"
 	grep -q "^udp -> $UP_UDP ReaskFilePing plain" "$T" && fail "remule sent aMule a plain UDP reask"
 	grep -q "^udp <- $UP_UDP ReaskAck obfuscated" "$T" || fail "aMule did not answer the UDP reask (obfuscated)"

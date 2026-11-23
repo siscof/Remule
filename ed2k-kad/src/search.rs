@@ -36,6 +36,10 @@ pub const RESULTS_TOTAL: u32 = 300;
 pub const STORE_LIFETIME: u64 = 140;
 /// `SEARCHSTOREFILE_TOTAL`, `SEARCHSTOREKEYWORD_TOTAL`: nodes that took a publish.
 pub const STORE_TOTAL: u32 = 10;
+/// `SEARCHFINDBUDDY_LIFETIME`: seconds.
+pub const FINDBUDDY_LIFETIME: u64 = 100;
+/// `SEARCHFINDBUDDY_TOTAL`: buddy requests sent.
+pub const FINDBUDDY_TOTAL: u32 = 10;
 /// Files per keyword publish, and per packet.
 pub const STORE_KEYWORD_FILES: usize = 150;
 pub const STORE_KEYWORD_PER_PACKET: usize = 50;
@@ -56,6 +60,9 @@ pub enum SearchKind {
     /// `STOREFILE`: publish ourselves as a source of the file. `tags` are
     /// the source tags; the file size is added for nodes of version 2 on.
     StoreSource { tags: Vec<Tag>, size: u64 },
+    /// `FINDBUDDY`: we are firewalled; ask the nodes close to our Kad ID
+    /// with every bit flipped to be our buddy.
+    FindBuddy,
 }
 
 impl SearchKind {
@@ -63,9 +70,9 @@ impl SearchKind {
         match self {
             SearchKind::Node | SearchKind::NodeComplete => FindType::FindNode.into(),
             SearchKind::Keyword { .. } | SearchKind::Source { .. } => FindType::FindValue.into(),
-            SearchKind::StoreKeyword { .. } | SearchKind::StoreSource { .. } => {
-                FindType::Store.into()
-            }
+            SearchKind::StoreKeyword { .. }
+            | SearchKind::StoreSource { .. }
+            | SearchKind::FindBuddy => FindType::Store.into(),
         }
     }
 
@@ -80,6 +87,8 @@ impl SearchKind {
     fn lifetime(&self) -> u64 {
         if self.is_store() {
             STORE_LIFETIME
+        } else if matches!(self, SearchKind::FindBuddy) {
+            FINDBUDDY_LIFETIME
         } else {
             LIFETIME
         }
@@ -102,6 +111,8 @@ pub enum Action {
     },
     /// `KADEMLIA2_PUBLISH_SOURCE_REQ`
     PublishSource { to: Contact, tags: Vec<Tag> },
+    /// `KADEMLIA_FINDBUDDY_REQ`
+    FindBuddy { to: Contact },
 }
 
 /// A file found by a keyword search (`ProcessResultKeyword`).
@@ -280,6 +291,15 @@ impl Search {
                     return (false, Vec::new());
                 }
             }
+            SearchKind::FindBuddy => {
+                if age_end < now {
+                    return (true, Vec::new());
+                }
+                if self.answers > FINDBUDDY_TOTAL || age_end - 20 < now {
+                    self.stop_at(now);
+                    return (false, Vec::new());
+                }
+            }
         }
         (false, self.jump_start(now))
     }
@@ -341,6 +361,16 @@ impl Search {
         }
         if self.kind.is_store() {
             return self.store_to(from);
+        }
+        if matches!(self.kind, SearchKind::FindBuddy) {
+            // A safeguard: no more than so many asked. Each request counts
+            // as an answer (`m_answers++`).
+            if self.answers > FINDBUDDY_TOTAL {
+                return None;
+            }
+            self.answers += 1;
+            self.requests += 1;
+            return Some(Action::FindBuddy { to: from.clone() });
         }
         // Kad1 nodes (before version 3) are not asked.
         if from.version < 3 {

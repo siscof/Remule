@@ -1009,6 +1009,16 @@ pub async fn run(
                         }
                     }
                     Some(KadEvent::Wire(w)) => eprintln!("{}", kad::wire_line(&w)),
+                    // Buddies: what the Kad side reports; the TCP side is not here yet.
+                    Some(KadEvent::BuddyOffer { tcp, .. }) => {
+                        debug!("[{:>5}s] Kad: buddy offer from {tcp}", start.elapsed().as_secs());
+                    }
+                    Some(KadEvent::BuddyRequest { tcp, .. }) => {
+                        debug!("[{:>5}s] Kad: buddy request from {tcp}", start.elapsed().as_secs());
+                    }
+                    Some(KadEvent::CallbackRequest { from, .. }) => {
+                        debug!("[{:>5}s] Kad: callback request from {from}", start.elapsed().as_secs());
+                    }
                     None => kad_node = None,
                 }
             }

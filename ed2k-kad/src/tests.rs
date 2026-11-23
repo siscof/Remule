@@ -1212,3 +1212,179 @@ fn an_old_nodes_hello_answer_is_challenged() {
         Ok(KadPacket::Req { receiver, .. }) if receiver == ids[1]
     )));
 }
+
+/// The buddy packets on the wire (`KADEMLIA_FINDBUDDY_REQ/RES`,
+/// `KADEMLIA_CALLBACK_REQ`): Kad 1 opcodes under the Kad 2 header; an
+/// offer's connect options only when present.
+#[test]
+fn buddy_packets_round_trip() {
+    let a = UInt128::new(0x0123_4567_89AB_CDEF_0011_2233_4455_6677);
+    let b = UInt128::new(42);
+    for p in [
+        KadPacket::FindBuddyReq {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 4662,
+        },
+        KadPacket::FindBuddyRes {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 4662,
+            connect_options: Some(3),
+        },
+        KadPacket::FindBuddyRes {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 4662,
+            connect_options: None,
+        },
+        KadPacket::CallbackReq {
+            buddy_id: a,
+            file: b,
+            tcp_port: 4711,
+        },
+    ] {
+        let d = p.to_datagram();
+        assert_eq!(d[0], 0xE4);
+        assert_eq!(KadPacket::parse(&d).unwrap(), p);
+    }
+    assert_eq!(
+        KadPacket::FindBuddyReq {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 1
+        }
+        .to_datagram()[1],
+        0x51
+    );
+    // Shorter than 34 bytes: refused.
+    assert!(KadPacket::parse(&[0xE4, 0x52, 1, 2, 3]).is_err());
+}
+
+/// A firewalled node finds a buddy: five minutes after start it searches
+/// toward its Kad ID with every bit flipped; the open node there offers
+/// (and says so to its application), the firewalled one hears the offer.
+/// A firewalled or already serving node does not offer; an offer for
+/// another ID, or unasked, is not taken.
+#[test]
+fn a_firewalled_node_finds_a_buddy() {
+    let mut rng = StdRng::seed_from_u64(77);
+    let mut ids: Vec<UInt128> = (0..30).map(|_| UInt128::new(rng.gen())).collect();
+    let target = UInt128::new(u128::MAX) ^ ids[0];
+    // Node 5 is close to node 0's buddy target; node 6 too, but serving.
+    ids[5] = target ^ UInt128::new(777);
+    ids[6] = target ^ UInt128::new(999);
+    let mut net = Net::new(&ids, &mut rng);
+    let mut c = net.nodes[0].config().clone();
+    c.tcp_firewalled = true;
+    net.nodes[0] = Kad::new(c, net.now);
+    net.nodes[6].serving_buddy = true;
+    // Everyone but node 0 can be reached over TCP.
+    for n in &mut net.nodes[1..] {
+        n.set_tcp_open();
+    }
+    for i in 0..net.nodes.len() {
+        for j in 0..net.nodes.len() {
+            if i == j || (i + j) % 3 != 0 && j != 5 && j != 6 {
+                continue;
+            }
+            let a = net.addrs[j];
+            let mut v = true;
+            net.nodes[i].routing.add(
+                ids[j],
+                u32::from(*a.ip()),
+                a.port(),
+                4662,
+                8,
+                UdpKey::default(),
+                &mut v,
+                false,
+                false,
+                1000,
+            );
+        }
+    }
+    net.run(60);
+    // Not before five minutes, nor with a buddy.
+    assert!(net.nodes[0].buddy_search(false, net.now).is_none());
+    net.run(250);
+    assert!(net.nodes[0].buddy_search(true, net.now).is_none());
+    let now = net.now;
+    let (_, out) = net.nodes[0]
+        .buddy_search(false, now)
+        .expect("a buddy search");
+    // Once: the next waits 20 minutes.
+    assert!(net.nodes[0].buddy_search(false, now).is_none());
+    // An open node that is not firewalled does not search.
+    assert!(net.nodes[1].buddy_search(false, now).is_none());
+    net.post(0, out);
+    let mut events = net.deliver();
+    events.extend(net.run(30));
+    let offer = events.iter().find_map(|(i, e)| match e {
+        Event::BuddyOffer { tcp, user_hash, .. } if *i == 0 => Some((*tcp, *user_hash)),
+        _ => None,
+    });
+    let (tcp, user_hash) = offer.expect("an offer");
+    assert_eq!(tcp, SocketAddrV4::new(*net.addrs[5].ip(), 4662));
+    assert_eq!(user_hash, net.nodes[5].config().user_hash);
+    let request = events.iter().find_map(|(i, e)| match e {
+        Event::BuddyRequest {
+            buddy_id,
+            user_hash,
+            tcp,
+        } if *i == 5 => Some((*buddy_id, *user_hash, *tcp)),
+        _ => None,
+    });
+    assert_eq!(
+        request,
+        Some((
+            target,
+            net.nodes[0].config().user_hash,
+            SocketAddrV4::new(*net.addrs[0].ip(), 4662)
+        ))
+    );
+    assert!(!events
+        .iter()
+        .any(|(i, e)| *i == 6 && matches!(e, Event::BuddyRequest { .. })));
+
+    // An offer nobody asked for, or for someone else: ignored.
+    let stray = KadPacket::FindBuddyRes {
+        buddy_id: target,
+        user_hash: UInt128::new(1),
+        tcp_port: 1,
+        connect_options: None,
+    };
+    let out = net.nodes[0].handle(net.addrs[9], &stray.to_datagram(), net.now);
+    assert!(out.events.is_empty());
+    // A firewalled node does not offer.
+    let req = KadPacket::FindBuddyReq {
+        buddy_id: UInt128::new(5),
+        user_hash: UInt128::new(6),
+        tcp_port: 7,
+    };
+    let out = net.nodes[0].handle(net.addrs[9], &req.to_datagram(), net.now);
+    assert!(out.send.is_empty() && out.events.is_empty());
+}
+
+/// `KADEMLIA_CALLBACK_REQ` reaches the application with the asker's
+/// address and TCP port.
+#[test]
+fn callback_requests_reach_the_application() {
+    let mut rng = StdRng::seed_from_u64(78);
+    let ids = [UInt128::new(rng.gen()), UInt128::new(rng.gen())];
+    let mut net = Net::new(&ids, &mut rng);
+    let req = KadPacket::CallbackReq {
+        buddy_id: UInt128::new(99),
+        file: UInt128::from_be_bytes([7; 16]),
+        tcp_port: 4711,
+    };
+    let out = net.nodes[0].handle(net.addrs[1], &req.to_datagram(), 1000);
+    assert_eq!(
+        out.events,
+        vec![Event::CallbackRequest {
+            buddy_id: UInt128::new(99),
+            file: Md4Hash([7; 16]),
+            from: SocketAddrV4::new(*net.addrs[1].ip(), 4711),
+        }]
+    );
+}

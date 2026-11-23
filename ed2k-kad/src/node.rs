@@ -415,9 +415,10 @@ impl Kad {
         true
     }
 
-    /// Tests: as if enough nodes had reached our TCP port.
-    #[cfg(test)]
-    pub(crate) fn set_tcp_open(&mut self) {
+    /// Start as if enough nodes had reached our TCP port (the application
+    /// knows it is reachable). The hourly check still runs and can say
+    /// otherwise.
+    pub fn assume_tcp_open(&mut self) {
         for _ in 0..crate::firewall::CONFIRMATIONS {
             self.recheck.add_confirmation();
         }

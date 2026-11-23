@@ -162,6 +162,10 @@ pub struct UploadSession {
     early_ident_state: Option<(Need, u32)>,
     /// Compression turned off for this session (a fast slot).
     no_compression: bool,
+    /// A callback of ours gives the peer its slot once it answers
+    /// ([`UploadSession::connect`]); one asked for through our Kad buddy
+    /// does not ([`UploadSession::connect_on_request`]).
+    give_slot: bool,
 }
 
 /// `IsUploadCompressible`: formats compressed by design, video and
@@ -272,6 +276,7 @@ impl UploadSession {
             ident: None,
             early_ident_state: None,
             no_compression: false,
+            give_slot: false,
         };
         let mut out = Output::default();
         // An eMule without CT_EMULE_VERSION expects the old capability packet.
@@ -301,7 +306,20 @@ impl UploadSession {
             ident: None,
             early_ident_state: None,
             no_compression: false,
+            give_slot: true,
         };
+        Ok((s, hello))
+    }
+
+    /// Connect to a peer that asked for it (`OP_CALLBACK`, through our Kad
+    /// buddy): say the returned hello once connected; when its answer
+    /// comes, it goes on as a peer that connected to us
+    /// ([`Event::Handshake`], then its requests).
+    pub fn connect_on_request(
+        ours: Hello,
+    ) -> Result<(UploadSession, Packet), ed2k_codec::TagError> {
+        let (mut s, hello) = Self::connect(ours)?;
+        s.give_slot = false;
         Ok((s, hello))
     }
 
@@ -488,8 +506,12 @@ impl UploadSession {
             return match packet {
                 PeerPacket::HelloAnswer(hello) => {
                     self.peer_said_hello(hello, out);
-                    out.send.push(self.accept());
-                    out.events.push(Event::CalledBack);
+                    if self.give_slot {
+                        out.send.push(self.accept());
+                        out.events.push(Event::CalledBack);
+                    } else {
+                        self.state = UploadState::Idle;
+                    }
                     Ok(())
                 }
                 p @ PeerPacket::MuleInfo { .. } => {

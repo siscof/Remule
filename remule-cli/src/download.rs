@@ -31,6 +31,8 @@ pub struct DownloadArgs {
     /// Find sources on Kad, keeping its state here.
     pub kad: Option<PathBuf>,
     pub kad_nodes: Option<PathBuf>,
+    /// Kad nodes to bootstrap from as well.
+    pub kad_bootstrap: Vec<std::net::SocketAddrV4>,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub nick: String,
@@ -140,6 +142,7 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         kad: a.kad.clone().map(|dir| KadSettings {
             dir,
             nodes: a.kad_nodes.clone(),
+            bootstrap: a.kad_bootstrap.clone(),
         }),
         tcp_port: a.tcp_port,
         udp_port: a.udp_port,

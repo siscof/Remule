@@ -1281,7 +1281,7 @@ fn a_firewalled_node_finds_a_buddy() {
     net.nodes[6].serving_buddy = true;
     // Everyone but node 0 can be reached over TCP.
     for n in &mut net.nodes[1..] {
-        n.set_tcp_open();
+        n.assume_tcp_open();
     }
     let addrs = net.addrs.clone();
     for i in 0..net.nodes.len() {

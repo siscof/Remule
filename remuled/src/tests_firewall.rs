@@ -255,6 +255,7 @@ async fn the_daemon_runs_the_kad_firewall_check() {
         kad: Some(KadSettings {
             dir: kad_dir,
             nodes: None,
+            bootstrap: Vec::new(),
         }),
         tcp_port,
         udp_port,

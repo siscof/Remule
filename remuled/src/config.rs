@@ -326,6 +326,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
             Some(KadSettings {
                 dir: dir.to_path_buf(),
                 nodes: None,
+                bootstrap: Vec::new(),
             })
         } else {
             notes.push("no nodes.dat (none could be fetched): Kad off".to_owned());

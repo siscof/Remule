@@ -159,6 +159,9 @@ enum Command {
         /// The nodes.dat to join Kad from (default: the --kad directory's).
         #[arg(long)]
         nodes: Option<PathBuf>,
+        /// Also bootstrap Kad from this node (IP:PORT).
+        #[arg(long)]
+        kad_bootstrap: Vec<std::net::SocketAddrV4>,
         /// TCP port: told to peers and servers, and listened on for callbacks.
         #[arg(long, default_value_t = 4662)]
         port: u16,
@@ -373,6 +376,7 @@ fn main() -> ExitCode {
             obfuscate,
             kad,
             nodes,
+            kad_bootstrap,
             port,
             udp_port,
             nick,
@@ -394,6 +398,7 @@ fn main() -> ExitCode {
             obfuscate_server: obfuscate,
             kad,
             kad_nodes: nodes,
+            kad_bootstrap,
             tcp_port: port,
             udp_port,
             nick,

@@ -69,6 +69,8 @@ pub struct KadSettings {
     pub dir: PathBuf,
     /// The `nodes.dat` to start from (default: the one in `dir`).
     pub nodes: Option<PathBuf>,
+    /// Nodes to bootstrap from as well.
+    pub bootstrap: Vec<SocketAddrV4>,
 }
 
 /// How to run.
@@ -793,7 +795,7 @@ pub async fn run(
                 &KadStart {
                     dir: k.dir.clone(),
                     nodes: k.nodes.clone(),
-                    bootstrap: Vec::new(),
+                    bootstrap: k.bootstrap.clone(),
                     udp_port: c.udp_port,
                     tcp_port: c.tcp_port,
                     user_hash: c.user_hash,
@@ -807,6 +809,12 @@ pub async fn run(
         ),
         None => None,
     };
+    // Buddy callbacks are checked against our Kad ID.
+    if let Some(k) = &kad_node {
+        let _ = cmd.send(Command::SetKadId(Some(k.prefs.kad_id)));
+    }
+    // Our Kad buddy is up (we are firewalled), or we serve one.
+    let mut own_buddy = false;
 
     // External connections: a view of the client, refreshed every second,
     // and what they ask of it.
@@ -941,6 +949,15 @@ pub async fn run(
                 if matches!(r, Report::Completed { .. }) {
                     done += 1;
                 }
+                // The buddy links: ours stops the buddy search, one we serve
+                // stops Kad's offers.
+                match (&r, &kad_node) {
+                    (Report::BuddyLinked { serving: false, .. }, _) => own_buddy = true,
+                    (Report::BuddyLost { serving: false, .. }, _) => own_buddy = false,
+                    (Report::BuddyLinked { serving: true, .. }, Some(k)) => k.handle.set_serving_buddy(true).await,
+                    (Report::BuddyLost { serving: true, .. }, Some(k)) => k.handle.set_serving_buddy(false).await,
+                    _ => {}
+                }
                 log_report(start.elapsed(), &r, &names);
             }
             ev = async { match &mut server { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
@@ -1018,15 +1035,18 @@ pub async fn run(
                         }
                     }
                     Some(KadEvent::Wire(w)) => eprintln!("{}", kad::wire_line(&w)),
-                    // Buddies: what the Kad side reports; the TCP side is not here yet.
-                    Some(KadEvent::BuddyOffer { tcp, .. }) => {
-                        debug!("[{:>5}s] Kad: buddy offer from {tcp}", start.elapsed().as_secs());
+                    // Buddies: the TCP side is the downloader's.
+                    Some(KadEvent::BuddyOffer { tcp, user_hash, connect_options }) => {
+                        info!("[{:>5}s] Kad: buddy offer from {tcp}", start.elapsed().as_secs());
+                        let _ = cmd.send(Command::BuddyOffer { tcp, user_hash, connect_options });
                     }
-                    Some(KadEvent::BuddyRequest { tcp, .. }) => {
-                        debug!("[{:>5}s] Kad: buddy request from {tcp}", start.elapsed().as_secs());
+                    Some(KadEvent::BuddyRequest { buddy_id, user_hash, tcp }) => {
+                        info!("[{:>5}s] Kad: buddy request from {tcp}, offered", start.elapsed().as_secs());
+                        let _ = cmd.send(Command::BuddyRequest { buddy_id, user_hash, tcp });
                     }
-                    Some(KadEvent::CallbackRequest { from, .. }) => {
+                    Some(KadEvent::CallbackRequest { buddy_id, file, from }) => {
                         debug!("[{:>5}s] Kad: callback request from {from}", start.elapsed().as_secs());
+                        let _ = cmd.send(Command::BuddyCallback { buddy_id, file, from });
                     }
                     None => kad_node = None,
                 }
@@ -1161,7 +1181,7 @@ pub async fn run(
                                     log_reach(t, was, reach);
                                 }
                                 Effect::StartKad => {
-                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None });
+                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None, bootstrap: Vec::new() });
                                     // The stopped node's socket may still be closing.
                                     let mut started = Err(String::new());
                                     for _ in 0..20 {
@@ -1185,6 +1205,7 @@ pub async fn run(
                                     match started {
                                         Ok(n) => {
                                             info!("[{:>5}s] Kad started", t.as_secs());
+                                            let _ = cmd.send(Command::SetKadId(Some(n.prefs.kad_id)));
                                             kad_node = Some(n);
                                         }
                                         Err(e) => warn!("Kad: {e}"),
@@ -1409,6 +1430,12 @@ pub async fn run(
                         for (h, size) in wanted.iter().filter(|(h, _)| !paused.contains(h)) {
                             let _ = s.get_sources(*h, *size).await;
                         }
+                    }
+                }
+                // Firewalled with no buddy: look for one when it is time.
+                if let (Some(k), Some(_)) = (&kad_node, kad_connected) {
+                    if k.handle.buddy_search(own_buddy).await.is_some() {
+                        info!("[{:>5}s] Kad: looking for a buddy", t.as_secs());
                     }
                 }
                 if let (Some(k), Some(at)) = (&kad_node, next_kad_ask) {

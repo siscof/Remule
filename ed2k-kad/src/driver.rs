@@ -75,6 +75,8 @@ enum Command {
     StoreCounts(oneshot::Sender<(usize, usize)>),
     Bootstrap(SocketAddrV4),
     FirewallAck(Ipv4Addr),
+    ServingBuddy(bool),
+    BuddySearch(bool, oneshot::Sender<Option<u32>>),
     Snapshot(oneshot::Sender<Snapshot>),
     Nodes(oneshot::Sender<Option<NodesDat>>),
     Index(oneshot::Sender<IndexFiles>),
@@ -214,6 +216,19 @@ impl KadHandle {
             .unwrap_or((usize::MAX, usize::MAX))
     }
 
+    /// We serve a buddy (or no longer): Kad offers no more while we do.
+    pub async fn set_serving_buddy(&self, serving: bool) {
+        let _ = self.cmd.send(Command::ServingBuddy(serving)).await;
+    }
+
+    /// [`Kad::buddy_search`]: look for a buddy when it is time and we need
+    /// one. The search's ID when one started.
+    pub async fn buddy_search(&self, have_buddy: bool) -> Option<u32> {
+        self.ask(|tx| Command::BuddySearch(have_buddy, tx))
+            .await
+            .flatten()
+    }
+
     pub async fn bootstrap(&self, to: SocketAddrV4) {
         let _ = self.cmd.send(Command::Bootstrap(to)).await;
     }
@@ -338,6 +353,17 @@ async fn run(
                     }
                     Command::FirewallAck(ip) => {
                         kad.firewall_ack(ip, t);
+                    }
+                    Command::ServingBuddy(serving) => kad.serving_buddy = serving,
+                    Command::BuddySearch(have, tx) => {
+                        let id = match kad.buddy_search(have, t) {
+                            Some((id, out)) => {
+                                socket.send(out).await;
+                                Some(id)
+                            }
+                            None => None,
+                        };
+                        let _ = tx.send(id);
                     }
                     Command::Snapshot(tx) => { let _ = tx.send(snapshot(&kad, t)); }
                     Command::Nodes(tx) => { let _ = tx.send(kad.nodes_to_save()); }

@@ -597,6 +597,39 @@ impl Uploader {
         }]
     }
 
+    /// `OP_DIRECTCALLBACKREQ` (we are firewalled, but take UDP): the peer at
+    /// `addr` wants us to connect; do, obfuscated when it supports that,
+    /// and serve it as if it had connected.
+    pub fn answer_direct_callback(
+        &mut self,
+        addr: SocketAddrV4,
+        user_hash: Md4Hash,
+        connect_options: u8,
+        now: Instant,
+        new_conn: &mut dyn FnMut() -> ConnId,
+    ) -> Vec<Action> {
+        let Ok((session, hello)) = UploadSession::connect_on_request(self.ours.clone()) else {
+            return Vec::new();
+        };
+        let conn = new_conn();
+        self.peers.insert(
+            conn,
+            Peer {
+                session,
+                user_hash,
+                ip: IpAddr::V4(*addr.ip()),
+                ident: IdentState::NotAvailable,
+                last_seen: now,
+                hello: Some(hello),
+            },
+        );
+        vec![Action::Connect {
+            conn,
+            addr: SocketAddr::V4(addr),
+            obfuscate_for: (connect_options & 0x01 != 0).then_some(user_hash),
+        }]
+    }
+
     /// `AddUpNextClient` for a peer that is not connected: connect to it;
     /// the slot is given when it answers our hello. If it cannot be
     /// reached, the slot ends and it leaves the queue (`AddDeadSource`).

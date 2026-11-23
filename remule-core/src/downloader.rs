@@ -321,6 +321,8 @@ pub async fn run_with(
     let conn_cfg = ConnConfig::new(config.bandwidth.clone());
     let own_hash = queue.config().ours.user_hash;
     let mut buddies = Buddies::new(queue.config().ours.clone());
+    // `AddTrackCallbackRequests`: direct callback requests by IP.
+    let mut direct_callbacks: HashMap<Ipv4Addr, Instant> = HashMap::new();
     let mut ticker = tokio::time::interval(config.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -498,7 +500,21 @@ pub async fn run_with(
                         buddies.relay(buddy_id, file, from)
                     }
                     Some(Command::Udp { from, datagram }) => {
-                        if datagram.get(1) == Some(&(UdpOpcode::ReaskFilePing as u8)) {
+                        if datagram.get(1) == Some(&(UdpOpcode::DirectCallbackReq as u8)) {
+                            // `OP_DIRECTCALLBACKREQ`: only while we are
+                            // firewalled, one per IP every three minutes.
+                            direct_callbacks.retain(|_, t| now.saturating_duration_since(*t) < DIRECT_CALLBACK_THROTTLE);
+                            match (ed2k_peer::udp::UdpPacket::parse(&datagram, None), uploader.as_mut()) {
+                                (Ok(ed2k_peer::udp::UdpPacket::DirectCallbackReq { tcp_port, user_hash, connect_options }), Some(up))
+                                    if !queue.config().reachable && !direct_callbacks.contains_key(from.ip()) =>
+                                {
+                                    direct_callbacks.insert(*from.ip(), now);
+                                    let addr = SocketAddrV4::new(*from.ip(), tcp_port);
+                                    up.answer_direct_callback(addr, user_hash, connect_options, now, &mut || queue.new_conn_id())
+                                }
+                                _ => Vec::new(),
+                            }
+                        } else if datagram.get(1) == Some(&(UdpOpcode::ReaskFilePing as u8)) {
                             match uploader.as_mut() {
                                 Some(up) => up.udp_reask(from, &datagram, now),
                                 None => Vec::new(),
@@ -603,6 +619,10 @@ pub async fn run_with(
 }
 
 /// `OP_KAD_FWTCPCHECK_ACK` (eMule protocol, no payload).
+/// `kCallbackRequestThrottleMs`: a direct callback request per IP at most
+/// this often.
+const DIRECT_CALLBACK_THROTTLE: Duration = Duration::from_secs(3 * 60);
+
 /// Whether the first packet of an incoming connection is the hello of the
 /// firewalled node we offered to serve as its Kad buddy.
 fn is_expected_buddy(

@@ -1585,7 +1585,11 @@ fn a_udp_firewall_round() {
     let answer = net.nodes[n].answer_udp_check(from0, internal, external, key, false, net.now);
     assert_eq!(answer.len(), 1, "one port: one packet");
     net.post(n, answer);
-    net.deliver();
+    let events = net.deliver();
+    assert!(
+        events.contains(&(0, Event::UdpFirewalled(false))),
+        "{events:?}"
+    );
     assert_eq!(
         net.nodes[0].udp_firewall.peek(),
         (false, true),

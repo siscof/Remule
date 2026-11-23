@@ -140,6 +140,8 @@ pub enum Event {
     UdpFirewallCheck {
         tcp: SocketAddrV4,
     },
+    /// The UDP firewall test's answer changed: firewalled or open.
+    UdpFirewalled(bool),
     /// Someone wants the firewalled node whose buddy ID is `buddy_id` to
     /// connect to it (`KADEMLIA_CALLBACK_REQ`): if we serve that buddy,
     /// send it `OP_CALLBACK` (`BuildBuddyCallback`).
@@ -336,8 +338,13 @@ impl Kad {
     pub fn udp_check_ended(&mut self, ip: Ipv4Addr, cancelled: bool, now: u64) -> Output {
         let mut out = Output::default();
         let port = self.cfg.udp_port;
-        self.udp_firewall
-            .result(false, cancelled, u32::from(ip), 0, port, now);
+        if self
+            .udp_firewall
+            .result(false, cancelled, u32::from(ip), 0, port, now)
+        {
+            out.events
+                .push(Event::UdpFirewalled(self.udp_firewall.peek().0));
+        }
         self.udp_query_next(&mut out);
         out
     }
@@ -1510,8 +1517,13 @@ impl Kad {
                 let expected = incoming_port != 0
                     && (incoming_port == internal || Some(incoming_port) == external);
                 let ok = expected && error == 0;
-                self.udp_firewall
-                    .result(ok, !ok, ip, incoming_port, internal, now);
+                if self
+                    .udp_firewall
+                    .result(ok, !ok, ip, incoming_port, internal, now)
+                {
+                    out.events
+                        .push(Event::UdpFirewalled(self.udp_firewall.peek().0));
+                }
                 self.udp_query_next(out);
             }
             KadPacket::SearchKeyReq {

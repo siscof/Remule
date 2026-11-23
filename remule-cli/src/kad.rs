@@ -225,7 +225,8 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
                     Event::BuddyOffer { .. }
                     | Event::BuddyRequest { .. }
                     | Event::CallbackRequest { .. }
-                    | Event::UdpFirewallCheck { .. } => {}
+                    | Event::UdpFirewallCheck { .. }
+                    | Event::UdpFirewalled(_) => {}
                 }
             }
             _ = tick.tick() => {

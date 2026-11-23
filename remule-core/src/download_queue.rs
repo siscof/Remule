@@ -312,6 +312,23 @@ pub enum Report {
         kad_port: u16,
         serving: bool,
     },
+    /// A UDP firewall test over TCP ended without its answer having been
+    /// seen here (Kad reads the answer itself): `cancelled` when the request
+    /// never went out ([`crate::udp_check`]).
+    UdpCheckEnded {
+        ip: Ipv4Addr,
+        cancelled: bool,
+    },
+    /// A peer asked us to test its UDP ports (`OP_FWCHECKUDPREQ`): for Kad
+    /// to answer. `known`: it is one of our sources, so the test would
+    /// prove nothing.
+    UdpCheckRequested {
+        ip: Ipv4Addr,
+        internal: u16,
+        external: u16,
+        key: u32,
+        known: bool,
+    },
     /// A Kad buddy link ended.
     BuddyLost {
         addr: SocketAddrV4,
@@ -1297,6 +1314,12 @@ impl DownloadQueue {
                 && self.files.get(&s.file).is_some_and(|e| !e.done)
                 && (s.endpoint.user_hash == Some(hello.user_hash) || *s.endpoint.addr.ip() == ip)
         })
+    }
+
+    /// Whether a connection is a source's (`GetUploadState` or
+    /// `GetDownloadState` not `NONE`, as far as the queue goes).
+    pub fn is_source_conn(&self, conn: ConnId) -> bool {
+        self.source_of(conn).is_some()
     }
 
     /// Hand an unmatched incoming connection over to someone else (the

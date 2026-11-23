@@ -256,6 +256,7 @@ async fn the_daemon_runs_the_kad_firewall_check() {
             dir: kad_dir,
             nodes: None,
             bootstrap: Vec::new(),
+            warmup: crate::client::KAD_WARMUP,
         }),
         tcp_port,
         udp_port,

@@ -1447,3 +1447,40 @@ fn buddy_sources_round_trip() {
         Some(id)
     );
 }
+
+/// A source search with only one node known, that node close to the
+/// target: it answers the lookup with nothing closer, and is then asked
+/// for sources (`JumpStart` -> `StorePacket`).
+#[test]
+fn a_lone_close_node_is_asked_for_sources() {
+    let mut rng = StdRng::seed_from_u64(81);
+    let file = Md4Hash([0x5A; 16]);
+    let target = UInt128::from_be_bytes(file.0);
+    let ids = [UInt128::new(rng.gen()), target ^ UInt128::new(3)];
+    let mut net = Net::new(&ids, &mut rng);
+    let a1 = net.addrs[1];
+    let mut v = true;
+    net.nodes[0].routing.add(
+        ids[1],
+        u32::from(*a1.ip()),
+        a1.port(),
+        4662,
+        9,
+        UdpKey::default(),
+        &mut v,
+        false,
+        false,
+        1000,
+    );
+    let (_, out) = net.nodes[0].search_sources(file, 1000, net.now).unwrap();
+    net.post(0, out);
+    net.deliver();
+    net.run(10);
+    assert!(
+        net.requests
+            .iter()
+            .any(|(to, p, _)| *to == 1 && matches!(p, KadPacket::SearchSourceReq { .. })),
+        "{:?}",
+        net.requests
+    );
+}

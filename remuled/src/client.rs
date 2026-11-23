@@ -58,7 +58,7 @@ use remule_core::download_queue::UdpOut;
 /// Kad source searches are repeated this often (`GetKadSourceReaskTime`).
 const KAD_REASK: Duration = Duration::from_secs(30 * 60);
 /// Seconds after Kad connects before searching, so the table fills.
-const KAD_WARMUP: u64 = 20;
+pub const KAD_WARMUP: u64 = 20;
 /// Shared files are offered to the server this often (new ones as they come).
 const OFFER_EVERY: Duration = Duration::from_secs(60);
 
@@ -71,6 +71,8 @@ pub struct KadSettings {
     pub nodes: Option<PathBuf>,
     /// Nodes to bootstrap from as well.
     pub bootstrap: Vec<SocketAddrV4>,
+    /// Seconds after Kad connects before the first source searches.
+    pub warmup: u64,
 }
 
 /// How to run.
@@ -1003,7 +1005,8 @@ pub async fn run(
                         info!("[{:>5}s] Kad connected", start.elapsed().as_secs());
                         kad_connected = Some(Instant::now());
                         kad_since = Some(unix_now());
-                        next_kad_ask = Some(Instant::now() + Duration::from_secs(KAD_WARMUP));
+                        let warmup = c.kad.as_ref().map_or(KAD_WARMUP, |k| k.warmup);
+                        next_kad_ask = Some(Instant::now() + Duration::from_secs(warmup));
                     }
                     Some(KadEvent::Found { search, found: Found::Source(s) }) => {
                         if let (Some(&file), Some(ep)) = (kad_searches.get(&search), Endpoint::from_kad(&s)) {
@@ -1187,7 +1190,7 @@ pub async fn run(
                                     log_reach(t, was, reach);
                                 }
                                 Effect::StartKad => {
-                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None, bootstrap: Vec::new() });
+                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None, bootstrap: Vec::new(), warmup: KAD_WARMUP });
                                     // The stopped node's socket may still be closing.
                                     let mut started = Err(String::new());
                                     for _ in 0..20 {

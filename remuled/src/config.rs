@@ -327,6 +327,7 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
                 dir: dir.to_path_buf(),
                 nodes: None,
                 bootstrap: Vec::new(),
+                warmup: crate::client::KAD_WARMUP,
             })
         } else {
             notes.push("no nodes.dat (none could be fetched): Kad off".to_owned());

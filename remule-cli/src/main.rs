@@ -162,6 +162,9 @@ enum Command {
         /// Also bootstrap Kad from this node (IP:PORT).
         #[arg(long)]
         kad_bootstrap: Vec<std::net::SocketAddrV4>,
+        /// Seconds after Kad connects before the first source searches.
+        #[arg(long, default_value_t = 20)]
+        kad_warmup: u64,
         /// TCP port: told to peers and servers, and listened on for callbacks.
         #[arg(long, default_value_t = 4662)]
         port: u16,
@@ -377,6 +380,7 @@ fn main() -> ExitCode {
             kad,
             nodes,
             kad_bootstrap,
+            kad_warmup,
             port,
             udp_port,
             nick,
@@ -399,6 +403,7 @@ fn main() -> ExitCode {
             kad,
             kad_nodes: nodes,
             kad_bootstrap,
+            kad_warmup,
             tcp_port: port,
             udp_port,
             nick,

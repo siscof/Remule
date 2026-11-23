@@ -156,7 +156,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask2-daemon-only
+          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask1-daemon-only
       - name: Build amulecmd, amulegui, amuleapi and amuled
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
@@ -175,11 +175,11 @@ jobs:
           cp "$(find build -type f -name amulegui -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amuleapi -perm -u+x | head -1)" /opt/amulecmd/
           # amuled only, for udp-reask-with-amule.sh: SourceReaskMinutes may
-          # go down to 2 (aMule's least is 15), so aMule reasks within the
+          # go down to 1 (aMule's least is 15), so aMule reasks within the
           # job; the default stays 15. The tools above, amuleapi among them
           # (its preferences schema reads these limits), keep aMule's own.
           grep -q 'SOURCE_REASK_MINUTES{ 15, 15, 60 }' src/SourceSearchLimits.h
-          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 2, 15, 60 }/' src/SourceSearchLimits.h
+          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 1, 15, 60 }/' src/SourceSearchLimits.h
           cmake --build build --target amuled -j "$(nproc)"
           cp "$(find build -type f -name amuled -perm -u+x | head -1)" /opt/amulecmd/
           # amuleapi's curl suite and static frontend, where run-all.sh
@@ -192,7 +192,7 @@ jobs:
           cargo build --release -p remuled -p remulecmd -p remule-gui -p remule-cli
           cargo build --release -p remule-ec --example gui_check
       # MIGRATION_PLAN.md 8.6: aMule, queued by remule, asks again over UDP.
-      # Only this aMule has SourceReaskMinutes (2 minutes here: its least,
+      # Only this aMule has SourceReaskMinutes (1 minute here: its least,
       # 15, is lowered when it is built).
       - name: UDP reask, aMule asks remule
         run: bash scripts/interop/udp-reask-with-amule.sh

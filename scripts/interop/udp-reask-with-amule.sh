@@ -18,12 +18,12 @@
 #                          out at 100 s). Its trace must show the ping going
 #                          out obfuscated and aMule's rank coming back.
 #   DIRECTION=amule-asks   remule shares; aMule waits in its queue and asks
-#                          over UDP after SourceReaskMinutes (set to 2) less
+#                          over UDP after SourceReaskMinutes (set to 1) less
 #                          20 s. remule's trace must show the ping coming in
 #                          obfuscated and the rank going back. Needs an aMule
 #                          with SourceReaskMinutes (aMule-org 688c51eb) whose
-#                          least is lowered from 15 to 2 (CI patches
-#                          SourceSearchLimits.h); about 3 minutes.
+#                          least is lowered from 15 to 1 (CI patches
+#                          SourceSearchLimits.h); about a minute.
 #
 # Usage: DIRECTION=remule-asks scripts/interop/udp-reask-with-amule.sh
 # Environment:
@@ -140,7 +140,7 @@ GeoIPEnabled=0
 GeoIPAutoUpdate=0
 NewVersionCheck=0
 MaxUpload=$AMULE_MAX_UPLOAD
-SourceReaskMinutes=2
+SourceReaskMinutes=1
 [Obfuscation]
 IsClientCryptLayerSupported=1
 IsCryptLayerRequested=1
@@ -215,12 +215,12 @@ else
 	# slot does not hand it to aMule (the longest waiting gets it).
 	REMULE_TRACE=1 "$REMULE" download --share "$WORK/share" --server "$IP:$SERVER_PORT" --allow-lan \
 		--config "$WORK/c0" --temp "$WORK/t0" --incoming "$WORK/i0" \
-		--port 4700 --udp-port 4710 --max-upload 2 --duration 300 --status-every 30 \
+		--port 4700 --udp-port 4710 --max-upload 2 --duration 180 --status-every 30 \
 		>"$WORK/sharer.log" 2>&1 &
 	PIDS+=($!)
 	sleep 5
 	for n in 1 2 3 4; do
-		downloader "$n" --duration 300 >"$WORK/filler$n.log" 2>&1 &
+		downloader "$n" --duration 180 >"$WORK/filler$n.log" 2>&1 &
 		PIDS+=($!)
 		sleep 3
 	done
@@ -228,10 +228,10 @@ else
 	cmd "add $LINK"
 	T="$WORK/sharer.log"
 	A="$IP:$AMULE_UDP"
-	# aMule asks over UDP after 2 minutes less 20 s.
+	# aMule asks over UDP after a minute less 20 s.
 	start=$(date +%s)
 	until grep -q "^udp -> $A ReaskAck" "$T"; do
-		[ $(($(date +%s) - start)) -gt 240 ] && break
+		[ $(($(date +%s) - start)) -gt 120 ] && break
 		sleep 10
 	done
 	echo "waited $(($(date +%s) - start)) s"

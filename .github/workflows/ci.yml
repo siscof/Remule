@@ -156,7 +156,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask5
+          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask2
       - name: Build amulecmd, amulegui, amuleapi and amuled
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
@@ -164,11 +164,11 @@ jobs:
           cd /tmp/amule-src
           git fetch -q --depth 1 https://github.com/amule-org/amule.git "$AMULE_REF"
           git checkout -q FETCH_HEAD
-          # udp-reask-with-amule.sh: let SourceReaskMinutes go down to 5
+          # udp-reask-with-amule.sh: let SourceReaskMinutes go down to 2
           # (aMule's least is 15), so aMule reasks within the job. The
           # default stays 15, so nothing else changes.
           grep -q 'SOURCE_REASK_MINUTES{ 15, 15, 60 }' src/SourceSearchLimits.h
-          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 5, 15, 60 }/' src/SourceSearchLimits.h
+          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 2, 15, 60 }/' src/SourceSearchLimits.h
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_MONOLITHIC=NO -DBUILD_DAEMON=YES -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES -DBUILD_AMULEAPI=YES \
             -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
@@ -190,7 +190,7 @@ jobs:
           cargo build --release -p remuled -p remulecmd -p remule-gui -p remule-cli
           cargo build --release -p remule-ec --example gui_check
       # MIGRATION_PLAN.md 8.6: aMule, queued by remule, asks again over UDP.
-      # Only this aMule has SourceReaskMinutes (5 minutes here: its least,
+      # Only this aMule has SourceReaskMinutes (2 minutes here: its least,
       # 15, is lowered when it is built).
       - name: UDP reask, aMule asks remule
         run: bash scripts/interop/udp-reask-with-amule.sh

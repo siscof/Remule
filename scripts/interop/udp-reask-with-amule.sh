@@ -70,7 +70,12 @@ fail() {
 	for f in "$WORK"/asker.log "$WORK"/sharer.log; do
 		[ -f "$f" ] || continue
 		echo "----- $(basename "$f") (UDP, queue and connections) -----"
-		grep -E "^udp|queue rank|logged in|accepted|connected|sending|slot" "$f" | head -60
+		grep -E "^udp|queue rank|logged in|accepted|connected|sending|slot|upload|dropped|closed" "$f" | head -60
+	done
+	for f in "$WORK"/filler*.log; do
+		[ -f "$f" ] || continue
+		echo "----- $(basename "$f") (tail) -----"
+		grep -v '^[[:space:]]*$' "$f" | tail -6
 	done
 	echo "----- aMule -----"
 	cmd status | tail -6
@@ -204,14 +209,16 @@ if [ "$DIRECTION" = remule-asks ]; then
 	grep -q "^udp <- $UP_UDP ReaskAck obfuscated" "$T" || fail "aMule did not answer the UDP reask (obfuscated)"
 	echo "PASS: remule, queued by a stock aMule, asked again over UDP and got its rank, obfuscated both ways"
 else
-	# remule shares at 2 KiB/s: two slots, which two remules take.
+	# remule shares at 2 KiB/s: two slots. Four remules come first: two
+	# take the slots, two wait ahead of aMule, so a filler that drops its
+	# slot does not hand it to aMule (the longest waiting gets it).
 	REMULE_TRACE=1 "$REMULE" download --share "$WORK/share" --server "$IP:$SERVER_PORT" --allow-lan \
 		--config "$WORK/c0" --temp "$WORK/t0" --incoming "$WORK/i0" \
 		--port 4700 --udp-port 4710 --max-upload 2 --duration 1200 --status-every 60 \
 		>"$WORK/sharer.log" 2>&1 &
 	PIDS+=($!)
 	sleep 5
-	for n in 1 2; do
+	for n in 1 2 3 4; do
 		downloader "$n" --duration 1200 >"$WORK/filler$n.log" 2>&1 &
 		PIDS+=($!)
 		sleep 3

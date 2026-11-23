@@ -1087,3 +1087,128 @@ fn nodes_dat_round_trip() {
     assert_eq!(kad2.load_nodes(&back, 1000), back.contacts.len());
     assert!(back.contacts.len() >= 25 && back.contacts.len() <= n);
 }
+
+/// `SendLegacyChallenge` / `IsLegacyChallenge`: a pre-v7 node saying hello
+/// unproven is sent a plain `KADEMLIA2_REQ` for a random target; an answer
+/// with another target proves nothing, the right one verifies it. One
+/// challenge per IP while it waits; a v7 node gets a keyed ping instead.
+#[test]
+fn legacy_challenges_verify_old_nodes() {
+    use crate::node::CHALLENGE_TIME;
+    let mut rng = StdRng::seed_from_u64(9);
+    let ids = [UInt128::new(rng.gen()), UInt128::new(rng.gen())];
+    let mut net = Net::new(&ids, &mut rng);
+    let b = net.addrs[1];
+    let old = |version| {
+        KadPacket::HelloReq(Hello {
+            id: ids[1],
+            tcp_port: 4662,
+            version,
+            udp_port: None,
+            misc_options: 0,
+        })
+    };
+    let out = net.nodes[0].handle(b, &old(6).to_datagram(), 1000);
+    let challenges: Vec<(UInt128, UInt128, u8)> = out
+        .send
+        .iter()
+        .filter_map(|d| match KadPacket::parse(&d.bytes) {
+            Ok(KadPacket::Req {
+                count,
+                target,
+                receiver,
+            }) => Some((target, receiver, count)),
+            _ => None,
+        })
+        .collect();
+    // Plain (it parses as is), for the contact's ID, KADEMLIA_FIND_VALUE.
+    assert_eq!(challenges.len(), 1);
+    let (challenge, receiver, count) = challenges[0];
+    assert_eq!((receiver, count), (ids[1], 0x02));
+    assert!(!net.nodes[0].routing.get(ids[1]).unwrap().ip_verified);
+
+    // A second hello while it waits: no second challenge.
+    let out = net.nodes[0].handle(b, &old(6).to_datagram(), 1001);
+    assert!(!out
+        .send
+        .iter()
+        .any(|d| matches!(KadPacket::parse(&d.bytes), Ok(KadPacket::Req { .. }))));
+
+    // The wrong target: nothing verified. It used up the request it
+    // answered (`CHECK_TRACKED_PACKET`), as in aMule.
+    let wrong = KadPacket::Res {
+        target: UInt128::new(12345),
+        contacts: vec![],
+    };
+    net.nodes[0].handle(b, &wrong.to_datagram(), 1002);
+    assert!(!net.nodes[0].routing.get(ids[1]).unwrap().ip_verified);
+    // Once that challenge expires, a new hello brings a new one, and the
+    // right answer to it verifies the contact.
+    let later = 1000 + CHALLENGE_TIME + 1;
+    let out = net.nodes[0].handle(b, &old(6).to_datagram(), later);
+    let (challenge2, ..) = out
+        .send
+        .iter()
+        .find_map(|d| match KadPacket::parse(&d.bytes) {
+            Ok(KadPacket::Req {
+                target, receiver, ..
+            }) => Some((target, receiver)),
+            _ => None,
+        })
+        .expect("a new challenge once the first expired");
+    assert_ne!(challenge2, challenge);
+    let right = KadPacket::Res {
+        target: challenge2,
+        contacts: vec![],
+    };
+    net.nodes[0].handle(b, &right.to_datagram(), later + 1);
+    assert!(net.nodes[0].routing.get(ids[1]).unwrap().ip_verified);
+
+    // Version 7: a ping, no challenge.
+    let mut net = Net::new(&ids, &mut rng);
+    let out = net.nodes[0].handle(b, &old(7).to_datagram(), 1000);
+    let parsed: Vec<KadPacket> = out
+        .send
+        .iter()
+        .map(|d| read_as(&net.nodes[1], net.addrs[0], &d.bytes))
+        .collect();
+    assert!(parsed.contains(&KadPacket::Ping));
+    assert!(!parsed.iter().any(|p| matches!(p, KadPacket::Req { .. })));
+    // Version 8 proves itself with the ACK: neither.
+    let mut net = Net::new(&ids, &mut rng);
+    let out = net.nodes[0].handle(b, &old(8).to_datagram(), 1000);
+    assert!(!out.send.iter().any(|d| matches!(
+        read_as(&net.nodes[1], net.addrs[0], &d.bytes),
+        KadPacket::Ping | KadPacket::Req { .. }
+    )));
+}
+
+/// A pre-v7 node's answer to our hello is challenged too (it can be
+/// spoofed by whoever knows we said hello).
+#[test]
+fn an_old_nodes_hello_answer_is_challenged() {
+    let mut rng = StdRng::seed_from_u64(10);
+    let ids = [UInt128::new(rng.gen()), UInt128::new(rng.gen())];
+    let mut net = Net::new(&ids, &mut rng);
+    let b = net.addrs[1];
+    let hello = KadPacket::HelloReq(Hello {
+        id: ids[0],
+        tcp_port: 4662,
+        version: 9,
+        udp_port: None,
+        misc_options: 0,
+    });
+    let _ = net.nodes[0].send_to_test(&hello, b, 6, None, 1000);
+    let res = KadPacket::HelloRes(Hello {
+        id: ids[1],
+        tcp_port: 4662,
+        version: 6,
+        udp_port: None,
+        misc_options: 0,
+    });
+    let out = net.nodes[0].handle(b, &res.to_datagram(), 1001);
+    assert!(out.send.iter().any(|d| matches!(
+        KadPacket::parse(&d.bytes),
+        Ok(KadPacket::Req { receiver, .. }) if receiver == ids[1]
+    )));
+}

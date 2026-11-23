@@ -24,7 +24,7 @@ pub mod udp;
 pub mod upload;
 
 pub use hello::{Hello, MiscOptions1, MiscOptions2, MuleInfo};
-pub use packets::{BadPacket, Block, ParseContext, PeerPacket};
+pub use packets::{BadPacket, Block, BuddyCallback, ParseContext, PeerPacket};
 pub use part_status::PartStatus;
 
 #[cfg(test)]

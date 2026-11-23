@@ -198,6 +198,15 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
             ..
         } => format!("{addr}: queue rank {n}"),
         Report::DownloadStarted { file, addr } => format!("{addr}: sending {}", name(file)),
+        Report::BuddyLinked {
+            addr,
+            serving: false,
+        } => format!("Kad: {addr} is our buddy"),
+        Report::BuddyLinked {
+            addr,
+            serving: true,
+        } => format!("Kad: we are {addr}'s buddy"),
+        Report::BuddyLost { addr, why, .. } => format!("Kad: buddy {addr} lost ({why})"),
         Report::PartVerified { file, part } => format!("{}: part {part} verified", name(file)),
         Report::PartCorrupt { file, part } => format!("{}: part {part} CORRUPT", name(file)),
         Report::AichRecovered { file, part, bytes } => {

@@ -271,8 +271,28 @@ pub enum PeerPacket {
     /// `OP_AICHANSWER`; `None` when the peer could not answer (a packet of
     /// at most 16 bytes).
     AichAnswer(Option<AichRecovery>),
+    /// `OP_BUDDYPING`: a firewalled client keeps its Kad buddy link alive.
+    BuddyPing,
+    /// `OP_BUDDYPONG`
+    BuddyPong,
+    /// `OP_CALLBACK`, from our buddy: someone wants us to connect to it.
+    Callback(BuddyCallback),
     /// Anything else, for the caller to handle or ignore.
     Other(Packet),
+}
+
+/// What an `OP_CALLBACK` carries (`BuildBuddyCallback`):
+/// `<buddy ID 16><file hash 16><IP 4><TCP port 2>`, the ID and the hash
+/// written as Kad writes a 128-bit number (`WriteUInt128`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuddyCallback {
+    /// The buddy ID (in aMule's byte order or eMule's: compare both).
+    pub buddy_id: ed2k_types::UInt128,
+    /// The file (`ToByteArray` of the number).
+    pub file: Md4Hash,
+    /// The requester, to connect to.
+    pub ip: std::net::Ipv4Addr,
+    pub tcp_port: u16,
 }
 
 /// The recovery data in an `OP_AICHANSWER`.
@@ -291,6 +311,27 @@ fn edonkey(op: Standard, payload: Vec<u8>) -> Packet {
 
 fn emule(op: Extended, payload: Vec<u8>) -> Packet {
     Packet::new(Protocol::Emule, op, payload)
+}
+
+/// `OP_BUDDYPING`
+pub fn buddy_ping() -> Packet {
+    emule(Extended::BuddyPing, Vec::new())
+}
+
+/// `OP_BUDDYPONG`
+pub fn buddy_pong() -> Packet {
+    emule(Extended::BuddyPong, Vec::new())
+}
+
+/// `OP_CALLBACK`. The IP is written as Kad writes it (`WriteUInt32` of the
+/// IP as a number, first octet highest).
+pub fn callback(c: &BuddyCallback) -> Packet {
+    let mut p = Vec::with_capacity(38);
+    p.extend_from_slice(&c.buddy_id.to_wire_bytes());
+    p.extend_from_slice(&ed2k_types::UInt128::from_be_bytes(c.file.0).to_wire_bytes());
+    p.extend_from_slice(&u32::from(c.ip).to_le_bytes());
+    p.extend_from_slice(&c.tcp_port.to_le_bytes());
+    emule(Extended::Callback, p)
 }
 
 fn hash_only(op: Standard, hash: Md4Hash) -> Packet {
@@ -829,6 +870,26 @@ impl PeerPacket {
                     ));
                 }
                 PeerPacket::QueueRanking(u16::from_le_bytes([p[0], p[1]]))
+            }
+            Extended::BuddyPing => PeerPacket::BuddyPing,
+            Extended::BuddyPong => PeerPacket::BuddyPong,
+            Extended::Callback => {
+                if p.len() < 38 {
+                    return Err(BadPacket::new(
+                        "callback",
+                        format!("{} bytes, not 38", p.len()),
+                    ));
+                }
+                let mut buddy_id = [0u8; 16];
+                buddy_id.copy_from_slice(&p[..16]);
+                let mut file = [0u8; 16];
+                file.copy_from_slice(&p[16..32]);
+                PeerPacket::Callback(BuddyCallback {
+                    buddy_id: ed2k_types::UInt128::from_wire_bytes(buddy_id),
+                    file: Md4Hash(ed2k_types::UInt128::from_wire_bytes(file).to_be_bytes()),
+                    ip: std::net::Ipv4Addr::from(u32::from_le_bytes([p[32], p[33], p[34], p[35]])),
+                    tcp_port: u16::from_le_bytes([p[36], p[37]]),
+                })
             }
             Extended::RequestPartsI64 => parse_request_parts(p, true)?,
             Extended::SendingPartI64 => parse_block(p, false, true)?,

@@ -691,3 +691,31 @@ fn truncated_multipackets() {
         assert!(PeerPacket::parse(q, ctx(true, 2)).is_err(), "{n} bytes");
     }
 }
+
+/// The buddy packets (`OP_BUDDYPING`, `OP_BUDDYPONG`, `OP_CALLBACK`): the
+/// callback's IP as Kad writes it, a number with the first octet highest.
+#[test]
+fn buddy_packets() {
+    use crate::packets::{buddy_ping, buddy_pong, callback};
+    use crate::BuddyCallback;
+    let ctx = ParseContext::default();
+    let round =
+        |p: Packet| PeerPacket::parse(Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap(), ctx);
+    assert_eq!(round(buddy_ping()).unwrap(), PeerPacket::BuddyPing);
+    assert_eq!(round(buddy_pong()).unwrap(), PeerPacket::BuddyPong);
+    let c = BuddyCallback {
+        buddy_id: ed2k_types::UInt128::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+        file: Md4Hash([7; 16]),
+        ip: std::net::Ipv4Addr::new(203, 0, 113, 9),
+        tcp_port: 4711,
+    };
+    let p = callback(&c);
+    assert_eq!(p.opcode, 0x99);
+    // WriteUInt128: four 32-bit words, most significant first, each little-endian.
+    assert_eq!(&p.payload[..4], &[4, 3, 2, 1]);
+    assert_eq!(&p.payload[32..38], &[9, 113, 0, 203, 0x67, 0x12]);
+    assert_eq!(round(p).unwrap(), PeerPacket::Callback(c));
+    let mut short = callback(&c);
+    short.payload.truncate(37);
+    assert!(PeerPacket::parse(short, ctx).is_err());
+}

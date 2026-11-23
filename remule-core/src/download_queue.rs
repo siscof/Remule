@@ -258,6 +258,18 @@ pub enum Report {
     KadFirewallAck {
         ip: Ipv4Addr,
     },
+    /// A Kad buddy link is up ([`crate::buddy`]): ours (we are firewalled),
+    /// or one we serve.
+    BuddyLinked {
+        addr: SocketAddrV4,
+        serving: bool,
+    },
+    /// A Kad buddy link ended.
+    BuddyLost {
+        addr: SocketAddrV4,
+        serving: bool,
+        why: String,
+    },
 }
 
 /// Where a source stands (`EDownloadState`, simplified).

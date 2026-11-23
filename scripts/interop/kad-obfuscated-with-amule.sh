@@ -21,13 +21,13 @@
 # Usage: scripts/interop/kad-obfuscated-with-amule.sh
 # Environment:
 #   REMULE=target/release/remule   the remule binary
-#   DURATION=180                   seconds remule's Kad node runs
+#   DURATION=240                   seconds remule's Kad node runs
 #   KEEP=1                         keep the work directory
 
 set -uo pipefail
 
 REMULE=$(realpath "${REMULE:-target/release/remule}")
-DURATION=${DURATION:-180}
+DURATION=${DURATION:-240}
 AMULE_TCP=4662
 AMULE_UDP=4672
 REMULE_UDP=4673
@@ -148,8 +148,17 @@ for _ in $(seq 1 120); do
 	grep -qF "kad <- $A HelloRe" "$T" && break
 	sleep 1
 done
+# aMule searches only contacts it has checked itself (its small timer, about
+# a minute): ask again every 20 s until the request reaches remule.
 sleep 10
-cmd "search kad $WORD"
+while kill -0 "$RPID" 2>/dev/null; do
+	echo "aMule: search kad $WORD ($(date +%T))"
+	cmd "search kad $WORD" | grep -v "^This is\|^Creating\|^Succeeded"
+	for _ in $(seq 1 20); do
+		grep -qF "kad <- $A SearchKeyReq" "$T" && break 2
+		sleep 1
+	done
+done
 wait "$RPID"
 echo "remule exited with $?"
 cmd status | grep -i "kad" || true

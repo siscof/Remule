@@ -90,7 +90,10 @@ pub fn classify(datagram: &[u8], from: SocketAddrV4, user_hash: Md4Hash) -> Opti
 /// otherwise. `true` when obfuscated.
 pub fn encode(d: &UdpOut, public_ip: Option<Ipv4Addr>) -> (Vec<u8>, bool) {
     let ip = public_ip.map_or(0, u32::from);
-    match (d.obfuscate_for, udp::send_form(d.obfuscate_for.is_some(), false, false, ip)) {
+    match (
+        d.obfuscate_for,
+        udp::send_form(d.obfuscate_for.is_some(), false, false, ip),
+    ) {
         (Some(receiver), SendForm::Obfuscated) => {
             let key = ClientKey::Ed2k {
                 receiver,
@@ -119,7 +122,13 @@ impl UdpPort {
         let port = socket.local_addr()?.port();
         let kad_in: KadIn = Arc::default();
         let trace = crate::kad::trace_from_env();
-        let task = tokio::spawn(receive(socket.clone(), user_hash, ed2k, kad_in.clone(), trace));
+        let task = tokio::spawn(receive(
+            socket.clone(),
+            user_hash,
+            ed2k,
+            kad_in.clone(),
+            trace,
+        ));
         Ok(UdpPort {
             socket,
             kad_in,
@@ -215,7 +224,9 @@ mod tests {
     fn obfuscated_both_ways() {
         let theirs = Md4Hash([0x42; 16]);
         let ours_ip = Ipv4Addr::new(203, 0, 113, 9);
-        let ping = vec![0xC5, 0x90, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let ping = vec![
+            0xC5, 0x90, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ];
         let out = UdpOut {
             to: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 4672),
             payload: ping.clone(),
@@ -230,7 +241,12 @@ mod tests {
         assert_eq!(d.payload, ping);
         // The wrong receiver, or the wrong sender IP: not ours.
         assert!(classify(&bytes, from, Md4Hash([1; 16])).is_none());
-        assert!(classify(&bytes, SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 1), theirs).is_none());
+        assert!(classify(
+            &bytes,
+            SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 1),
+            theirs
+        )
+        .is_none());
         // Without our public IP, plain.
         let (bytes, obfuscated) = encode(&out, None);
         assert!(!obfuscated);

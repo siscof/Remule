@@ -48,12 +48,12 @@ use tracing::{debug, info, warn};
 
 use crate::ec::{self, Control, DownloadIds, EcSettings, KadStatus, ServerStatus, Status};
 use crate::ec_search;
-use crate::udp_port::UdpPort;
-use remule_core::download_queue::UdpOut;
 use crate::ec_servers::{Effect, ServerList};
 use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
+use crate::udp_port::UdpPort;
+use remule_core::download_queue::UdpOut;
 
 /// Kad source searches are repeated this often (`GetKadSourceReaskTime`).
 const KAD_REASK: Duration = Duration::from_secs(30 * 60);
@@ -779,18 +779,21 @@ pub async fn run(
 
     let mut kad_node = match &c.kad {
         Some(k) => Some(
-            start_kad(udp_port.as_ref(), &KadStart {
-                dir: k.dir.clone(),
-                nodes: k.nodes.clone(),
-                bootstrap: Vec::new(),
-                udp_port: c.udp_port,
-                tcp_port: c.tcp_port,
-                user_hash: c.user_hash,
-                reachable: c.reachable,
-                listening,
-                allow_lan: c.allow_lan,
-                trace_wire: kad::trace_from_env(),
-            })
+            start_kad(
+                udp_port.as_ref(),
+                &KadStart {
+                    dir: k.dir.clone(),
+                    nodes: k.nodes.clone(),
+                    bootstrap: Vec::new(),
+                    udp_port: c.udp_port,
+                    tcp_port: c.tcp_port,
+                    user_hash: c.user_hash,
+                    reachable: c.reachable,
+                    listening,
+                    allow_lan: c.allow_lan,
+                    trace_wire: kad::trace_from_env(),
+                },
+            )
             .await?,
         ),
         None => None,

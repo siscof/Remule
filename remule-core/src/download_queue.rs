@@ -13,8 +13,9 @@
 //!
 //! Sources come from servers, Kad and source exchange, all through
 //! [`DownloadQueue::add_source`]. Only sources that can be connected to
-//! directly are used: callbacks through a server or a Kad buddy, and UDP
-//! reasks, are not ported yet.
+//! directly are used: callbacks through a server or a Kad buddy are not
+//! ported yet. A source whose queue we wait in is asked again over UDP
+//! first ([`Action::SendUdp`], [`DownloadQueue::udp_packet`]).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};

@@ -14,20 +14,25 @@
 #     decrypts and parses;
 #   - aMule's packets carry the verify key remule gave it (receiver key
 #     valid), so aMule read the sender key out of remule's packets;
-#   - aMule's own Kad keyword search, started with amulecmd, reaches remule
-#     obfuscated.
+#   - aMule's own requests (its ping, its firewall check) reach remule
+#     obfuscated, and remule's answers go back obfuscated.
 # Nothing touches the real network.
+#
+# Not checked: aMule searching remule. aMule's Kad never takes a LAN address
+# into its routing table, whatever FilterLanIPs says (IsGoodIPPort is
+# IsGoodIP(ip, true)), so on this machine's private address remule is never
+# its contact: it answers remule but asks it nothing a search would.
 #
 # Usage: scripts/interop/kad-obfuscated-with-amule.sh
 # Environment:
 #   REMULE=target/release/remule   the remule binary
-#   DURATION=240                   seconds remule's Kad node runs
+#   DURATION=120                   seconds remule's Kad node runs
 #   KEEP=1                         keep the work directory
 
 set -uo pipefail
 
 REMULE=$(realpath "${REMULE:-target/release/remule}")
-DURATION=${DURATION:-240}
+DURATION=${DURATION:-120}
 AMULE_TCP=4662
 AMULE_UDP=4672
 REMULE_UDP=4673
@@ -142,23 +147,6 @@ REMULE_TRACE=1 "$REMULE" kad --dir "$WORK/remule-kad" --port "$REMULE_UDP" \
 	>"$WORK/remule.out" 2>"$T" &
 RPID=$!
 PIDS+=($RPID)
-
-# Once they have said hello, aMule searches Kad: its only contact is remule.
-for _ in $(seq 1 120); do
-	grep -qF "kad <- $A HelloRe" "$T" && break
-	sleep 1
-done
-# aMule searches only contacts it has checked itself (its small timer, about
-# a minute): ask again every 20 s until the request reaches remule.
-sleep 10
-while kill -0 "$RPID" 2>/dev/null; do
-	echo "aMule: search kad $WORD ($(date +%T))"
-	cmd "search kad $WORD" | grep -v "^This is\|^Creating\|^Succeeded"
-	for _ in $(seq 1 20); do
-		grep -qF "kad <- $A SearchKeyReq" "$T" && break 2
-		sleep 1
-	done
-done
 wait "$RPID"
 echo "remule exited with $?"
 cmd status | grep -i "kad" || true
@@ -182,5 +170,9 @@ grep -F "kad <- $A " "$T" | grep -v " BootstrapRes " | grep -qF " plain" &&
 grep -qE "kad <- $A [A-Za-z0-9]+ obfuscated \(Kad ID\)" "$T" ||
 	fail "aMule never keyed a packet on remule's Kad ID"
 grep -qF "receiver key valid" "$T" || fail "aMule never sent back the verify key remule gave it"
-grep -qE "kad <- $A SearchKeyReq obfuscated" "$T" || fail "aMule's Kad search did not reach remule obfuscated"
+# aMule's own requests, and remule's answers to them.
+grep -qE "kad <- $A (Ping|Firewalled2Req) obfuscated" "$T" ||
+	fail "no request of aMule's own reached remule obfuscated"
+grep -qE "kad -> $A Pong obfuscated" "$T" || fail "remule did not answer aMule's ping obfuscated"
+grep -qE "kad -> $A SearchKeyReq obfuscated" "$T" || fail "remule's search did not reach aMule obfuscated"
 echo "PASS: Kad with a stock aMule, obfuscated both ways after the bootstrap"

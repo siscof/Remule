@@ -37,6 +37,7 @@ use crate::packets::{ContactRecord, Hello, KadPacket, SearchAnswer, SizedTag};
 use crate::routing::{RoutingTable, CONTACT_FILE_LIMIT};
 use crate::search::{keyword_target, Action, Found, Search, SearchKind, SEARCH_TOLERANCE};
 use crate::tracking::{Admission, InTracker};
+use crate::udp_firewall::{ExternalPort, UdpFirewallTester};
 use ed2k_codec::{Tag, TagName, TagValue};
 use ed2k_types::kad::{
     FindType, KADEMLIAMAXNOTECOMMENTLEN, KADEMLIAMAXNOTENAMELEN, KADEMLIAMAXSOURCEEXTRABYTES,
@@ -65,6 +66,8 @@ pub struct Config {
     /// Our user hash (what eD2k-keyed obfuscated packets to us use).
     pub user_hash: Md4Hash,
     pub tcp_port: u16,
+    /// Our (internal) Kad UDP port, which UDP firewall checks are sent to.
+    pub udp_port: u16,
     /// Nothing listens on `tcp_port`: say we are TCP-firewalled, and run no
     /// firewall checks, ours or others'. Otherwise the application has the
     /// TCP side: it passes on the acks peers send there
@@ -128,6 +131,13 @@ pub enum Event {
     BuddyRequest {
         buddy_id: UInt128,
         user_hash: Md4Hash,
+        tcp: SocketAddrV4,
+    },
+    /// The UDP firewall test wants this node asked, over TCP
+    /// (`DoRequestFirewallCheckUDP`): connect, say hello, send
+    /// `OP_FWCHECKUDPREQ` ([`Kad::udp_check_request`]); if the connection
+    /// ends without the answer coming, [`Kad::udp_check_ended`].
+    UdpFirewallCheck {
         tcp: SocketAddrV4,
     },
     /// Someone wants the firewalled node whose buddy ID is `buddy_id` to
@@ -245,6 +255,10 @@ pub struct Kad {
     /// `m_nextFindBuddy`, and the flag it sets (`SetFindBuddy`).
     next_find_buddy: u64,
     find_buddy: bool,
+    /// `CUDPFirewallTester`, and the external port it needs first.
+    pub udp_firewall: UdpFirewallTester,
+    pub extern_port: ExternalPort,
+    next_extern_lookup: u64,
 }
 
 /// How long a legacy challenge waits for its answer.
@@ -291,6 +305,110 @@ impl Kad {
             // firewalled answer is not a false one.
             next_find_buddy: now + 5 * 60,
             find_buddy: false,
+            udp_firewall: UdpFirewallTester::default(),
+            extern_port: ExternalPort::default(),
+            next_extern_lookup: now,
+        }
+    }
+
+    /// `IsFirewalledUDP(true)`, as far as it is known: the test's answer once
+    /// it has one, else what we were told (`Config::udp_firewalled`).
+    pub fn udp_firewalled(&mut self, now: u64) -> bool {
+        let tcp = self.is_firewalled(now);
+        if self.udp_firewall.is_verified(now) {
+            self.udp_firewall.is_firewalled(true, tcp, now)
+        } else {
+            self.cfg.udp_firewalled
+        }
+    }
+
+    /// The data of `OP_FWCHECKUDPREQ` for a node at `ip`
+    /// (`SendFirewallCheckUDPRequest`): our internal and external Kad
+    /// ports and our verify key for it.
+    pub fn udp_check_request(&self, ip: Ipv4Addr) -> (u16, u16, u32) {
+        let external = self.extern_port.get().unwrap_or(0);
+        (self.cfg.udp_port, external, self.verify_key(u32::from(ip)))
+    }
+
+    /// A UDP firewall test over TCP with the node at `ip` ended without its
+    /// answer: `cancelled` when the request never went out (it proves
+    /// nothing), else the test failed.
+    pub fn udp_check_ended(&mut self, ip: Ipv4Addr, cancelled: bool, now: u64) -> Output {
+        let mut out = Output::default();
+        let port = self.cfg.udp_port;
+        self.udp_firewall
+            .result(false, cancelled, u32::from(ip), 0, port, now);
+        self.udp_query_next(&mut out);
+        out
+    }
+
+    /// `ProcessFirewallCheckUDPRequest`: a node asked us over TCP
+    /// (`OP_FWCHECKUDPREQ`) to test its UDP ports. Send `KADEMLIA2_FIREWALLUDP`
+    /// to its internal port, and its external one if different, keyed with
+    /// its verify key; with an error when we already know it (`known`, or it
+    /// is in our routing table), as the test would prove nothing.
+    pub fn answer_udp_check(
+        &mut self,
+        to: Ipv4Addr,
+        internal: u16,
+        external: u16,
+        sender_key: u32,
+        known: bool,
+        now: u64,
+    ) -> Vec<Datagram> {
+        if internal == 0 {
+            return Vec::new();
+        }
+        let ip = u32::from(to);
+        let error = u8::from(known || self.routing.get_by_addr(ip, 0, false).is_some());
+        let key = UdpKey::new(sender_key, self.routing.public_ip);
+        let mut out = Vec::new();
+        for port in [internal, external] {
+            if port == 0 || (port == external && external == internal && !out.is_empty()) {
+                continue;
+            }
+            let p = KadPacket::FirewallUdp {
+                error,
+                incoming_port: port,
+            };
+            out.push(self.packet(&p, SocketAddrV4::new(to, port), 0, None, key, now));
+        }
+        out
+    }
+
+    /// Start a `NODEFWCHECKUDP` lookup (`FindNodeFWCheckUDP`).
+    fn start_udp_check_lookup(&mut self, now: u64, out: &mut Output) {
+        let ids: Vec<u32> = self
+            .searches
+            .iter()
+            .filter(|(_, s)| s.kind == SearchKind::NodeFwCheckUdp)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            if let Some(s) = self.searches.remove(&id) {
+                self.by_target.remove(&s.target);
+            }
+        }
+        let target = UInt128::new(self.rng.gen());
+        if let Some((_, d)) = self.start(SearchKind::NodeFwCheckUdp, target, now) {
+            out.send.extend(d);
+        }
+    }
+
+    /// `QueryNextClient`: hand the next test contact to the application.
+    fn udp_query_next(&mut self, out: &mut Output) {
+        let ours = self.cfg.kad_id;
+        let public = self.routing.public_ip;
+        let known_port = !self.extern_port.finding(false);
+        let routing = &self.routing;
+        if let Some(c) = self.udp_firewall.next_client(
+            known_port,
+            |c| c.id == ours || (public != 0 && c.ip == public),
+            |ip| routing.get_by_addr(ip, 0, false).is_some(),
+        ) {
+            out.events.push(Event::UdpFirewallCheck {
+                tcp: SocketAddrV4::new(Ipv4Addr::from(c.ip), c.tcp_port),
+            });
         }
     }
 
@@ -865,6 +983,30 @@ impl Kad {
         if self.next_firewall_check <= now {
             self.next_firewall_check = now + RECHECK_INTERVAL;
             self.recheck.start(now);
+            // `ReCheckFirewallUDP(false)` too.
+            if self.last_contact != 0 && self.udp_firewall.recheck(false, now) {
+                // Our external port may have changed too (`FindExternKadPort(true)`).
+                self.extern_port.finding(true);
+                self.start_udp_check_lookup(now, &mut out);
+            }
+        }
+        // While the UDP test waits for our external port, a node is pinged
+        // every 15 seconds; its pong says the port it saw.
+        if self.next_extern_lookup <= now {
+            self.next_extern_lookup = now + 15;
+            if self.udp_firewall.is_running() && self.extern_port.finding(false) {
+                let picked = self
+                    .routing
+                    .contacts()
+                    .filter(|c| c.version >= 6 && c.kind <= 3)
+                    .map(|c| (c.addr(), c.version, c.id, c.udp_key))
+                    .collect::<Vec<_>>();
+                if !picked.is_empty() {
+                    let (to, version, id, key) = picked[self.rng.gen_range(0..picked.len())];
+                    let d = self.packet(&KadPacket::Ping, to, version, Some(id), key, now);
+                    out.send.push(d);
+                }
+            }
         }
         let firewalled = self.is_firewalled(now);
         if firewalled != self.shown_firewalled {
@@ -885,7 +1027,10 @@ impl Kad {
                     self.by_target.remove(&s.target);
                     // Lookups and publishes report how they went; for a
                     // publish, answers are the nodes that took it.
-                    if !matches!(s.kind, SearchKind::Node | SearchKind::NodeComplete) {
+                    if !matches!(
+                        s.kind,
+                        SearchKind::Node | SearchKind::NodeComplete | SearchKind::NodeFwCheckUdp
+                    ) {
                         out.events.push(Event::SearchDone {
                             search: id,
                             answers: s.answers,
@@ -985,6 +1130,10 @@ impl Kad {
         }
         if self.last_contact == 0 {
             out.events.push(Event::Connected);
+            // `CUDPFirewallTester::Connected`
+            if self.udp_firewall.connected(now) {
+                self.start_udp_check_lookup(now, &mut out);
+            }
         }
         self.last_contact = now;
         self.dispatch(packet, from, valid_receiver_key, sender_key, now, &mut out);
@@ -1096,6 +1245,12 @@ impl Kad {
                 if unproven && h.version < 7 {
                     self.send_legacy_challenge(to, h.id, now, out);
                 }
+                // Do we need to find out our external port?
+                if !(unproven && h.version == 7) && h.version > 5 && self.extern_port.finding(false)
+                {
+                    let d = self.packet(&KadPacket::Ping, to, h.version, None, sender_key, now);
+                    out.send.push(d);
+                }
                 self.firewalled_check(to, h.version, sender_key, now, out);
             }
             KadPacket::HelloRes(h) => {
@@ -1158,6 +1313,48 @@ impl Kad {
             KadPacket::Res { target, contacts } => {
                 if !self.was_requested(ip, Opcode::Req, now) {
                     self.stats.unrequested += 1;
+                    return;
+                }
+                // A UDP firewall check lookup: the nodes it names go to the
+                // tester only, neither into the routing table nor asked
+                // anything over UDP (they must not have heard from us).
+                let fw_search = self
+                    .by_target
+                    .get(&target)
+                    .and_then(|id| self.searches.get(id))
+                    .is_some_and(|s| s.kind == SearchKind::NodeFwCheckUdp);
+                if fw_search && self.udp_firewall.is_running() {
+                    let filter_lan = self.routing.filter_lan;
+                    for c in contacts {
+                        if c.version > 1
+                            && is_good_ip_port(c.ip, c.udp_port, filter_lan)
+                            && !(c.udp_port == 53 && c.version <= 5)
+                        {
+                            self.udp_firewall.add_possible(Contact::new(
+                                c.id,
+                                c.ip,
+                                c.udp_port,
+                                c.tcp_port,
+                                c.version,
+                                UdpKey::default(),
+                                false,
+                                now,
+                            ));
+                            // `AddPossibleTestContact` asks the next each time.
+                            self.udp_query_next(out);
+                        }
+                    }
+                    if let Some(s) = self
+                        .by_target
+                        .get(&target)
+                        .and_then(|id| self.searches.get_mut(id))
+                    {
+                        let actions = s.process_response(ip, port, sender_key, Vec::new(), now);
+                        for a in actions {
+                            let d = self.action(a, target, now);
+                            out.send.push(d);
+                        }
+                    }
                     return;
                 }
                 // The answer to a legacy challenge: the contact is verified,
@@ -1236,7 +1433,7 @@ impl Kad {
                 user_hash,
                 tcp_port,
             } => {
-                if self.is_firewalled(now) || self.cfg.udp_firewalled || self.serving_buddy {
+                if self.is_firewalled(now) || self.udp_firewalled(now) || self.serving_buddy {
                     return;
                 }
                 let res = KadPacket::FindBuddyRes {
@@ -1295,8 +1492,27 @@ impl Kad {
             }
             KadPacket::Pong { port } => {
                 if self.was_requested(ip, Opcode::Ping, now) {
-                    self.external_port = Some(port);
+                    // `SetExternKadPort` while it is looked for.
+                    if self.extern_port.finding(false) {
+                        self.extern_port.vote(port, ip);
+                        self.udp_query_next(out);
+                    }
+                    self.external_port = self.extern_port.get().or(Some(port));
                 }
+            }
+            // `Process2FirewallUDP`: the answer to our UDP firewall test.
+            KadPacket::FirewallUdp {
+                error,
+                incoming_port,
+            } => {
+                let internal = self.cfg.udp_port;
+                let external = self.extern_port.get();
+                let expected = incoming_port != 0
+                    && (incoming_port == internal || Some(incoming_port) == external);
+                let ok = expected && error == 0;
+                self.udp_firewall
+                    .result(ok, !ok, ip, incoming_port, internal, now);
+                self.udp_query_next(out);
             }
             KadPacket::SearchKeyReq {
                 target,

@@ -159,6 +159,14 @@ impl UdpFirewallTester {
         }
     }
 
+    /// The answer as it stands (firewalled, verified), without the timers.
+    pub fn peek(&self) -> (bool, bool) {
+        (
+            self.firewalled || (self.timed_out && self.is_running()),
+            self.verified,
+        )
+    }
+
     /// `IsVerified`: there is an answer, fresh enough.
     pub fn is_verified(&mut self, now: u64) -> bool {
         self.check_expiry(now);

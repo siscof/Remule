@@ -63,12 +63,17 @@ pub enum SearchKind {
     /// `FINDBUDDY`: we are firewalled; ask the nodes close to our Kad ID
     /// with every bit flipped to be our buddy.
     FindBuddy,
+    /// `NODEFWCHECKUDP`: a lookup of a random target whose answers only
+    /// feed the UDP firewall test (nodes that do not know us).
+    NodeFwCheckUdp,
 }
 
 impl SearchKind {
     fn request_count(&self) -> u8 {
         match self {
-            SearchKind::Node | SearchKind::NodeComplete => FindType::FindNode.into(),
+            SearchKind::Node | SearchKind::NodeComplete | SearchKind::NodeFwCheckUdp => {
+                FindType::FindNode.into()
+            }
             SearchKind::Keyword { .. } | SearchKind::Source { .. } => FindType::FindValue.into(),
             SearchKind::StoreKeyword { .. }
             | SearchKind::StoreSource { .. }
@@ -299,7 +304,7 @@ impl Search {
     pub fn tick(&mut self, now: u64) -> (bool, Vec<Action>) {
         let age_end = self.created + self.kind.lifetime();
         match self.kind {
-            SearchKind::Node => {
+            SearchKind::Node | SearchKind::NodeFwCheckUdp => {
                 if age_end < now {
                     return (true, Vec::new());
                 }

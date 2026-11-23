@@ -222,7 +222,10 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
                     // REMULE_TRACE: every datagram, and how it was obfuscated.
                     Event::Wire(w) => eprintln!("{}", remuled::kad::wire_line(&w)),
                     // No TCP here: no buddy either way.
-                    Event::BuddyOffer { .. } | Event::BuddyRequest { .. } | Event::CallbackRequest { .. } => {}
+                    Event::BuddyOffer { .. }
+                    | Event::BuddyRequest { .. }
+                    | Event::CallbackRequest { .. }
+                    | Event::UdpFirewallCheck { .. } => {}
                 }
             }
             _ = tick.tick() => {

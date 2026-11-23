@@ -1053,6 +1053,8 @@ pub async fn run(
                         info!("[{:>5}s] Kad: buddy request from {tcp}, offered", start.elapsed().as_secs());
                         let _ = cmd.send(Command::BuddyRequest { buddy_id, user_hash, tcp });
                     }
+                    // The UDP firewall test's TCP half is not wired yet.
+                    Some(KadEvent::UdpFirewallCheck { .. }) => {}
                     Some(KadEvent::CallbackRequest { buddy_id, file, from }) => {
                         debug!("[{:>5}s] Kad: callback request from {from}", start.elapsed().as_secs());
                         let _ = cmd.send(Command::BuddyCallback { buddy_id, file, from });

@@ -85,6 +85,7 @@ impl Seeder {
             user_hash: Some(self.hello.user_hash),
             crypt: crypt::SUPPORTED,
             buddy: None,
+            direct_udp: None,
         }
     }
 
@@ -1175,6 +1176,87 @@ fn a_firewalled_source_is_asked_through_its_buddy() {
     let a = w.q.packet(conn, wire(s.hello.to_hello().unwrap()), w.now);
     w.run(a.into());
     w.tick_until(20, World::completed);
+}
+
+/// A Kad source that takes UDP but not TCP (type 6, direct callback flag
+/// set): not connected to; asked over UDP to connect to us
+/// (`OP_DIRECTCALLBACKREQ`: our TCP port, user hash, connect options),
+/// only while we can be reached. Without the flag it is not taken.
+#[test]
+fn a_udp_only_source_is_asked_to_call_back() {
+    use ed2k_kad::search::SourceResult;
+    let kad = |crypt| SourceResult {
+        user_hash: Md4Hash([0x66; 16]),
+        source_type: 6,
+        ip: Ipv4Addr::new(10, 1, 0, 2),
+        tcp_port: 4662,
+        udp_port: 4672,
+        buddy_ip: Ipv4Addr::UNSPECIFIED,
+        buddy_port: 0,
+        buddy_id: None,
+        crypt_options: crypt,
+    };
+    assert!(Endpoint::from_kad(&kad(0x01)).is_none());
+    let ep = Endpoint::from_kad(&kad(0x09)).unwrap();
+    assert_eq!(ep.direct_udp, Some(4672));
+
+    let (_dir, _d, h, q) = setup("q-direct-callback");
+    let mut w = World::new(q);
+    w.add_source(h.ed2k, ep);
+    w.tick();
+    assert!(
+        w.udp.is_empty() && w.conns.is_empty(),
+        "not reachable: nothing"
+    );
+    // Reachable, but without a UDP port of ours (0 here): nothing either.
+    w.q.set_reachable(true);
+    assert_eq!(w.q.config().ours.udp_port, 0);
+    for _ in 0..10 {
+        w.tick();
+    }
+    assert!(w.udp.is_empty() && w.conns.is_empty());
+}
+
+#[test]
+fn a_udp_only_source_gets_the_request() {
+    use ed2k_kad::search::SourceResult;
+    let dir = TempDir::new("q-direct-callback-2");
+    let d = Arc::new(data(SIZE, 21));
+    let h = Arc::new(hashes(&d));
+    let mut c = config(&dir);
+    c.ours.udp_port = 4672;
+    c.reachable = true;
+    let mut q = DownloadQueue::new(c);
+    let pf = PartFile::create(&dir.temp(), "test file.bin", h.ed2k, SIZE).unwrap();
+    assert!(q.add_file(pf));
+    let mut w = World::new(q);
+    let ep = Endpoint::from_kad(&SourceResult {
+        user_hash: Md4Hash([0x66; 16]),
+        source_type: 6,
+        ip: Ipv4Addr::new(10, 1, 0, 2),
+        tcp_port: 4662,
+        udp_port: 4673,
+        buddy_ip: Ipv4Addr::UNSPECIFIED,
+        buddy_port: 0,
+        buddy_id: None,
+        crypt_options: 0x09,
+    })
+    .unwrap();
+    w.add_source(h.ed2k, ep);
+    w.tick();
+    assert!(w.conns.is_empty());
+    assert_eq!(w.udp.len(), 1);
+    let u = &w.udp[0];
+    assert_eq!(u.to, SocketAddrV4::new(Ipv4Addr::new(10, 1, 0, 2), 4673));
+    assert_eq!(u.obfuscate_for, Some(Md4Hash([0x66; 16])));
+    assert_eq!(
+        UdpPacket::parse(&u.payload, None).unwrap(),
+        UdpPacket::DirectCallbackReq {
+            tcp_port: 4662,
+            user_hash: w.q.config().ours.user_hash,
+            connect_options: 0x03,
+        }
+    );
 }
 
 /// A firewalled source we wait in the queue of is reasked through its Kad

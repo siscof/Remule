@@ -46,6 +46,15 @@ pub enum UdpPacket {
     /// `OP_QUEUEFULL`: the uploader does not know the asker, and its queue
     /// is (nearly) full.
     QueueFull,
+    /// `OP_DIRECTCALLBACKREQ`: to a source that cannot take TCP connections
+    /// but takes UDP (Kad source type 6): connect to us.
+    /// `<TCP port 2><user hash 16><connect options 1>`
+    DirectCallbackReq {
+        tcp_port: u16,
+        user_hash: Md4Hash,
+        /// Bit 0 crypt supported, 1 requested, 2 required.
+        connect_options: u8,
+    },
     /// `OP_REASKCALLBACKUDP`: a reask for a firewalled source, sent to its
     /// Kad buddy to pass on: `<buddy ID 16>` (raw, as the source published
     /// it) then what an `OP_REASKFILEPING` carries, laid out for the
@@ -104,6 +113,16 @@ impl UdpPacket {
             UdpPacket::QueueFull => {
                 w.u8(Opcode::QueueFull as u8);
             }
+            UdpPacket::DirectCallbackReq {
+                tcp_port,
+                user_hash,
+                connect_options,
+            } => {
+                w.u8(Opcode::DirectCallbackReq as u8);
+                w.u16(*tcp_port);
+                w.hash(*user_hash);
+                w.u8(*connect_options);
+            }
             UdpPacket::ReaskCallbackUdp { buddy_id, ping } => {
                 w.u8(Opcode::ReaskCallbackUdp as u8);
                 w.bytes(buddy_id);
@@ -154,6 +173,11 @@ impl UdpPacket {
                 let rank = r.u16().map_err(bad)?;
                 Ok(UdpPacket::ReaskAck { parts, rank })
             }
+            Ok(Opcode::DirectCallbackReq) => Ok(UdpPacket::DirectCallbackReq {
+                tcp_port: r.u16().map_err(bad)?,
+                user_hash: r.hash().map_err(bad)?,
+                connect_options: r.u8().map_err(bad)?,
+            }),
             Ok(Opcode::ReaskCallbackUdp) => {
                 // The buddy ID, then at least the file hash (`size < 17`
                 // is malformed for aMule; it reads the hash later).
@@ -252,6 +276,20 @@ mod tests {
     }
 
     #[test]
+    fn direct_callback_request() {
+        let p = UdpPacket::DirectCallbackReq {
+            tcp_port: 4662,
+            user_hash: h(3),
+            connect_options: 0x03,
+        };
+        let b = p.to_datagram(0);
+        assert_eq!(&b[..4], &[0xC5, 0x95, 0x36, 0x12]);
+        assert_eq!(b.len(), 2 + 2 + 16 + 1);
+        assert_eq!(UdpPacket::parse(&b, None).unwrap(), p);
+        assert!(UdpPacket::parse(&b[..10], None).is_err());
+    }
+
+    #[test]
     fn bad_datagrams() {
         assert_eq!(UdpPacket::parse(&[], None), Err(BadUdpPacket::NotEmule));
         assert_eq!(
@@ -272,8 +310,8 @@ mod tests {
             Err(BadUdpPacket::Malformed(_))
         ));
         assert_eq!(
-            UdpPacket::parse(&[0xC5, 0x95], None),
-            Err(BadUdpPacket::Unhandled(0x95))
+            UdpPacket::parse(&[0xC5, 0x96], None),
+            Err(BadUdpPacket::Unhandled(0x96))
         );
     }
 }

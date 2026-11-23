@@ -68,6 +68,9 @@ pub struct Endpoint {
     /// A firewalled Kad source: it is not connected to, its buddy is asked
     /// to have it connect to us.
     pub buddy: Option<BuddyRoute>,
+    /// A Kad source that takes UDP but not TCP (type 6): asked over UDP,
+    /// at this port, to connect to us (`OP_DIRECTCALLBACKREQ`).
+    pub direct_udp: Option<u16>,
 }
 
 /// A firewalled source's Kad buddy (source types 3 and 5).
@@ -86,6 +89,7 @@ impl Endpoint {
             user_hash: None,
             crypt: 0,
             buddy: None,
+            direct_udp: None,
         }
     }
 
@@ -100,6 +104,7 @@ impl Endpoint {
             user_hash: s.user_hash,
             crypt: s.crypt_options.unwrap_or(0) & 0x07,
             buddy: None,
+            direct_udp: None,
         })
     }
 
@@ -109,8 +114,14 @@ impl Endpoint {
         if s.tcp_port == 0 {
             return None;
         }
+        let mut direct_udp = None;
         let buddy = match s.source_type {
             1 | 4 => None,
+            // Direct callback: only with its flag set (0x08) and a UDP port.
+            6 if s.crypt_options & 0x08 != 0 && s.udp_port != 0 => {
+                direct_udp = Some(s.udp_port);
+                None
+            }
             // `KademliaSearchFile` for types 3 and 5: reached through its
             // buddy. Its IP only matches it when it calls.
             3 | 5 => match s.buddy_id {
@@ -127,6 +138,7 @@ impl Endpoint {
             user_hash: Some(s.user_hash),
             crypt: s.crypt_options & 0x07,
             buddy,
+            direct_udp,
         })
     }
 
@@ -137,6 +149,7 @@ impl Endpoint {
             user_hash: s.user_hash,
             crypt: s.crypt_options.unwrap_or(0) & 0x07,
             buddy: None,
+            direct_udp: None,
         })
     }
 }
@@ -1067,6 +1080,34 @@ impl DownloadQueue {
             }
             busy.push(addr);
             started += 1;
+            // A source that takes UDP only (`SupportsDirectUDPCallback`):
+            // ask it to connect to us, if it can (we are reachable, and have
+            // a UDP port to ask from). One packet, like a connection try.
+            if let Some(udp) = self.sources[&id].endpoint.direct_udp {
+                let ok = self.config.reachable && self.config.ours.udp_port != 0;
+                let ours = &self.config.ours;
+                let req = UdpPacket::DirectCallbackReq {
+                    tcp_port: ours.port,
+                    user_hash: ours.user_hash,
+                    // GetMyConnectOptions(true, false)
+                    connect_options: 0x03,
+                };
+                let s = self.sources.get_mut(&id).unwrap();
+                s.last_asked = Some(now);
+                if ok {
+                    let ep = s.endpoint;
+                    let obfuscate_for = ep.user_hash.filter(|_| {
+                        ep.crypt & crypt::SUPPORTED != 0
+                            && (self.config.request_obfuscation || ep.crypt & crypt::REQUESTED != 0)
+                    });
+                    out.push(Action::SendUdp(UdpOut {
+                        to: SocketAddrV4::new(*ep.addr.ip(), udp),
+                        payload: req.to_datagram(0),
+                        obfuscate_for,
+                    }));
+                }
+                continue;
+            }
             // A firewalled source: ask its buddy to have it connect to us
             // (`DS_WAITCALLBACKKAD`), unless we cannot be reached either.
             if let Some(route) = self.sources[&id].endpoint.buddy {

@@ -328,6 +328,7 @@ fn udp_client_round_trips_with_every_key() {
             assert_eq!(d.payload, b"\xE4\x20payload");
             let kad = !matches!(key, ClientKey::Ed2k { .. });
             assert_eq!(d.kad, kad);
+            assert_eq!(d.key, key.kind());
             assert_eq!(d.verify, if kad { v } else { VerifyKeys::default() });
             // The marker is only a hint: any marker still decrypts.
             let mut q = p.clone();

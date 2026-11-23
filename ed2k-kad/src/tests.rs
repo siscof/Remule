@@ -825,6 +825,89 @@ fn answers_hello_req_and_ping_and_ignores_the_unrequested() {
     assert!(net.nodes[1].routing.get(UInt128::new(5)).is_none());
 }
 
+/// With `trace_wire`, every datagram each way is recorded with its key:
+/// a hello keyed on the receiver's Kad ID, answered keyed on ours and
+/// carrying the verify key we gave, which we see as valid.
+#[test]
+fn the_wire_trace_tells_how_each_datagram_was_obfuscated() {
+    use crate::node::{Wire, WireForm};
+    use ed2k_types::kad::v2::Opcode;
+    let mut rng = StdRng::seed_from_u64(7);
+    let ids = [UInt128::new(rng.gen()), UInt128::new(rng.gen())];
+    let mut net = Net::new(&ids, &mut rng);
+    for n in &mut net.nodes {
+        n.trace_wire = true;
+    }
+    let (a, b) = (net.addrs[0], net.addrs[1]);
+    let hello = KadPacket::HelloReq(Hello {
+        id: ids[1],
+        tcp_port: 4662,
+        version: 9,
+        udp_port: None,
+        misc_options: 0,
+    });
+    // Node 1 knows node 0's ID: keyed on it.
+    let d = net.nodes[1].send_to_test(&hello, a, 9, Some(ids[0]), net.now);
+    net.post(1, vec![d]);
+    net.deliver();
+    let w1 = net.nodes[1].take_wire();
+    let w0 = net.nodes[0].take_wire();
+    assert_eq!(
+        w1[0],
+        Wire {
+            incoming: false,
+            peer: a,
+            opcode: Opcode::HelloReq as u8,
+            form: WireForm::KadId,
+            receiver_key_valid: false,
+        }
+    );
+    // Node 0 had given node 1 no verify key yet.
+    assert_eq!(
+        w0[0],
+        Wire {
+            incoming: true,
+            peer: b,
+            opcode: Opcode::HelloReq as u8,
+            form: WireForm::KadId,
+            receiver_key_valid: false,
+        }
+    );
+    // The answer, keyed on node 1's ID, with node 1's verify key in it.
+    let res = w0
+        .iter()
+        .find(|w| !w.incoming && w.opcode == Opcode::HelloRes as u8)
+        .expect("node 0 answered");
+    assert_eq!((res.peer, res.form), (b, WireForm::KadId));
+    let got = w1
+        .iter()
+        .find(|w| w.incoming && w.opcode == Opcode::HelloRes as u8)
+        .expect("node 1 read the answer");
+    assert_eq!(got.form, WireForm::KadId);
+    assert!(got.receiver_key_valid);
+    // The counters agree; the trace is drained.
+    let s = &net.nodes[0].stats;
+    assert_eq!(
+        (s.obfuscated_in, s.obfuscated_out),
+        (
+            w0.iter()
+                .filter(|w| w.incoming && w.form != WireForm::Plain)
+                .count() as u64,
+            w0.iter()
+                .filter(|w| !w.incoming && w.form != WireForm::Plain)
+                .count() as u64
+        )
+    );
+    assert!(net.nodes[0].take_wire().is_empty());
+    // Off by default.
+    let mut quiet = Net::new(&ids, &mut rng);
+    let d = quiet.nodes[1].send_to_test(&hello, quiet.addrs[0], 9, Some(ids[0]), 0);
+    quiet.post(1, vec![d]);
+    quiet.deliver();
+    assert!(quiet.nodes[0].take_wire().is_empty());
+    assert!(quiet.nodes[0].stats.obfuscated_in > 0);
+}
+
 /// A packet `to` receives from `from`, decrypted as it would.
 fn read_as(to: &Kad, from: SocketAddrV4, bytes: &[u8]) -> KadPacket {
     let plain = if bytes[0] == 0xE4 || bytes[0] == 0xE5 {

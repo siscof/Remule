@@ -91,6 +91,15 @@ impl ClientKey {
         !matches!(self, ClientKey::Ed2k { .. })
     }
 
+    /// Which kind of key this is.
+    pub fn kind(&self) -> KeyKind {
+        match self {
+            ClientKey::Ed2k { .. } => KeyKind::Ed2k,
+            ClientKey::KadId(_) => KeyKind::KadId,
+            ClientKey::KadVerifyKey(_) => KeyKind::KadVerifyKey,
+        }
+    }
+
     /// The marker bits for this key, set into `random`.
     fn marker(&self, random: u8) -> u8 {
         match self {
@@ -99,6 +108,14 @@ impl ClientKey {
             ClientKey::KadVerifyKey(_) => (random & 0xFC) | 0x02,
         }
     }
+}
+
+/// The kind of [`ClientKey`] a packet was encrypted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Ed2k,
+    KadId,
+    KadVerifyKey,
 }
 
 /// The Kad verify keys a packet carries.
@@ -169,6 +186,8 @@ pub struct Decrypted {
     pub payload: Vec<u8>,
     /// Whether a Kad key opened it.
     pub kad: bool,
+    /// The key that opened it.
+    pub key: KeyKind,
     /// The verify keys of a Kad packet (zero for eD2k).
     pub verify: VerifyKeys,
 }
@@ -229,6 +248,7 @@ pub fn decrypt_client(packet: &[u8], own: &OwnKeys) -> Option<Decrypted> {
         return Some(Decrypted {
             payload: rc4.crypt(rest),
             kad: key.is_kad(),
+            key: key.kind(),
             verify,
         });
     }

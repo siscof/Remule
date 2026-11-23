@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! `remule kad`: join Kad from a nodes.dat, keep the routing table alive,
 //! search keywords and sources.
+//!
+//! With `REMULE_TRACE` set, every datagram is printed to stderr with how it
+//! was obfuscated (plain, or keyed on a Kad ID, a verify key or a user hash).
 
 use std::collections::HashMap;
 use std::net::SocketAddrV4;
@@ -36,6 +39,8 @@ pub struct KadArgs {
     /// Say we take unsolicited UDP: others then publish to us and we
     /// store and serve it (the port must be reachable from outside).
     pub reachable: bool,
+    /// Take contacts on LAN addresses.
+    pub allow_lan: bool,
 }
 
 /// `HASH:SIZE` for `--source`.
@@ -57,6 +62,12 @@ fn status(t: Duration, s: &Snapshot) -> String {
         extra += &format!(
             ", index {} keywords / {} sources / {} notes ({} publishes, {} searches answered)",
             i.keywords, i.sources, i.notes, s.stats.publishes_stored, s.stats.searches_answered
+        );
+    }
+    if s.stats.obfuscated_in + s.stats.obfuscated_out > 0 {
+        extra += &format!(
+            ", obfuscated in {} / out {}",
+            s.stats.obfuscated_in, s.stats.obfuscated_out
         );
     }
     if s.stats.flood_drops + s.stats.bans > 0 {
@@ -160,6 +171,8 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
         reachable: a.reachable,
         // Nothing listens on TCP here: no firewall check.
         listening: false,
+        allow_lan: a.allow_lan,
+        trace_wire: remuled::kad::trace_from_env(),
     })
     .await?;
     let mut h = node.handle;
@@ -206,6 +219,8 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
                     }
                     // No TCP here: no firewall check either way.
                     Event::Firewalled(_) | Event::FirewallCheck { .. } => {}
+                    // REMULE_TRACE: every datagram, and how it was obfuscated.
+                    Event::Wire(w) => eprintln!("{}", remuled::kad::wire_line(&w)),
                 }
             }
             _ = tick.tick() => {

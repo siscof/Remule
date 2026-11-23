@@ -110,6 +110,42 @@ pub enum Event {
         /// Its connect options: bit 0 crypt supported, 1 requested, 2 required.
         connect_options: u8,
     },
+    /// A datagram went out or came in (only with [`Kad::trace_wire`] set).
+    Wire(Wire),
+}
+
+/// How a datagram was sent: plain, or obfuscated with which key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireForm {
+    Plain,
+    /// Keyed on the receiver's Kad ID.
+    KadId,
+    /// Keyed on the verify key the receiver gave the sender.
+    KadVerifyKey,
+    /// Keyed on the receiver's user hash (eD2k).
+    Ed2k,
+}
+
+impl From<udp::KeyKind> for WireForm {
+    fn from(k: udp::KeyKind) -> Self {
+        match k {
+            udp::KeyKind::Ed2k => WireForm::Ed2k,
+            udp::KeyKind::KadId => WireForm::KadId,
+            udp::KeyKind::KadVerifyKey => WireForm::KadVerifyKey,
+        }
+    }
+}
+
+/// One Kad datagram, for tracing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wire {
+    /// Came in (else went out).
+    pub incoming: bool,
+    pub peer: SocketAddrV4,
+    pub opcode: u8,
+    pub form: WireForm,
+    /// Incoming: it carried the verify key we gave its sender.
+    pub receiver_key_valid: bool,
 }
 
 /// What a call produced.
@@ -133,6 +169,10 @@ pub struct Stats {
     pub publishes_stored: u64,
     /// Search requests answered with at least one result.
     pub searches_answered: u64,
+    /// Packets that came in obfuscated.
+    pub obfuscated_in: u64,
+    /// Packets sent obfuscated.
+    pub obfuscated_out: u64,
 }
 
 /// The node.
@@ -166,6 +206,9 @@ pub struct Kad {
     next_firewall_check: u64,
     /// The answer last given as [`Event::Firewalled`].
     shown_firewalled: bool,
+    /// Record every datagram as an [`Event::Wire`].
+    pub trace_wire: bool,
+    wire: Vec<Wire>,
 }
 
 /// aMule-order IP of an address.
@@ -201,6 +244,19 @@ impl Kad {
             ip_vote: PublicIpVote::default(),
             next_firewall_check: now + RECHECK_INTERVAL,
             shown_firewalled: true,
+            trace_wire: false,
+            wire: Vec::new(),
+        }
+    }
+
+    /// The datagrams recorded since the last call (with [`Self::trace_wire`]).
+    pub fn take_wire(&mut self) -> Vec<Wire> {
+        std::mem::take(&mut self.wire)
+    }
+
+    fn record_wire(&mut self, w: Wire) {
+        if self.trace_wire {
+            self.wire.push(w);
         }
     }
 
@@ -414,6 +470,16 @@ impl Kad {
             None => plain,
         };
         self.stats.packets_out += 1;
+        if ckey.is_some() {
+            self.stats.obfuscated_out += 1;
+        }
+        self.record_wire(Wire {
+            incoming: false,
+            peer: to,
+            opcode: p.opcode(),
+            form: ckey.map_or(WireForm::Plain, |k| k.kind().into()),
+            receiver_key_valid: false,
+        });
         Datagram { to, bytes }
     }
 
@@ -715,9 +781,9 @@ impl Kad {
             return out;
         }
         // Decrypt (DecryptReceivedClient): our Kad ID, then our verify key for the sender.
-        let (plain, valid_receiver_key, sender_key) = match datagram.first() {
+        let (plain, valid_receiver_key, sender_key, form) = match datagram.first() {
             Some(&b) if b == Protocol::Kademlia as u8 || b == Protocol::KademliaPacked as u8 => {
-                (datagram.to_vec(), false, UdpKey::default())
+                (datagram.to_vec(), false, UdpKey::default(), WireForm::Plain)
             }
             _ => {
                 let own = OwnKeys {
@@ -731,6 +797,7 @@ impl Kad {
                         d.payload,
                         d.verify.receiver == self.verify_key(ip),
                         UdpKey::new(d.verify.sender, self.routing.public_ip),
+                        d.key.into(),
                     ),
                     _ => {
                         self.stats.bad_packets += 1;
@@ -751,6 +818,16 @@ impl Kad {
             }
         };
         self.stats.packets_in += 1;
+        if form != WireForm::Plain {
+            self.stats.obfuscated_in += 1;
+        }
+        self.record_wire(Wire {
+            incoming: true,
+            peer: from,
+            opcode: packet.opcode(),
+            form,
+            receiver_key_valid: valid_receiver_key,
+        });
         match self
             .tracker
             .admit(ip, packet.opcode(), valid_receiver_key, now * 1000)

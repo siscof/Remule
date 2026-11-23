@@ -719,3 +719,36 @@ fn buddy_packets() {
     short.payload.truncate(37);
     assert!(PeerPacket::parse(short, ctx).is_err());
 }
+
+/// `OP_REASKCALLBACKUDP` (to the buddy) and `OP_REASKCALLBACKTCP` (from
+/// it): the asker's IP in network order; an IPv6 asker is refused.
+#[test]
+fn reask_relay_packets() {
+    use crate::packets::reask_callback_tcp;
+    use crate::udp::UdpPacket;
+    let ping = [[9u8; 16].as_slice(), &[0, 0, 1, 0]].concat();
+    let u = UdpPacket::ReaskCallbackUdp {
+        buddy_id: [7; 16],
+        ping: ping.clone(),
+    };
+    let d = u.to_datagram(4);
+    assert_eq!(&d[..2], &[0xC5, 0x94]);
+    assert_eq!(UdpPacket::parse(&d, None).unwrap(), u);
+    assert!(UdpPacket::parse(&d[..20], None).is_err());
+
+    let from = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(203, 0, 113, 9), 4672);
+    let p = reask_callback_tcp(from, &ping);
+    assert_eq!(&p.payload[..6], &[203, 0, 113, 9, 0x40, 0x12]);
+    let ctx = ParseContext::default();
+    let parsed = PeerPacket::parse(Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap(), ctx);
+    assert_eq!(
+        parsed.unwrap(),
+        PeerPacket::ReaskCallbackTcp {
+            from,
+            ping: ping.clone()
+        }
+    );
+    let mut v6 = p.clone();
+    v6.payload[..4].copy_from_slice(&[0xFF; 4]);
+    assert!(PeerPacket::parse(v6, ctx).is_err());
+}

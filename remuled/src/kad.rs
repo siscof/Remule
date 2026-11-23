@@ -91,6 +91,34 @@ pub struct KadStart {
 
 /// Load the state, bind the UDP port and start the node.
 pub async fn start(a: &KadStart) -> Result<KadNode, String> {
+    let (kad, prefs) = load(a)?;
+    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", a.udp_port))
+        .await
+        .map_err(|e| format!("UDP port {}: {e}", a.udp_port))?;
+    finish(a, prefs, driver::spawn(kad, socket)).await
+}
+
+/// Load the state and start the node on the client's UDP port, which it
+/// shares with eD2k as in aMule.
+pub async fn start_on(a: &KadStart, port: &crate::udp_port::UdpPort) -> Result<KadNode, String> {
+    let (kad, prefs) = load(a)?;
+    let (incoming, outgoing) = port.kad_transport();
+    finish(a, prefs, driver::spawn_on(kad, incoming, outgoing)).await
+}
+
+async fn finish(a: &KadStart, prefs: KadPrefs, handle: KadHandle) -> Result<KadNode, String> {
+    for b in &a.bootstrap {
+        handle.bootstrap(*b).await;
+    }
+    Ok(KadNode {
+        handle,
+        prefs,
+        dir: a.dir.clone(),
+    })
+}
+
+/// The node, from its state files.
+fn load(a: &KadStart) -> Result<(Kad, KadPrefs), String> {
     std::fs::create_dir_all(&a.dir).map_err(|e| format!("{}: {e}", a.dir.display()))?;
     let prefs = load_or_make_prefs(&a.dir);
     let nodes_path = a.nodes.clone().unwrap_or_else(|| a.dir.join("nodes.dat"));
@@ -155,18 +183,7 @@ pub async fn start(a: &KadStart) -> Result<KadNode, String> {
             .map(|b| format!("{b:02X}"))
             .collect::<String>()
     );
-    let socket = tokio::net::UdpSocket::bind(("0.0.0.0", a.udp_port))
-        .await
-        .map_err(|e| format!("UDP port {}: {e}", a.udp_port))?;
-    let handle: KadHandle = driver::spawn(kad, socket);
-    for b in &a.bootstrap {
-        handle.bootstrap(*b).await;
-    }
-    Ok(KadNode {
-        handle,
-        prefs,
-        dir: a.dir.clone(),
-    })
+    Ok((kad, prefs))
 }
 
 impl KadNode {

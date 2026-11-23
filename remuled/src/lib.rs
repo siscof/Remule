@@ -43,6 +43,7 @@ pub mod kad;
 pub mod prefs;
 pub mod server_conn;
 pub mod stats;
+pub mod udp_port;
 pub mod version_check;
 
 #[cfg(test)]

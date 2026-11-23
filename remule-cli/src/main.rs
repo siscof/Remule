@@ -196,6 +196,11 @@ enum Command {
         /// Take sources on LAN and loopback addresses.
         #[arg(long)]
         allow_lan: bool,
+        /// Seconds before asking a source again (aMule's SourceReaskMinutes,
+        /// 15 minutes); a queued source is asked over UDP 20 s before.
+        /// Peers ban a client that asks within about 10 minutes.
+        #[arg(long, default_value_t = 900)]
+        reask: u64,
     },
     /// Share directories as aMule does: hash new files into known.met and
     /// known2_64.met, and list the shared files.
@@ -380,6 +385,7 @@ fn main() -> ExitCode {
             config,
             reachable,
             allow_lan,
+            reask,
         } => run_async(download::run(download::DownloadArgs {
             links,
             temp,
@@ -400,6 +406,7 @@ fn main() -> ExitCode {
             config,
             reachable,
             allow_lan,
+            reask,
         })),
         Command::Share {
             dirs,

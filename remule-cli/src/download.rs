@@ -49,6 +49,8 @@ pub struct DownloadArgs {
     pub reachable: bool,
     /// Take sources on LAN and loopback addresses (aMule's FilterLanIPs off).
     pub allow_lan: bool,
+    /// Seconds before asking a source again.
+    pub reask: u64,
 }
 
 /// Our user hash, kept in the temp directory so peers recognise us.
@@ -149,6 +151,7 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         share: a.share.clone(),
         reachable: a.reachable,
         allow_lan: a.allow_lan,
+        reask: Duration::from_secs(a.reask.max(1)),
         ip_filter: None,
         stop_when_done: true,
         status_every: Duration::from_secs(a.status_every.max(1)),

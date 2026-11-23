@@ -48,6 +48,8 @@ use tracing::{debug, info, warn};
 
 use crate::ec::{self, Control, DownloadIds, EcSettings, KadStatus, ServerStatus, Status};
 use crate::ec_search;
+use crate::udp_port::UdpPort;
+use remule_core::download_queue::UdpOut;
 use crate::ec_servers::{Effect, ServerList};
 use crate::firewall::{self, Reachability, MAX_CONNECT_BACKS};
 use crate::kad::{self, KadStart};
@@ -107,6 +109,9 @@ pub struct ClientConfig {
     pub reachable: bool,
     /// Take sources on LAN and loopback addresses (aMule's FilterLanIPs off).
     pub allow_lan: bool,
+    /// Before asking a source again (`SourceReaskMinutes`); a queued one is
+    /// asked over UDP 20 s before that.
+    pub reask: Duration,
     /// Peers and servers it blocks are left alone (`ipfilter.dat`).
     pub ip_filter: Option<Arc<AddressFilter>>,
     /// Stop once every download is complete (ignored when sharing).
@@ -694,8 +699,26 @@ pub async fn run(
     };
     let listening = listener.is_some();
 
+    // The client UDP port, Kad's too (`CClientUDPSocket`): reasks come and
+    // go there.
+    let (ed2k_udp_tx, mut ed2k_udp_rx) = mpsc::unbounded_channel();
+    let udp_port = if c.udp_port == 0 {
+        None
+    } else {
+        match UdpPort::bind(c.udp_port, c.user_hash, ed2k_udp_tx).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("UDP port {}: {e} (no UDP reasks, no Kad)", c.udp_port);
+                None
+            }
+        }
+    };
+    let (udp_out_tx, mut udp_out_rx) = mpsc::unbounded_channel::<UdpOut>();
+    // Our public IP as the server tells it: obfuscated datagrams are keyed with it.
+    let mut public_ip: Option<std::net::Ipv4Addr> = None;
+
     let mut ours = Hello::amule(c.user_hash, our_id, c.tcp_port, c.nick.clone());
-    ours.udp_port = 0;
+    ours.udp_port = udp_port.as_ref().map_or(0, |p| p.port);
     ours.misc2 = Some(MiscOptions2::amule(
         0,
         CryptSettings {
@@ -708,12 +731,14 @@ pub async fn run(
     qc.max_connections = c.max_connections;
     qc.identity = Some(c.identity.clone());
     qc.filter_lan = !c.allow_lan;
+    qc.reask = c.reask;
     qc.ip_filter = c.ip_filter.clone();
     let ours_for_upload = qc.ours.clone();
     let ours_for_checks = qc.ours.clone();
     let queue = DownloadQueue::new(qc);
     let mut dc = DownloaderConfig::new(Arc::new(Bandwidth::new(c.max_upload, c.max_download)));
     dc.stop_when_done = c.stop_when_done;
+    dc.udp = udp_port.as_ref().map(|_| udp_out_tx);
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let (rep_tx, mut reports) = mpsc::unbounded_channel();
     let uploader = match &shares {
@@ -754,7 +779,7 @@ pub async fn run(
 
     let mut kad_node = match &c.kad {
         Some(k) => Some(
-            kad::start(&KadStart {
+            start_kad(udp_port.as_ref(), &KadStart {
                 dir: k.dir.clone(),
                 nodes: k.nodes.clone(),
                 bootstrap: Vec::new(),
@@ -863,6 +888,10 @@ pub async fn run(
                         our_id = li.id;
                         tree_track.logins += 1;
                         server_since = connector.connected().map(|a| (a.addr, unix_now()));
+                        // `GetPublicIP`: a HighID is our IP.
+                        public_ip = li.public_ip.or_else(|| {
+                            (!li.low_id).then(|| ed2k_server::packets::id_to_ip(li.id))
+                        });
                         let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
                         let was = reach;
                         reach.high_id = !li.low_id;
@@ -878,6 +907,18 @@ pub async fn run(
                         let next = connector.failed(now);
                         follow(next, &c, &mut attempting, t);
                     }
+                }
+            }
+            // Client UDP out (obfuscated when the peer wants it and our IP
+            // is known), and in (to the downloader).
+            d = async { match &udp_port { Some(_) => udp_out_rx.recv().await, None => std::future::pending().await } } => {
+                if let (Some(d), Some(p)) = (d, &udp_port) {
+                    p.send_ed2k(&d, public_ip).await;
+                }
+            }
+            d = async { match &udp_port { Some(_) => ed2k_udp_rx.recv().await, None => std::future::pending().await } } => {
+                if let Some(d) = d {
+                    let _ = cmd.send(Command::Udp { from: d.from, datagram: d.payload });
                 }
             }
             r = reports.recv() => {
@@ -910,6 +951,7 @@ pub async fn run(
                         server = None;
                         server_since = None;
                         our_id = 0;
+                        public_ip = None;
                         let _ = cmd.send(Command::SetOurId { id: 0, public_ip: None });
                         let was = reach;
                         reach.high_id = false;
@@ -1101,7 +1143,7 @@ pub async fn run(
                                     // The stopped node's socket may still be closing.
                                     let mut started = Err(String::new());
                                     for _ in 0..20 {
-                                        started = kad::start(&KadStart {
+                                        started = start_kad(udp_port.as_ref(), &KadStart {
                                             dir: k.dir.clone(),
                                             nodes: k.nodes.clone(),
                                             bootstrap: Vec::new(),
@@ -1475,4 +1517,13 @@ async fn update_ip_filter(dir: PathBuf, url: String, filter: Arc<AddressFilter>)
     info!("Successfully updated ipfilter.dat");
     let _ =
         tokio::task::spawn_blocking(move || crate::config::reload_ip_filter(&dir, &filter)).await;
+}
+
+/// Kad on the client UDP port when there is one (shared, as in aMule),
+/// else on a socket of its own.
+async fn start_kad(port: Option<&UdpPort>, a: &KadStart) -> Result<kad::KadNode, String> {
+    match port {
+        Some(p) => kad::start_on(a, p).await,
+        None => kad::start(a).await,
+    }
 }

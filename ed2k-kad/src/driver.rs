@@ -79,6 +79,7 @@ enum Command {
     Bootstrap(SocketAddrV4),
     FirewallAck(Ipv4Addr),
     ServingBuddy(bool),
+    DirectCallback(oneshot::Sender<Option<Option<u16>>>),
     UdpCheckRequest(Ipv4Addr, oneshot::Sender<(u16, u16, u32)>),
     UdpCheckEnded(Ipv4Addr, bool),
     AnswerUdpCheck {
@@ -259,6 +260,11 @@ impl KadHandle {
             .await;
     }
 
+    /// [`Kad::direct_callback`]
+    pub async fn direct_callback(&self) -> Option<Option<u16>> {
+        self.ask(Command::DirectCallback).await.flatten()
+    }
+
     /// We serve a buddy (or no longer): Kad offers no more while we do.
     pub async fn set_serving_buddy(&self, serving: bool) {
         let _ = self.cmd.send(Command::ServingBuddy(serving)).await;
@@ -400,6 +406,9 @@ async fn run(
                         kad.firewall_ack(ip, t);
                     }
                     Command::ServingBuddy(serving) => kad.serving_buddy = serving,
+                    Command::DirectCallback(tx) => {
+                        let _ = tx.send(kad.direct_callback(t));
+                    }
                     Command::UdpCheckRequest(ip, tx) => {
                         let _ = tx.send(kad.udp_check_request(ip));
                     }

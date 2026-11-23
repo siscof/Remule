@@ -324,6 +324,19 @@ impl Kad {
         }
     }
 
+    /// `DirectCallbackAvailable`: TCP-firewalled, but the UDP test says
+    /// others reach our UDP port. Then sources are published as type 6
+    /// (peers ask us over UDP to connect), and no buddy is needed. The UDP
+    /// port to publish with them when it is the internal one (`None` when
+    /// the external one answered: receivers take the port it came from).
+    pub fn direct_callback(&mut self, now: u64) -> Option<Option<u16>> {
+        let tcp = self.is_firewalled(now);
+        let verified = self.udp_firewall.is_verified(now);
+        let udp = self.udp_firewall.is_firewalled(true, tcp, now);
+        (tcp && verified && !udp)
+            .then(|| (!self.udp_firewall.use_external_port).then_some(self.cfg.udp_port))
+    }
+
     /// The data of `OP_FWCHECKUDPREQ` for a node at `ip`
     /// (`SendFirewallCheckUDPRequest`): our internal and external Kad
     /// ports and our verify key for it.
@@ -432,6 +445,10 @@ impl Kad {
             self.next_find_buddy = now + 20 * 60;
         }
         if !self.find_buddy || have_buddy || !self.is_connected(now) || !self.is_firewalled(now) {
+            return None;
+        }
+        // `NeedsBuddy`: not while the direct callback works.
+        if self.direct_callback(now).is_some() {
             return None;
         }
         let target = UInt128::new(u128::MAX) ^ self.cfg.kad_id;
@@ -1711,6 +1728,33 @@ pub fn buddy_source_publish_tags(
             TagValue::U8(crypt_options),
         ),
     ]
+}
+
+/// `CSearch::StorePacket` for `STOREFILE` with `EKadSourcePublish::DirectCallback`:
+/// firewalled, but peers may ask us over UDP to connect (source type 6):
+/// our TCP port, our internal Kad port when that is the one others reach,
+/// and our connect options with the direct callback bit (0x08).
+pub fn direct_callback_source_publish_tags(
+    tcp_port: u16,
+    udp_port: Option<u16>,
+    crypt_options: u8,
+) -> Vec<Tag> {
+    use ed2k_types::tags::kad as t;
+    let mut tags = vec![
+        Tag::new(TagName::Str(t::SOURCETYPE.to_vec()), TagValue::U8(6)),
+        int_tag(t::SOURCEPORT, u64::from(tcp_port)),
+    ];
+    if let Some(p) = udp_port {
+        tags.push(Tag::new(
+            TagName::Str(t::SOURCEUPORT.to_vec()),
+            TagValue::U16(p),
+        ));
+    }
+    tags.push(Tag::new(
+        TagName::Str(t::ENCRYPTION.to_vec()),
+        TagValue::U8(crypt_options | 0x08),
+    ));
+    tags
 }
 
 fn int_tag(name: &[u8], v: u64) -> Tag {

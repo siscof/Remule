@@ -11,7 +11,22 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddrV4;
 
-use ed2k_kad::node::{buddy_source_publish_tags, keyword_publish_tags, source_publish_tags};
+use ed2k_kad::node::{
+    buddy_source_publish_tags, direct_callback_source_publish_tags, keyword_publish_tags,
+    source_publish_tags,
+};
+
+/// How others get to us, which decides how we publish ourselves as a
+/// source (`DecideKadSourcePublish`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRoute {
+    /// Not firewalled: they connect (types 1 and 4).
+    Open,
+    /// TCP-firewalled, UDP open: they ask us over UDP to connect (type 6).
+    DirectCallback { udp_port: Option<u16> },
+    /// Firewalled with a Kad buddy: they ask it (types 3 and 5).
+    Buddy { at: SocketAddrV4, id: UInt128 },
+}
 use ed2k_kad::search::keyword_target;
 use ed2k_server::packets::{offer_limit, OfferedFile};
 use ed2k_server::search::kad_words;
@@ -223,20 +238,21 @@ impl Publisher {
     /// and publishes nothing). Keyword and source publishes each start at
     /// most every two seconds, one keyword in turn every 24 hours, one file
     /// as a source in turn every 5 hours (kept in `known.met`).
-    #[allow(clippy::too_many_arguments)]
     pub fn kad_publish(
         &mut self,
         shared: &mut SharedFiles,
         running: (usize, usize),
-        reachable: bool,
-        buddy: Option<(SocketAddrV4, UInt128)>,
+        route: Option<SourceRoute>,
         tcp_port: u16,
         crypt_options: u8,
         now: u64,
     ) -> Vec<KadPublish> {
         let mut out = Vec::new();
-        // Firewalled: only with a buddy to call us back through.
-        if (!reachable && buddy.is_none()) || shared.shared_count() == 0 {
+        // No route back to us: nothing (`PublishesToKad`).
+        let Some(route) = route else {
+            return out;
+        };
+        if shared.shared_count() == 0 {
             return out;
         }
         if running.0 < MAX_KEYWORD_STORES && now >= self.next_keyword_time {
@@ -288,15 +304,24 @@ impl Publisher {
                             size: f.size,
                             // `DecideKadSourcePublish`: firewalled, as
                             // reached through our buddy.
-                            tags: match (reachable, buddy) {
-                                (false, Some((at, id))) => buddy_source_publish_tags(
+                            tags: match route {
+                                SourceRoute::Open => {
+                                    source_publish_tags(f.size, tcp_port, crypt_options)
+                                }
+                                SourceRoute::DirectCallback { udp_port } => {
+                                    direct_callback_source_publish_tags(
+                                        tcp_port,
+                                        udp_port,
+                                        crypt_options,
+                                    )
+                                }
+                                SourceRoute::Buddy { at, id } => buddy_source_publish_tags(
                                     f.size,
                                     tcp_port,
                                     crypt_options,
                                     at,
                                     id,
                                 ),
-                                _ => source_publish_tags(f.size, tcp_port, crypt_options),
                             },
                         });
                     }

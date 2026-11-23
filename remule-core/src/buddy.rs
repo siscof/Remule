@@ -35,28 +35,14 @@ pub const INCOMING_PING_INTERVAL: Duration = Duration::from_secs(3 * 60);
 /// `ReceiveTimeout`: silence that ends a link.
 pub const RECEIVE_TIMEOUT: Duration = Duration::from_secs(25 * 60);
 
-/// `ConvertBuddyIdLayout`: eMule writes a buddy ID with each 4-byte group
-/// reversed against aMule's (`ToByteArray`); the change is its own inverse.
-pub fn other_layout(id: UInt128) -> UInt128 {
-    let b = id.to_be_bytes();
-    let mut o = [0u8; 16];
-    for g in 0..4 {
-        for i in 0..4 {
-            o[g * 4 + i] = b[g * 4 + (3 - i)];
-        }
-    }
-    UInt128::from_be_bytes(o)
-}
-
-/// `MatchesBuddyIdEitherLayout`
-pub fn same_buddy_id(received: UInt128, expected: UInt128) -> bool {
-    received == expected || received == other_layout(expected)
-}
+pub use ed2k_kad::search::{buddy_id_other_layout as other_layout, same_buddy_id};
 
 #[derive(Debug, Clone)]
 struct Link {
     conn: ConnId,
     addr: SocketAddrV4,
+    /// Its Kad port (ours: published with our sources).
+    kad_port: u16,
     user_hash: Md4Hash,
     /// The hellos are done (`KS_CONNECTED_BUDDY`).
     up: bool,
@@ -71,6 +57,7 @@ impl Link {
         Link {
             conn,
             addr,
+            kad_port: 0,
             user_hash,
             up: false,
             since: now,
@@ -161,9 +148,11 @@ impl Buddies {
     /// `RequestBuddy`: an offer, for when we are firewalled. Taken if we
     /// have no buddy and are not connecting to one: connect to it
     /// (obfuscated when it says it supports that).
+    #[allow(clippy::too_many_arguments)]
     pub fn offer(
         &mut self,
         tcp: SocketAddrV4,
+        kad_port: u16,
         user_hash: Md4Hash,
         connect_options: u8,
         conn: ConnId,
@@ -172,7 +161,9 @@ impl Buddies {
         if self.own.is_some() {
             return Vec::new();
         }
-        self.own = Some(Link::new(conn, tcp, user_hash, now));
+        let mut link = Link::new(conn, tcp, user_hash, now);
+        link.kad_port = kad_port;
+        self.own = Some(link);
         vec![Action::Connect {
             conn,
             addr: SocketAddr::V4(tcp),
@@ -249,6 +240,7 @@ impl Buddies {
         }
         out.push(Action::Report(Report::BuddyLinked {
             addr,
+            kad_port: 0,
             serving: true,
         }));
         out
@@ -274,6 +266,7 @@ impl Buddies {
                     l.renew(now);
                     out.push(Action::Report(Report::BuddyLinked {
                         addr: l.addr,
+                        kad_port: l.kad_port,
                         serving: false,
                     }));
                 }

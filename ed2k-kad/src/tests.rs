@@ -1394,3 +1394,56 @@ fn callback_requests_reach_the_application() {
         }]
     );
 }
+
+/// A firewalled source published through its buddy (`TAG_SOURCETYPE` 3,
+/// `TAG_SERVERIP`/`PORT`, `TAG_BUDDYHASH`) reads back as published: the
+/// buddy's IP in network order, the ID in aMule's layout though written
+/// in eMule's.
+#[test]
+fn buddy_sources_round_trip() {
+    use crate::node::buddy_source_publish_tags;
+    use crate::search::{buddy_id_other_layout, source_result};
+    use ed2k_types::tags::kad as t;
+    let buddy = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 4672);
+    let id = UInt128::from_be_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    let tags = buddy_source_publish_tags(1000, 4662, 3, buddy, id);
+    let ip_tag = tags.iter().find(|x| x.name.is(t::SERVERIP)).unwrap();
+    assert_eq!(
+        ip_tag.as_int(),
+        Some(u64::from(u32::from_le_bytes([198, 51, 100, 7])))
+    );
+    let hash = tags.iter().find(|x| x.name.is(t::BUDDYHASH)).unwrap();
+    assert_eq!(
+        hash.value,
+        TagValue::String("0403020108070605 0C0B0A09100F0E0D".replace(' ', ""))
+    );
+    // As an index answers it: the sender's IP added.
+    let mut answered = tags.clone();
+    answered.push(Tag::new(
+        TagName::Str(t::SOURCEIP.to_vec()),
+        TagValue::int(u64::from(u32::from(Ipv4Addr::new(192, 0, 2, 50)))),
+    ));
+    let r = source_result(UInt128::new(77), &answered).unwrap();
+    assert_eq!(r.source_type, 3);
+    assert_eq!((r.buddy_ip, r.buddy_port), (*buddy.ip(), 4672));
+    assert_eq!(r.buddy_id, Some(id));
+    assert_eq!((r.ip, r.tcp_port), (Ipv4Addr::new(192, 0, 2, 50), 4662));
+    // Large files are type 5; a lower-case hash reads too.
+    assert!(matches!(
+        buddy_source_publish_tags(5 << 30, 1, 0, buddy, id)[0].value,
+        TagValue::U8(5)
+    ));
+    let mut lower = answered.clone();
+    let i = lower.iter().position(|x| x.name.is(t::BUDDYHASH)).unwrap();
+    lower[i].value = TagValue::String(
+        buddy_id_other_layout(id)
+            .to_be_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    );
+    assert_eq!(
+        source_result(UInt128::new(77), &lower).unwrap().buddy_id,
+        Some(id)
+    );
+}

@@ -147,9 +147,47 @@ pub struct SourceResult {
     pub ip: Ipv4Addr,
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// A firewalled source's buddy (types 3 and 5): its IP and Kad port...
     pub buddy_ip: Ipv4Addr,
     pub buddy_port: u16,
+    /// ...and the ID callbacks for the source go by (`TAG_BUDDYHASH`, read
+    /// in aMule's layout whatever the publisher wrote).
+    pub buddy_id: Option<UInt128>,
     pub crypt_options: u8,
+}
+
+/// `ConvertBuddyIdLayout`: eMule (and emule-qt, eMuleAI) write a buddy ID
+/// with each 4-byte group reversed against aMule's (`ToByteArray`); the
+/// change is its own inverse.
+pub fn buddy_id_other_layout(id: UInt128) -> UInt128 {
+    let b = id.to_be_bytes();
+    let mut o = [0u8; 16];
+    for g in 0..4 {
+        for i in 0..4 {
+            o[g * 4 + i] = b[g * 4 + (3 - i)];
+        }
+    }
+    UInt128::from_be_bytes(o)
+}
+
+/// `MatchesBuddyIdEitherLayout`
+pub fn same_buddy_id(received: UInt128, expected: UInt128) -> bool {
+    received == expected || received == buddy_id_other_layout(expected)
+}
+
+/// A 32-digit hex string (`CMD4Hash::Decode`), either case.
+fn decode_hex16(s: &str) -> Option<[u8; 16]> {
+    let b = s.as_bytes();
+    if b.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        let hi = (b[2 * i] as char).to_digit(16)?;
+        let lo = (b[2 * i + 1] as char).to_digit(16)?;
+        *o = (hi * 16 + lo) as u8;
+    }
+    Some(out)
 }
 
 /// A result.
@@ -619,6 +657,7 @@ pub fn source_result(answer: UInt128, tags: &[Tag]) -> Option<SourceResult> {
         udp_port: 0,
         buddy_ip: Ipv4Addr::UNSPECIFIED,
         buddy_port: 0,
+        buddy_id: None,
         crypt_options: 0,
     };
     for t in tags {
@@ -633,9 +672,16 @@ pub fn source_result(answer: UInt128, tags: &[Tag]) -> Option<SourceResult> {
         } else if n.is(tag::SOURCEUPORT) {
             r.udp_port = int as u16;
         } else if n.is(tag::SERVERIP) {
-            r.buddy_ip = Ipv4Addr::from(int as u32);
+            // The buddy's `GetIP()`: network order, unlike the Kad IPs.
+            r.buddy_ip = Ipv4Addr::from((int as u32).to_le_bytes());
         } else if n.is(tag::SERVERPORT) {
             r.buddy_port = int as u16;
+        } else if n.is(tag::BUDDYHASH) {
+            // Published in eMule's layout: turned into aMule's.
+            if let TagValue::String(s) = &t.value {
+                r.buddy_id =
+                    decode_hex16(s).map(|b| buddy_id_other_layout(UInt128::from_be_bytes(b)));
+            }
         } else if n.is(tag::ENCRYPTION) {
             r.crypt_options = int as u8;
         }

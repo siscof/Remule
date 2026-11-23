@@ -68,7 +68,7 @@ fn our_buddy() {
     let addr = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 4662);
     let theirs = Md4Hash([0x22; 16]);
     let conn: ConnId = 7;
-    let a = b.offer(addr, theirs, 0x03, conn, t0);
+    let a = b.offer(addr, 4672, theirs, 0x03, conn, t0);
     assert!(matches!(
         &a[..],
         [Action::Connect { conn: c, addr: SocketAddr::V4(to), obfuscate_for: Some(h) }]
@@ -76,7 +76,7 @@ fn our_buddy() {
     ));
     assert!(b.has_own() && b.owns(conn) && b.own_buddy().is_none());
     // A second offer meanwhile: not taken.
-    assert!(b.offer(addr, theirs, 0, 8, t0).is_empty());
+    assert!(b.offer(addr, 4672, theirs, 0, 8, t0).is_empty());
 
     assert!(matches!(
         sent(&b.connected(conn, t0))[..],
@@ -89,6 +89,7 @@ fn our_buddy() {
         reports(&a),
         vec![Report::BuddyLinked {
             addr,
+            kad_port: 4672,
             serving: false
         }]
     );
@@ -140,7 +141,7 @@ fn our_buddy() {
     assert!(!b.has_own());
     // An offer that never comes up is given up after two minutes.
     let t2 = t1 + Duration::from_secs(30 * 60);
-    b.offer(addr, theirs, 0, 9, t2);
+    b.offer(addr, 4672, theirs, 0, 9, t2);
     assert!(b.tick(t2 + Duration::from_secs(119)).is_empty());
     let a = b.tick(t2 + Duration::from_secs(120));
     assert!(a.iter().any(|x| matches!(x, Action::Close { conn: 9 })));
@@ -175,6 +176,7 @@ fn a_buddy_we_serve() {
         reports(&a),
         vec![Report::BuddyLinked {
             addr: SocketAddrV4::new(fw_ip, 4662),
+            kad_port: 0,
             serving: true
         }]
     );

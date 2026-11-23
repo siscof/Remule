@@ -83,9 +83,11 @@ fn kad_publishes_go_in_turn() {
     assert_eq!(p.keyword_count(), 3);
     let t = 1_000_000;
     // Firewalled: nothing.
-    assert!(p.kad_publish(&mut s, (0, 0), false, 4662, 1, t).is_empty());
+    assert!(p
+        .kad_publish(&mut s, (0, 0), false, None, 4662, 1, t)
+        .is_empty());
 
-    let first = p.kad_publish(&mut s, (0, 0), true, 4662, 1, t);
+    let first = p.kad_publish(&mut s, (0, 0), true, None, 4662, 1, t);
     assert_eq!(first.len(), 2, "{first:?}");
     let KadPublish::Keyword { word, files, .. } = &first[0] else {
         panic!("{first:?}")
@@ -95,9 +97,9 @@ fn kad_publishes_go_in_turn() {
     assert!(matches!(first[1], KadPublish::Source { size: 10, .. }));
     // Two seconds between starts.
     assert!(p
-        .kad_publish(&mut s, (0, 0), true, 4662, 1, t + 1)
+        .kad_publish(&mut s, (0, 0), true, None, 4662, 1, t + 1)
         .is_empty());
-    let next = p.kad_publish(&mut s, (0, 0), true, 4662, 1, t + 2);
+    let next = p.kad_publish(&mut s, (0, 0), true, None, 4662, 1, t + 2);
     let KadPublish::Keyword { word, files, .. } = &next[0] else {
         panic!("{next:?}")
     };
@@ -105,24 +107,65 @@ fn kad_publishes_go_in_turn() {
     assert!(matches!(next[1], KadPublish::Source { size: 20, .. }));
     // Too many publishes running: none started.
     assert!(p
-        .kad_publish(&mut s, (2, 3), true, 4662, 1, t + 4)
+        .kad_publish(&mut s, (2, 3), true, None, 4662, 1, t + 4)
         .is_empty());
-    let third = p.kad_publish(&mut s, (0, 0), true, 4662, 1, t + 6);
+    let third = p.kad_publish(&mut s, (0, 0), true, None, 4662, 1, t + 6);
     assert!(matches!(&third[0], KadPublish::Keyword { word, .. } if word == "gamma"));
     // Every file is a source for the next five hours, every keyword for a day.
     assert_eq!(third.len(), 1, "{third:?}");
     let mut later = Vec::new();
     for i in 0..10 {
-        later.extend(p.kad_publish(&mut s, (0, 0), true, 4662, 1, t + 8 + 2 * i));
+        later.extend(p.kad_publish(&mut s, (0, 0), true, None, 4662, 1, t + 8 + 2 * i));
     }
     assert!(later.is_empty(), "{later:?}");
     // The source time is kept in known.met.
     let (f, _) = s.get(&Md4Hash([1; 16])).unwrap();
     assert_eq!(u64::from(f.kad_last_publish_src), t + SOURCE_REPUBLISH);
-    let again = p.kad_publish(&mut s, (0, 0), true, 4662, 1, t + SOURCE_REPUBLISH + 10);
+    let again = p.kad_publish(
+        &mut s,
+        (0, 0),
+        true,
+        None,
+        4662,
+        1,
+        t + SOURCE_REPUBLISH + 10,
+    );
     assert!(again.iter().any(|x| matches!(x, KadPublish::Source { .. })));
-    let again = p.kad_publish(&mut s, (0, 0), true, 4662, 1, t + KEYWORD_REPUBLISH + 10);
+    let again = p.kad_publish(
+        &mut s,
+        (0, 0),
+        true,
+        None,
+        4662,
+        1,
+        t + KEYWORD_REPUBLISH + 10,
+    );
     assert!(again
         .iter()
         .any(|x| matches!(x, KadPublish::Keyword { .. })));
+}
+
+/// Firewalled with a Kad buddy (`EKadSourcePublish::Buddy`): keywords as
+/// usual, and ourselves as a source reached through the buddy (type 3,
+/// its address, our buddy ID).
+#[test]
+fn a_firewalled_client_with_a_buddy_publishes_through_it() {
+    use ed2k_types::tags::kad as t;
+    use ed2k_types::UInt128;
+    let dir = TempDir::new("publish-buddy");
+    let mut s = shares(&dir, &[("alpha.txt", 10)]);
+    let mut p = Publisher::new();
+    p.update_keywords(&s);
+    let buddy = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(198, 51, 100, 7), 4672);
+    let id = UInt128::new(0xABCD);
+    let out = p.kad_publish(&mut s, (0, 0), false, Some((buddy, id)), 4662, 3, 1_000_000);
+    assert!(matches!(out[0], KadPublish::Keyword { .. }));
+    let KadPublish::Source { tags, .. } = &out[1] else {
+        panic!("{out:?}")
+    };
+    let get = |n: &[u8]| tags.iter().find(|x| x.name.is(n)).and_then(|x| x.as_int());
+    assert_eq!(get(t::SOURCETYPE), Some(3));
+    assert_eq!(get(t::SERVERPORT), Some(4672));
+    assert_eq!(get(t::SOURCEPORT), Some(4662));
+    assert!(tags.iter().any(|x| x.name.is(t::BUDDYHASH)));
 }

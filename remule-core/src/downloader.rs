@@ -85,9 +85,13 @@ pub enum Command {
     /// (`ed2k_kad::Event::BuddyOffer`).
     BuddyOffer {
         tcp: SocketAddrV4,
+        kad_port: u16,
         user_hash: Md4Hash,
         connect_options: u8,
     },
+    /// Whether others can connect to us now (a HighID, Kad's firewall
+    /// check, or told so).
+    SetReachable(bool),
     /// Kad offered to serve a firewalled node (`ed2k_kad::Event::BuddyRequest`).
     BuddyRequest {
         buddy_id: ed2k_types::UInt128,
@@ -478,9 +482,13 @@ pub async fn run_with(
                         buddies.set_kad_id(id);
                         Vec::new()
                     }
-                    Some(Command::BuddyOffer { tcp, user_hash, connect_options }) => {
+                    Some(Command::BuddyOffer { tcp, kad_port, user_hash, connect_options }) => {
                         let conn = queue.new_conn_id();
-                        buddies.offer(tcp, user_hash, connect_options, conn, now)
+                        buddies.offer(tcp, kad_port, user_hash, connect_options, conn, now)
+                    }
+                    Some(Command::SetReachable(r)) => {
+                        queue.set_reachable(r);
+                        Vec::new()
                     }
                     Some(Command::BuddyRequest { buddy_id, user_hash, tcp }) => {
                         buddies.expect(buddy_id, user_hash, *tcp.ip(), now);

@@ -203,10 +203,12 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
         Report::BuddyLinked {
             addr,
             serving: false,
+            ..
         } => format!("Kad: {addr} is our buddy"),
         Report::BuddyLinked {
             addr,
             serving: true,
+            ..
         } => format!("Kad: we are {addr}'s buddy"),
         Report::BuddyLost { addr, why, .. } => format!("Kad: buddy {addr} lost ({why})"),
         Report::PartVerified { file, part } => format!("{}: part {part} verified", name(file)),
@@ -813,8 +815,10 @@ pub async fn run(
     if let Some(k) = &kad_node {
         let _ = cmd.send(Command::SetKadId(Some(k.prefs.kad_id)));
     }
-    // Our Kad buddy is up (we are firewalled), or we serve one.
-    let mut own_buddy = false;
+    // Our Kad buddy, once up (we are firewalled): its IP and Kad port.
+    let mut own_buddy: Option<SocketAddrV4> = None;
+    // What the downloader was last told of whether others reach us.
+    let mut told_reachable: Option<bool> = None;
 
     // External connections: a view of the client, refreshed every second,
     // and what they ask of it.
@@ -952,8 +956,10 @@ pub async fn run(
                 // The buddy links: ours stops the buddy search, one we serve
                 // stops Kad's offers.
                 match (&r, &kad_node) {
-                    (Report::BuddyLinked { serving: false, .. }, _) => own_buddy = true,
-                    (Report::BuddyLost { serving: false, .. }, _) => own_buddy = false,
+                    (Report::BuddyLinked { serving: false, addr, kad_port }, _) => {
+                        own_buddy = Some(SocketAddrV4::new(*addr.ip(), *kad_port));
+                    }
+                    (Report::BuddyLost { serving: false, .. }, _) => own_buddy = None,
                     (Report::BuddyLinked { serving: true, .. }, Some(k)) => k.handle.set_serving_buddy(true).await,
                     (Report::BuddyLost { serving: true, .. }, Some(k)) => k.handle.set_serving_buddy(false).await,
                     _ => {}
@@ -1036,9 +1042,9 @@ pub async fn run(
                     }
                     Some(KadEvent::Wire(w)) => eprintln!("{}", kad::wire_line(&w)),
                     // Buddies: the TCP side is the downloader's.
-                    Some(KadEvent::BuddyOffer { tcp, user_hash, connect_options }) => {
+                    Some(KadEvent::BuddyOffer { tcp, kad_port, user_hash, connect_options }) => {
                         info!("[{:>5}s] Kad: buddy offer from {tcp}", start.elapsed().as_secs());
-                        let _ = cmd.send(Command::BuddyOffer { tcp, user_hash, connect_options });
+                        let _ = cmd.send(Command::BuddyOffer { tcp, kad_port, user_hash, connect_options });
                     }
                     Some(KadEvent::BuddyRequest { buddy_id, user_hash, tcp }) => {
                         info!("[{:>5}s] Kad: buddy request from {tcp}, offered", start.elapsed().as_secs());
@@ -1409,7 +1415,15 @@ pub async fn run(
                     let publishes = {
                         let mut sh = sh.lock().unwrap_or_else(|e| e.into_inner());
                         publisher.update_keywords(&sh);
-                        publisher.kad_publish(&mut sh, running, reach.reachable(), c.tcp_port, 0x03, unix_now().into())
+                        publisher.kad_publish(
+                            &mut sh,
+                            running,
+                            reach.reachable(),
+                            own_buddy.map(|b| (b, ed2k_types::UInt128::new(u128::MAX) ^ k.prefs.kad_id)),
+                            c.tcp_port,
+                            0x03,
+                            unix_now().into(),
+                        )
                     };
                     for p in publishes {
                         let r = match p {
@@ -1432,9 +1446,15 @@ pub async fn run(
                         }
                     }
                 }
+                // Firewalled sources are asked for callbacks only while
+                // others can reach us.
+                if told_reachable != Some(reach.reachable()) {
+                    told_reachable = Some(reach.reachable());
+                    let _ = cmd.send(Command::SetReachable(reach.reachable()));
+                }
                 // Firewalled with no buddy: look for one when it is time.
                 if let (Some(k), Some(_)) = (&kad_node, kad_connected) {
-                    if k.handle.buddy_search(own_buddy).await.is_some() {
+                    if k.handle.buddy_search(own_buddy.is_some()).await.is_some() {
                         info!("[{:>5}s] Kad: looking for a buddy", t.as_secs());
                     }
                 }

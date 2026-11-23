@@ -116,6 +116,8 @@ pub enum Event {
     /// `RequestBuddy`): connect to its TCP port and keep the connection.
     BuddyOffer {
         tcp: SocketAddrV4,
+        /// Its Kad port: published with our sources, for callbacks.
+        kad_port: u16,
         user_hash: Md4Hash,
         /// Bit 0 crypt supported, 1 requested, 2 required (0 from old nodes).
         connect_options: u8,
@@ -1268,6 +1270,7 @@ impl Kad {
                 }
                 out.events.push(Event::BuddyOffer {
                     tcp: SocketAddrV4::new(*from.ip(), tcp_port),
+                    kad_port: from.port(),
                     user_hash: Md4Hash(user_hash.to_be_bytes()),
                     connect_options: connect_options.unwrap_or(0),
                 });
@@ -1436,6 +1439,44 @@ pub fn source_publish_tags(size: u64, tcp_port: u16, crypt_options: u8) -> Vec<T
             TagName::Str(t::SOURCETYPE.to_vec()),
             TagValue::U8(if large { 4 } else { 1 }),
         ),
+        int_tag(t::SOURCEPORT, u64::from(tcp_port)),
+        Tag::new(
+            TagName::Str(t::ENCRYPTION.to_vec()),
+            TagValue::U8(crypt_options),
+        ),
+    ]
+}
+
+/// `CSearch::StorePacket` for `STOREFILE` when we are firewalled and have
+/// a buddy (`EKadSourcePublish::Buddy`): source type 3 (5 for a file over
+/// 4 GB), the buddy's IP (network order) and Kad port, and the buddy ID
+/// that callbacks for us go by, as hex in eMule's layout as everyone
+/// publishes it.
+pub fn buddy_source_publish_tags(
+    size: u64,
+    tcp_port: u16,
+    crypt_options: u8,
+    buddy: SocketAddrV4,
+    buddy_id: UInt128,
+) -> Vec<Tag> {
+    use ed2k_types::tags::kad as t;
+    let large = size > u64::from(u32::MAX);
+    let hash: String = crate::search::buddy_id_other_layout(buddy_id)
+        .to_be_bytes()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    vec![
+        Tag::new(
+            TagName::Str(t::SOURCETYPE.to_vec()),
+            TagValue::U8(if large { 5 } else { 3 }),
+        ),
+        int_tag(
+            t::SERVERIP,
+            u64::from(u32::from_le_bytes(buddy.ip().octets())),
+        ),
+        int_tag(t::SERVERPORT, u64::from(buddy.port())),
+        Tag::new(TagName::Str(t::BUDDYHASH.to_vec()), TagValue::String(hash)),
         int_tag(t::SOURCEPORT, u64::from(tcp_port)),
         Tag::new(
             TagName::Str(t::ENCRYPTION.to_vec()),

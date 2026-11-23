@@ -14,12 +14,14 @@ use ed2k_hash::FileHashes;
 use ed2k_peer::hello::{CryptSettings, MiscOptions2};
 use ed2k_peer::packets::{self, AichRecovery, MultiAnswer, MultiRequest, ParseContext};
 use ed2k_peer::sources::{AnswerBuilder, ExchangedSource};
+use ed2k_peer::udp::UdpPacket;
 use ed2k_peer::{Hello, PartStatus, PeerPacket};
 use ed2k_types::ed2k::{EMBLOCKSIZE, PARTSIZE};
 use ed2k_types::Md4Hash;
 
 use crate::download_queue::{
     crypt, Action, ConnId, DownloadQueue, Endpoint, Origin, QueueConfig, Report, SourceState,
+    UdpOut,
 };
 use crate::tests_part_file::{data, hashes, parts, TempDir};
 use crate::PartFile;
@@ -201,6 +203,8 @@ struct World {
     now: Instant,
     /// Addresses that refuse connections.
     unreachable: HashSet<SocketAddr>,
+    /// Datagrams sent.
+    udp: Vec<UdpOut>,
 }
 
 impl World {
@@ -212,6 +216,7 @@ impl World {
             reports: Vec::new(),
             now: Instant::now(),
             unreachable: HashSet::new(),
+            udp: Vec::new(),
         }
     }
 
@@ -244,6 +249,7 @@ impl World {
                 Action::Close { conn } => {
                     self.conns.remove(&conn);
                 }
+                Action::SendUdp(d) => self.udp.push(d),
                 Action::Report(r) => self.reports.push(r),
             }
         }
@@ -969,4 +975,145 @@ fn a_deleted_category_moves_its_downloads_to_the_default_one() {
             .category
     };
     assert_eq!((cat(1), cat(2), cat(3), cat(4)), (0, 1, 0, 2));
+}
+
+/// `CPartFile::Process` for a queued source, `UDPReaskForDownload` and the
+/// answers to it: the reask goes out over UDP (obfuscated, laid out for the
+/// source's UDP version) 20 s before the TCP one is due, once; an answer
+/// with a rank puts the TCP reask off; unanswered, TCP asks; "file not
+/// found" drops the source.
+#[test]
+fn a_queued_source_is_reasked_over_udp_first() {
+    let dir = TempDir::new("q-udp-reask");
+    let d = Arc::new(data(SIZE, 21));
+    let h = Arc::new(hashes(&d));
+    let mut c = config(&dir);
+    c.reask = Duration::from_secs(60);
+    c.ours.udp_port = 4672;
+    let mut q = DownloadQueue::new(c);
+    let pf = PartFile::create(&dir.temp(), "test file.bin", h.ed2k, SIZE).unwrap();
+    assert!(q.add_file(pf));
+    let mut w = World::new(q);
+    let mut s = seeder_at(1, &d, &h, PartStatus::Complete);
+    s.queue_first = true;
+    s.hello.udp_port = 4672;
+    let ep = s.endpoint();
+    let udp_addr = SocketAddrV4::new(*ep.addr.ip(), 4672);
+    w.add_seeder(s.clone());
+    w.add_source(h.ed2k, ep);
+    w.tick();
+    // Queued; the seeder hangs up.
+    let (&conn, _) = w.conns.iter().next().unwrap();
+    w.conns.remove(&conn);
+    let a = w.q.closed(conn, w.now);
+    w.run(a.into());
+    let asked = w.now;
+    let connects = |w: &World| w.conns.len();
+
+    // Nothing until 40 s (60 - 20) have passed, then one ping.
+    while w.now < asked + Duration::from_secs(40) {
+        w.tick();
+        assert!(w.udp.is_empty(), "too early");
+    }
+    w.tick();
+    assert_eq!(w.udp.len(), 1);
+    let ping = w.udp[0].clone();
+    assert_eq!(ping.to, udp_addr);
+    assert_eq!(ping.obfuscate_for, Some(s.hello.user_hash));
+    // aMule's UDP version 4: our parts and the complete sources it knows.
+    assert_eq!(
+        UdpPacket::parse(&ping.payload, Some(4)).unwrap(),
+        UdpPacket::ReaskFilePing {
+            file: h.ed2k,
+            parts: Some(parts(3, &[])),
+            complete_sources: Some(1),
+        }
+    );
+    // Once only while it is unanswered.
+    for _ in 0..5 {
+        w.tick();
+    }
+    assert_eq!(w.udp.len(), 1);
+
+    // The answer, rank 2: no TCP reask at 60 s, the clock starts again.
+    let ack = UdpPacket::ReaskAck {
+        parts: Some(PartStatus::Complete),
+        rank: 2,
+    };
+    let a = w.q.udp_packet(udp_addr, &ack.to_datagram(4), w.now);
+    w.run(a.into());
+    assert!(w.reports.contains(&Report::Queued {
+        file: h.ed2k,
+        addr: ep.addr,
+        rank: Some(2)
+    }));
+    let acked = w.now;
+    // From another port, or unasked: ignored.
+    let a = w.q.udp_packet(udp_addr, &ack.to_datagram(4), w.now);
+    assert!(a.is_empty());
+    while w.now < asked + Duration::from_secs(65) {
+        w.tick();
+        assert_eq!(connects(&w), 0, "TCP reask despite the UDP answer");
+    }
+    // The next ping 40 s after the answer, left unanswered: TCP at 60 s.
+    while w.udp.len() < 2 {
+        w.tick();
+    }
+    assert!(w.now >= acked + Duration::from_secs(40));
+    while connects(&w) == 0 {
+        w.tick();
+        assert!(w.now <= acked + Duration::from_secs(62), "no TCP reask");
+    }
+    assert!(w.now > acked + Duration::from_secs(60));
+    let (&conn, _) = w.conns.iter().next().unwrap();
+    w.conns.remove(&conn);
+    let a = w.q.closed(conn, w.now);
+    w.run(a.into());
+
+    // Next time the file is gone: the source is dropped.
+    while w.udp.len() < 3 {
+        w.tick();
+    }
+    let a =
+        w.q.udp_packet(udp_addr, &UdpPacket::FileNotFound.to_datagram(4), w.now);
+    w.run(a.into());
+    assert!(w.q.sources_of(&h.ed2k).is_empty());
+    assert!(w.reports.iter().any(|r| matches!(r,
+        Report::SourceDropped { why, .. } if why.contains("not found"))));
+}
+
+/// No UDP reask without a UDP port of ours, or as a LowID (others cannot
+/// answer what they cannot reach).
+#[test]
+fn no_udp_reask_without_a_port_or_as_a_low_id() {
+    for (udp_port, id) in [(0u16, None), (4672, Some(5000u32))] {
+        let dir = TempDir::new("q-udp-none");
+        let d = Arc::new(data(SIZE, 21));
+        let h = Arc::new(hashes(&d));
+        let mut c = config(&dir);
+        c.reask = Duration::from_secs(60);
+        c.ours.udp_port = udp_port;
+        if let Some(id) = id {
+            c.ours.id = id;
+        }
+        let mut q = DownloadQueue::new(c);
+        let pf = PartFile::create(&dir.temp(), "test file.bin", h.ed2k, SIZE).unwrap();
+        assert!(q.add_file(pf));
+        let mut w = World::new(q);
+        let mut s = seeder_at(1, &d, &h, PartStatus::Complete);
+        s.queue_first = true;
+        s.hello.udp_port = 4672;
+        let ep = s.endpoint();
+        w.add_seeder(s);
+        w.add_source(h.ed2k, ep);
+        w.tick();
+        let (&conn, _) = w.conns.iter().next().unwrap();
+        w.conns.remove(&conn);
+        let a = w.q.closed(conn, w.now);
+        w.run(a.into());
+        for _ in 0..70 {
+            w.tick();
+        }
+        assert!(w.udp.is_empty());
+    }
 }

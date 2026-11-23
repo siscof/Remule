@@ -18,7 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,11 +32,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::download_queue::{
-    Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report,
+    Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report, UdpOut,
 };
 use crate::part_file::PartFile;
 use crate::uploader::Uploader;
 use ed2k_peer::PeerPacket;
+use ed2k_types::ed2k::client_udp::Opcode as UdpOpcode;
 
 /// What the application can tell a running downloader.
 #[derive(Debug)]
@@ -71,6 +72,12 @@ pub enum Command {
     /// A category was deleted: the downloads in it, or after it, moved
     /// ([`DownloadQueue::remove_category`]).
     RemoveCategory(u32),
+    /// A client UDP datagram (eMule protocol, decrypted) came to our UDP
+    /// port: a reask for the uploader, or an answer to one of ours.
+    Udp {
+        from: SocketAddrV4,
+        datagram: Vec<u8>,
+    },
     /// Hang up, save the files, and return the queue.
     Shutdown,
 }
@@ -102,6 +109,10 @@ pub struct DownloaderConfig {
     pub stop_when_done: bool,
     /// Accept obfuscated callbacks, padded up to this much.
     pub max_padding: u8,
+    /// Where client UDP datagrams go out ([`Action::SendUdp`]): the
+    /// application owns the UDP port (shared with Kad, as in aMule).
+    /// Without it, nothing is sent over UDP.
+    pub udp: Option<mpsc::UnboundedSender<UdpOut>>,
 }
 
 impl DownloaderConfig {
@@ -111,6 +122,7 @@ impl DownloaderConfig {
             tick: Duration::from_secs(1),
             stop_when_done: false,
             max_padding: remule_net::conn::DEFAULT_MAX_PADDING,
+            udp: None,
         }
     }
 }
@@ -411,6 +423,16 @@ pub async fn run_with(
                         queue.remove_category(cat);
                         Vec::new()
                     }
+                    Some(Command::Udp { from, datagram }) => {
+                        if datagram.get(1) == Some(&(UdpOpcode::ReaskFilePing as u8)) {
+                            match uploader.as_mut() {
+                                Some(up) => up.udp_reask(from, &datagram, now),
+                                None => Vec::new(),
+                            }
+                        } else {
+                            queue.udp_packet(from, &datagram, now)
+                        }
+                    }
                     Some(Command::File { file, op, reply }) => {
                         let mut out = Vec::new();
                         let missing = || Err(format!("FileHash not found: {file}"));
@@ -467,6 +489,11 @@ pub async fn run_with(
                         tokio::spawn(async move {
                             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
                         });
+                    }
+                }
+                Action::SendUdp(d) => {
+                    if let Some(tx) = &config.udp {
+                        let _ = tx.send(d);
                     }
                 }
                 Action::Report(r) => {

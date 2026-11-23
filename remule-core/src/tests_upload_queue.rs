@@ -13,7 +13,7 @@ use ed2k_types::Md4Hash;
 
 use crate::credits::Credits;
 use crate::tests_part_file::{data, TempDir};
-use crate::upload_queue::{Answer, Asker, QueueAction, UploadConfig, UploadQueue};
+use crate::upload_queue::{Answer, Asker, QueueAction, UdpReask, UploadConfig, UploadQueue};
 
 fn asker(n: u8) -> Asker {
     Asker {
@@ -22,6 +22,9 @@ fn asker(n: u8) -> Asker {
         low_id: false,
         score_ratio: 1.0,
         old_emule: false,
+        udp_port: 4672,
+        udp_version: 4,
+        crypt_udp: false,
     }
 }
 
@@ -319,6 +322,9 @@ fn a_shared_file_uploads_into_a_part_file() {
         low_id: false,
         score_ratio: 1.0,
         old_emule: false,
+        udp_port: 0,
+        udp_version: 0,
+        crypt_udp: false,
     };
     let (mut up, out) = UploadSession::accepted(hello(0x22, 0x0200_000A), peer_hello).unwrap();
     let mut to_down: VecDeque<Packet> = out.send.into();
@@ -661,4 +667,85 @@ fn the_credit_history_carries_the_metadata_block() {
     assert_eq!(h[0].0.key, a.key);
     assert_eq!(h[0].1.as_ref().unwrap().sessions, 3);
     assert_eq!((h[1].0.downloaded, h[1].1.is_none()), (20, true));
+}
+
+/// `OP_REASKFILEPING` as `CClientUDPSocket::ProcessPacket` takes it: the
+/// waiting peer found by IP and UDP port (or IP alone when it is the only
+/// one there), its place kept and its rank given; another file gets no
+/// answer; a stranger hears the queue is full only when it nearly is.
+#[test]
+fn udp_reasks_find_the_waiting_peer() {
+    let t0 = Instant::now();
+    let mut q = UploadQueue::new(UploadConfig {
+        max_upload_kbps: 20,
+        queue_size: 100,
+        purge_after: Duration::from_secs(3600),
+        ..Default::default()
+    });
+    // Two slots taken, then 3 and 4 wait.
+    for n in 1..=4 {
+        ask(&mut q, asker(n), t0 + Duration::from_secs(u64::from(n) * 2));
+    }
+    assert_eq!(q.waiting_count(), 2);
+    let ip = |n| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n));
+    let t = t0 + Duration::from_secs(60);
+    assert_eq!(
+        q.udp_reask(ip(4), 4672, FILE, t),
+        UdpReask::Waiting {
+            user: Md4Hash([4; 16]),
+            rank: 2,
+            udp_version: 4,
+            crypt_udp: false
+        }
+    );
+    // From another port of a lone waiter's IP: still it, the port updated.
+    assert!(matches!(
+        q.udp_reask(ip(3), 5000, FILE, t),
+        UdpReask::Waiting { rank: 1, .. }
+    ));
+    assert!(matches!(
+        q.udp_reask(ip(3), 5000, FILE, t),
+        UdpReask::Waiting { rank: 1, .. }
+    ));
+    assert_eq!(
+        q.udp_reask(ip(3), 5000, Md4Hash([9; 16]), t),
+        UdpReask::OtherFile {
+            user: Md4Hash([3; 16]),
+            crypt_udp: false
+        }
+    );
+    // Strangers: room enough, then 50 or fewer places left.
+    assert_eq!(
+        q.udp_reask(ip(9), 4672, FILE, t),
+        UdpReask::Unknown { queue_full: false }
+    );
+    q = UploadQueue::new(UploadConfig {
+        max_upload_kbps: 20,
+        queue_size: 49,
+        ..Default::default()
+    });
+    assert_eq!(
+        q.udp_reask(ip(9), 4672, FILE, t),
+        UdpReask::Unknown { queue_full: true }
+    );
+    // Two waiting from one address, asking from a third port.
+    let mut q = UploadQueue::new(UploadConfig {
+        max_upload_kbps: 20,
+        queue_size: 100,
+        ..Default::default()
+    });
+    for n in 1..=2 {
+        ask(&mut q, asker(n), t0);
+    }
+    for (n, port) in [(5u8, 1000u16), (6, 2000)] {
+        let mut a = asker(n);
+        a.ip = ip(7);
+        a.udp_port = port;
+        ask(&mut q, a, t0);
+    }
+    assert_eq!(q.udp_reask(ip(7), 3000, FILE, t), UdpReask::Ambiguous);
+    assert!(matches!(
+        q.udp_reask(ip(7), 2000, FILE, t),
+        UdpReask::Waiting { user, .. } if user == Md4Hash([6; 16])
+    ));
 }

@@ -1172,7 +1172,7 @@ fn legacy_challenges_verify_old_nodes() {
         .iter()
         .map(|d| read_as(&net.nodes[1], net.addrs[0], &d.bytes))
         .collect();
-    assert!(parsed.iter().any(|p| *p == KadPacket::Ping));
+    assert!(parsed.contains(&KadPacket::Ping));
     assert!(!parsed.iter().any(|p| matches!(p, KadPacket::Req { .. })));
     // Version 8 proves itself with the ACK: neither.
     let mut net = Net::new(&ids, &mut rng);

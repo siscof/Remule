@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::buddy::Buddies;
+use crate::buddy::{Buddies, ForUploader};
 use crate::download_queue::{
     Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report, UdpOut,
 };
@@ -363,10 +363,15 @@ pub async fn run_with(
                     // A Kad buddy link; callbacks through it are answered by
                     // the upload side.
                     NetEvent::Packet(c, p) if buddies.owns(c) => {
-                        let (mut a, callbacks) = buddies.packet(c, p, now);
+                        let (mut a, work) = buddies.packet(c, p, now);
                         if let Some(up) = uploader.as_mut() {
-                            for cb in callbacks {
-                                a.extend(up.answer_callback(cb.addr, cb.file, now, &mut || queue.new_conn_id()));
+                            for w in work {
+                                a.extend(match w {
+                                    ForUploader::CallBack { addr, file } => {
+                                        up.answer_callback(addr, file, now, &mut || queue.new_conn_id())
+                                    }
+                                    ForUploader::Reask { from, datagram } => up.udp_reask(from, &datagram, now),
+                                });
                             }
                         }
                         a
@@ -511,6 +516,14 @@ pub async fn run_with(
                                     direct_callbacks.insert(*from.ip(), now);
                                     let addr = SocketAddrV4::new(*from.ip(), tcp_port);
                                     up.answer_direct_callback(addr, user_hash, connect_options, now, &mut || queue.new_conn_id())
+                                }
+                                _ => Vec::new(),
+                            }
+                        } else                         if datagram.get(1) == Some(&(UdpOpcode::ReaskCallbackUdp as u8)) {
+                            // For the firewalled node we serve as its buddy.
+                            match ed2k_peer::udp::UdpPacket::parse(&datagram, None) {
+                                Ok(ed2k_peer::udp::UdpPacket::ReaskCallbackUdp { buddy_id, ping }) => {
+                                    buddies.relay_reask(from, buddy_id, &ping)
                                 }
                                 _ => Vec::new(),
                             }

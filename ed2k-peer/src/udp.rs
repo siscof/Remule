@@ -55,6 +55,15 @@ pub enum UdpPacket {
         /// Bit 0 crypt supported, 1 requested, 2 required.
         connect_options: u8,
     },
+    /// `OP_REASKCALLBACKUDP`: a reask for a firewalled source, sent to its
+    /// Kad buddy to pass on: `<buddy ID 16>` (raw, as the source published
+    /// it) then what an `OP_REASKFILEPING` carries, laid out for the
+    /// source's UDP version.
+    ReaskCallbackUdp {
+        buddy_id: [u8; 16],
+        /// The `OP_REASKFILEPING` payload: file hash first.
+        ping: Vec<u8>,
+    },
 }
 
 /// Why a datagram is not a client UDP packet we read.
@@ -114,6 +123,11 @@ impl UdpPacket {
                 w.hash(*user_hash);
                 w.u8(*connect_options);
             }
+            UdpPacket::ReaskCallbackUdp { buddy_id, ping } => {
+                w.u8(Opcode::ReaskCallbackUdp as u8);
+                w.bytes(buddy_id);
+                w.bytes(ping);
+            }
         }
         w.into_bytes()
     }
@@ -164,6 +178,19 @@ impl UdpPacket {
                 user_hash: r.hash().map_err(bad)?,
                 connect_options: r.u8().map_err(bad)?,
             }),
+            Ok(Opcode::ReaskCallbackUdp) => {
+                // The buddy ID, then at least the file hash (`size < 17`
+                // is malformed for aMule; it reads the hash later).
+                if payload.len() < 32 {
+                    return Err(BadUdpPacket::Malformed("callback reask too short".into()));
+                }
+                let mut buddy_id = [0u8; 16];
+                buddy_id.copy_from_slice(&payload[..16]);
+                Ok(UdpPacket::ReaskCallbackUdp {
+                    buddy_id,
+                    ping: payload[16..].to_vec(),
+                })
+            }
             Ok(Opcode::FileNotFound) => Ok(UdpPacket::FileNotFound),
             Ok(Opcode::QueueFull) => Ok(UdpPacket::QueueFull),
             _ => Err(BadUdpPacket::Unhandled(op)),

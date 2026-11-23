@@ -880,10 +880,15 @@ impl DownloadQueue {
     /// Only while others can reach us (a HighID), with a UDP port of our
     /// own, and not when the source is to be asked for sources (that
     /// needs TCP).
+    ///
+    /// A firewalled source (one reached through its Kad buddy) is asked
+    /// through the buddy instead (`OP_REASKCALLBACKUDP`), unobfuscated;
+    /// it answers us directly, whether we are firewalled or not.
     fn udp_reasks(&mut self, now: Instant, out: &mut Vec<Action>) {
-        if self.config.ours.udp_port == 0 || self.config.ours.id < 0x0100_0000 {
+        if self.config.ours.udp_port == 0 {
             return;
         }
+        let high_id = self.config.ours.id >= 0x0100_0000;
         let early = self.config.reask.saturating_sub(UDP_REASK_EARLY);
         let ids: Vec<u64> = self
             .sources
@@ -893,6 +898,7 @@ impl DownloadQueue {
                     && s.conn.is_none()
                     && !s.udp_pending
                     && s.udp.is_some()
+                    && (high_id || s.endpoint.buddy.is_some())
                     && s.last_asked
                         .is_some_and(|t| now.saturating_duration_since(t) > early)
             })
@@ -906,8 +912,10 @@ impl DownloadQueue {
             if e.done || e.file.is_stopped() {
                 continue;
             }
+            // Only a direct reask gives way to asking for sources over TCP
+            // (the buddy branch of `UDPReaskForDownload` does not check).
             let count = self.source_count(&s.file);
-            if wants_sources(&self.config, e, s, count, now) {
+            if s.endpoint.buddy.is_none() && wants_sources(&self.config, e, s, count, now) {
                 continue;
             }
             let (port, version) = s.udp.unwrap_or_default();
@@ -921,13 +929,34 @@ impl DownloadQueue {
                 parts: Some(e.file.part_status()),
                 complete_sources: Some(complete.min(u16::MAX as usize) as u16),
             };
-            let to = SocketAddrV4::new(*s.endpoint.addr.ip(), port);
-            let obfuscate_for = s.endpoint.user_hash.filter(|_| s.crypt_udp);
-            out.push(Action::SendUdp(UdpOut {
-                to,
-                payload: ping.to_datagram(version),
-                obfuscate_for,
-            }));
+            let datagram = ping.to_datagram(version);
+            match s.endpoint.buddy {
+                Some(route) => {
+                    let relayed = UdpPacket::ReaskCallbackUdp {
+                        buddy_id: if s.callback_other_layout {
+                            ed2k_kad::search::buddy_id_other_layout(route.id)
+                        } else {
+                            route.id
+                        }
+                        .to_be_bytes(),
+                        ping: datagram[2..].to_vec(),
+                    };
+                    out.push(Action::SendUdp(UdpOut {
+                        to: route.kad,
+                        payload: relayed.to_datagram(version),
+                        obfuscate_for: None,
+                    }));
+                }
+                None => {
+                    let to = SocketAddrV4::new(*s.endpoint.addr.ip(), port);
+                    let obfuscate_for = s.endpoint.user_hash.filter(|_| s.crypt_udp);
+                    out.push(Action::SendUdp(UdpOut {
+                        to,
+                        payload: datagram,
+                        obfuscate_for,
+                    }));
+                }
+            }
             self.sources.get_mut(&id).unwrap().udp_pending = true;
         }
     }
@@ -1310,6 +1339,7 @@ impl DownloadQueue {
         s.last_asked = Some(now);
         s.callback_unanswered = false;
         s.endpoint.user_hash.get_or_insert(hello.user_hash);
+        note_udp(s, &hello, self.config.request_obfuscation);
         let e = self.files.get_mut(&s.file).unwrap();
         let view = SourceView {
             file: &mut e.file,
@@ -1399,14 +1429,7 @@ impl DownloadQueue {
                 Event::Handshake(h) => {
                     s.endpoint.user_hash.get_or_insert(h.user_hash);
                     start_ident = self.config.identity.is_some();
-                    let udp_version = h.misc1.map_or(0, |m| m.udp_version);
-                    s.udp =
-                        (h.udp_port != 0 && udp_version != 0).then_some((h.udp_port, udp_version));
-                    let theirs = h.misc2.unwrap_or_default();
-                    s.crypt_udp = theirs.supports_crypt
-                        && (theirs.requires_crypt
-                            || theirs.requests_crypt
-                            || self.config.request_obfuscation);
+                    note_udp(s, &h, self.config.request_obfuscation);
                 }
                 Event::PeerParts(p) => {
                     if let Some(old) = s.parts.take() {
@@ -1685,6 +1708,16 @@ impl DownloadQueue {
             })),
         }
     }
+}
+
+/// What a source's hello says of reaching it over UDP: its port and UDP
+/// version, and whether to obfuscate (`ShouldReceiveCryptUDPPackets`).
+fn note_udp(s: &mut Source, h: &Hello, request_obfuscation: bool) {
+    let udp_version = h.misc1.map_or(0, |m| m.udp_version);
+    s.udp = (h.udp_port != 0 && udp_version != 0).then_some((h.udp_port, udp_version));
+    let theirs = h.misc2.unwrap_or_default();
+    s.crypt_udp = theirs.supports_crypt
+        && (theirs.requires_crypt || theirs.requests_crypt || request_obfuscation);
 }
 
 /// Whether to ask a source for more sources (the file's half of

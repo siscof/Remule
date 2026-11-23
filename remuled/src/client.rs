@@ -11,7 +11,7 @@
 //! stops when one asks it to.
 //!
 //! With `REMULE_TRACE` set, every peer packet's protocol, opcode and size
-//! is printed to stderr.
+//! is printed to stderr, and every Kad datagram with how it was obfuscated.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -763,6 +763,8 @@ pub async fn run(
                 user_hash: c.user_hash,
                 reachable: c.reachable,
                 listening,
+                allow_lan: c.allow_lan,
+                trace_wire: kad::trace_from_env(),
             })
             .await?,
         ),
@@ -961,6 +963,7 @@ pub async fn run(
                             });
                         }
                     }
+                    Some(KadEvent::Wire(w)) => eprintln!("{}", kad::wire_line(&w)),
                     None => kad_node = None,
                 }
             }
@@ -1107,6 +1110,8 @@ pub async fn run(
                                             user_hash: c.user_hash,
                                             reachable: c.reachable,
                                             listening,
+                                            allow_lan: c.allow_lan,
+                                            trace_wire: kad::trace_from_env(),
                                         }).await;
                                         if started.is_ok() {
                                             break;

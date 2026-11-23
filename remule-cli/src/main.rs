@@ -132,6 +132,9 @@ enum Command {
         /// The UDP port is reachable from outside: store what others publish.
         #[arg(long)]
         reachable: bool,
+        /// Take contacts on LAN addresses (aMule's FilterLanIPs off).
+        #[arg(long)]
+        allow_lan: bool,
     },
     /// Download files from ed2k links, with sources from servers and Kad. Downloads
     /// already in the temp directory (remule's or aMule's) are resumed.
@@ -341,6 +344,7 @@ fn main() -> ExitCode {
             limit,
             verbose,
             reachable,
+            allow_lan,
         } => run_async(kad::run(kad::KadArgs {
             nodes,
             dir,
@@ -354,6 +358,7 @@ fn main() -> ExitCode {
             limit,
             verbose,
             reachable,
+            allow_lan,
         })),
         Command::Download {
             links,

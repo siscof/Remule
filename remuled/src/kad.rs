@@ -7,12 +7,42 @@ use std::path::PathBuf;
 
 use ed2k_formats::nodes_dat::NodesDat;
 use ed2k_kad::driver::{self, KadHandle};
-use ed2k_kad::node::Config;
+use ed2k_kad::node::{Config, Wire, WireForm};
 use ed2k_kad::prefs::{self, KadPrefs};
 use ed2k_kad::Kad;
+use ed2k_types::kad::v2::Opcode;
 use ed2k_types::{Md4Hash, UInt128};
 use rand::Rng;
 use tracing::info;
+
+/// Whether `REMULE_TRACE` asks for every datagram.
+pub fn trace_from_env() -> bool {
+    std::env::var_os("REMULE_TRACE").is_some()
+}
+
+/// A traced datagram as one line: direction, peer, opcode and how it was
+/// obfuscated, e.g. `kad <- 10.0.0.2:4672 HelloRes obfuscated (Kad ID), receiver key valid`.
+pub fn wire_line(w: &Wire) -> String {
+    let op = Opcode::try_from(w.opcode)
+        .map(|o| format!("{o:?}"))
+        .unwrap_or_else(|_| format!("{:#04x}", w.opcode));
+    let form = match w.form {
+        WireForm::Plain => "plain",
+        WireForm::KadId => "obfuscated (Kad ID)",
+        WireForm::KadVerifyKey => "obfuscated (verify key)",
+        WireForm::Ed2k => "obfuscated (user hash)",
+    };
+    format!(
+        "kad {} {} {op} {form}{}",
+        if w.incoming { "<-" } else { "->" },
+        w.peer,
+        if w.receiver_key_valid {
+            ", receiver key valid"
+        } else {
+            ""
+        }
+    )
+}
 
 /// The index files in the state directory.
 pub const INDEX_FILES: [&str; 3] = ["load_index.dat", "key_index.dat", "src_index.dat"];
@@ -53,6 +83,10 @@ pub struct KadStart {
     /// check acks that come there and connect back when it is asked to:
     /// the TCP firewall check runs.
     pub listening: bool,
+    /// Take contacts on LAN addresses (aMule's `FilterLanIPs` off).
+    pub allow_lan: bool,
+    /// Hand every datagram to the application as an `Event::Wire`.
+    pub trace_wire: bool,
 }
 
 /// Load the state, bind the UDP port and start the node.
@@ -81,6 +115,8 @@ pub async fn start(a: &KadStart) -> Result<KadNode, String> {
     let now = driver::unix_now();
     let mut kad = Kad::new(cfg, now);
     kad.load_public_ip(prefs.public_ip);
+    kad.routing.filter_lan = !a.allow_lan;
+    kad.trace_wire = a.trace_wire;
     for (i, name) in INDEX_FILES.iter().enumerate() {
         let Ok(b) = std::fs::read(a.dir.join(name)) else {
             continue;

@@ -302,5 +302,8 @@ async fn run(
                 }
             }
         }
+        for w in kad.take_wire() {
+            let _ = events.send(Event::Wire(w)).await;
+        }
     }
 }

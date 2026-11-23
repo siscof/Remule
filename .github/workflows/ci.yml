@@ -156,7 +156,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask2
+          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask2-daemon-only
       - name: Build amulecmd, amulegui, amuleapi and amuled
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
@@ -164,21 +164,23 @@ jobs:
           cd /tmp/amule-src
           git fetch -q --depth 1 https://github.com/amule-org/amule.git "$AMULE_REF"
           git checkout -q FETCH_HEAD
-          # udp-reask-with-amule.sh: let SourceReaskMinutes go down to 2
-          # (aMule's least is 15), so aMule reasks within the job. The
-          # default stays 15, so nothing else changes.
-          grep -q 'SOURCE_REASK_MINUTES{ 15, 15, 60 }' src/SourceSearchLimits.h
-          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 2, 15, 60 }/' src/SourceSearchLimits.h
           cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_MONOLITHIC=NO -DBUILD_DAEMON=YES -DBUILD_ED2K=NO -DBUILD_AMULECMD=YES -DBUILD_REMOTEGUI=YES -DBUILD_AMULEAPI=YES \
             -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
             -DENABLE_MEDIA_PROBE=OFF -DENABLE_VERSION_CHECK=OFF -DENABLE_BFD=NO \
             -DTRANSLATED_MANPAGES=NO
-          cmake --build build --target amulecmd amulegui amuleapi amuled -j "$(nproc)"
+          cmake --build build --target amulecmd amulegui amuleapi -j "$(nproc)"
           mkdir -p /opt/amulecmd
           cp "$(find build -type f -name amulecmd -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amulegui -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amuleapi -perm -u+x | head -1)" /opt/amulecmd/
+          # amuled only, for udp-reask-with-amule.sh: SourceReaskMinutes may
+          # go down to 2 (aMule's least is 15), so aMule reasks within the
+          # job; the default stays 15. The tools above, amuleapi among them
+          # (its preferences schema reads these limits), keep aMule's own.
+          grep -q 'SOURCE_REASK_MINUTES{ 15, 15, 60 }' src/SourceSearchLimits.h
+          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 2, 15, 60 }/' src/SourceSearchLimits.h
+          cmake --build build --target amuled -j "$(nproc)"
           cp "$(find build -type f -name amuled -perm -u+x | head -1)" /opt/amulecmd/
           # amuleapi's curl suite and static frontend, where run-all.sh
           # looks for them (it climbs three levels from its own folder).

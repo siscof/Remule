@@ -157,25 +157,30 @@ async fn conn_task(
         How::Incoming(s, hs) => (s, hs, false),
     };
     let _ = stream.set_nodelay(true);
-    let obfuscated = matches!(handshake, Handshake::Client { .. });
     let established =
         tokio::time::timeout(CONNECTION_TIMEOUT, establish(stream, handshake, cfg)).await;
-    // REMULE_TRACE: each connection we make, and each packet's protocol,
-    // opcode and size; =2 also the payload of packets up to 64 bytes, in hex.
+    // REMULE_TRACE: each connection made or accepted and whether it is
+    // obfuscated, and each packet's protocol, opcode and size; =2 also the
+    // payload of packets up to 64 bytes, in hex.
     let trace_level = std::env::var("REMULE_TRACE").map_or(0, |v| if v == "2" { 2 } else { 1 });
     let trace = trace_level > 0;
+    let way = if outgoing { "connected" } else { "accepted" };
     let Ok(Ok((mut reader, mut writer))) = established else {
-        if let (true, true, Some(a)) = (trace, outgoing, &how_addr) {
-            eprintln!("{a} handshake failed");
+        if let (true, Some(a)) = (trace, &how_addr) {
+            eprintln!("{a} handshake failed ({way})");
         }
         let _ = events.send(NetEvent::Closed(conn));
         return;
     };
+    if let (true, Some(a)) = (trace, &how_addr) {
+        let kind = if writer.is_obfuscated() {
+            "obfuscated"
+        } else {
+            "plain"
+        };
+        eprintln!("{a} {way}, {kind}");
+    }
     if outgoing {
-        if let (true, Some(a)) = (trace, &how_addr) {
-            let kind = if obfuscated { "obfuscated" } else { "plain" };
-            eprintln!("{a} connected, {kind}");
-        }
         let _ = events.send(NetEvent::Connected(conn));
     }
     let hex = |p: &Packet| -> String {

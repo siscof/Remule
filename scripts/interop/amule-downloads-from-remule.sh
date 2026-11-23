@@ -12,8 +12,16 @@
 # (IsGoodIP), so remule is reached on this machine's own LAN address, with
 # FilterLanIPs off.
 #
+# With OBFUSCATED=1 (MIGRATION_PLAN.md 4.M, aMule to remule): aMule requires
+# obfuscation (IsClientCryptLayerRequired), and the link has no source.
+# remule logs into the fake server too and offers the file; aMule asks the
+# server for sources and is given remule with its user hash and obfuscation
+# settings (OP_FOUNDSOURCES_OBFU), so it can connect to remule obfuscated,
+# which remule's trace must show for every connection it accepts.
+#
 # Usage: scripts/interop/amule-downloads-from-remule.sh
 # Environment:
+#   OBFUSCATED=1                   as above (remule as the source only)
 #   REMULE=target/release/remule   the remule binary
 #   SIZE=24000000                  bytes to share (default: three parts)
 #   TIMEOUT=300                    seconds aMule gets to finish
@@ -24,6 +32,7 @@ set -euo pipefail
 REMULE=$(realpath "${REMULE:-target/release/remule}")
 SIZE=${SIZE:-24000000}
 TIMEOUT=${TIMEOUT:-180}
+OBFUSCATED=${OBFUSCATED:-0}
 REMULE_PORT=4663
 AMULE_PORT=4662
 # Not 4661: aMule pings a server's UDP port at TCP + 4, and 4665 is aMule's
@@ -89,7 +98,10 @@ head -c "$SIZE" /dev/urandom > "$WORK/share/$NAME"
 # All of remule's output first: grep -m1 would close the pipe on it.
 HASH_OUT=$("$REMULE" hash "$WORK/share/$NAME")
 LINK=$(printf '%s\n' "$HASH_OUT" | grep -m1 '^ed2k://')
-LINK="${LINK}|sources,$IP:$REMULE_PORT|/"
+HASH=$(printf '%s\n' "$LINK" | cut -d'|' -f5 | tr 'A-F' 'a-f')
+# Obfuscated, the server gives remule, user hash and all; a link source has
+# no user hash to key the handshake on.
+[ "$OBFUSCATED" = 1 ] || LINK="${LINK}|sources,$IP:$REMULE_PORT|/"
 echo "link: $LINK"
 
 # Headers of the peer connection, to see who stops sending or reading.
@@ -155,8 +167,11 @@ EOF
 	amulecmd -h 127.0.0.1 -p 4713 -P "$EC_PASS" -c "show shared" 2>&1 | tail -5 | sed 's/^/  /'
 else
 	# remule shares it and waits; every peer packet is traced to its log.
+	# Obfuscated, it logs into the server and offers the file there.
+	SERVER_ARGS=()
+	[ "$OBFUSCATED" = 1 ] && SERVER_ARGS=(--server "$IP:$SERVER_PORT")
 	REMULE_TRACE=2 "$REMULE" download --share "$WORK/share" --config "$WORK/remule-config" \
-		--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" \
+		--temp "$WORK/remule-temp" --incoming "$WORK/remule-incoming" "${SERVER_ARGS[@]}" \
 		--port "$REMULE_PORT" --allow-lan --max-upload "${MAX_UPLOAD:-1024}" --duration $((TIMEOUT + 60)) --status-every 15 \
 		> "$WORK/remule.log" 2>&1 &
 	PIDS+=($!)
@@ -190,6 +205,14 @@ ECPassword=$(printf '%s' "$EC_PASS" | md5sum | cut -d' ' -f1)
 IpFilterClients=0
 IpFilterServers=0
 EOF
+if [ "$OBFUSCATED" = 1 ]; then
+	cat >> "$AMULE_CFG/amule.conf" <<EOF
+[Obfuscation]
+IsClientCryptLayerSupported=1
+IsCryptLayerRequested=1
+IsClientCryptLayerRequired=1
+EOF
+fi
 # Its only server is the fake one. Without a server.met, aMule 2.3.3 fetches
 # one over HTTP at start (addresses.dat), which aborts with wxWidgets 3.2.
 python3 - "$IP" "$SERVER_PORT" "$AMULE_CFG/server.met" <<'PY'
@@ -223,6 +246,16 @@ done
 cmd status
 [ "$connected" = 1 ] || { echo "aMule did not log into the fake server"; dump_logs; exit 1; }
 
+if [ "$OBFUSCATED" = 1 ]; then
+	offered=0
+	for _ in $(seq 1 60); do
+		if grep -qs "offered .*$HASH" "$WORK/server.log"; then offered=1; break; fi
+		sleep 1
+	done
+	[ "$offered" = 1 ] || { echo "remule did not offer the file to the server"; dump_logs; exit 1; }
+	echo "remule offered the file to the server"
+fi
+
 echo "adding the link to aMule"
 cmd "add $LINK"
 
@@ -232,6 +265,16 @@ while :; do
 	if [ -f "$AMULE_CFG/Incoming/$NAME" ] && cmp -s "$AMULE_CFG/Incoming/$NAME" "$WORK/share/$NAME"; then
 		echo "aMule finished the file after $((now - start))s, byte for byte"
 		grep -i "uploading" "$WORK/remule.log" || true
+		if [ "$OBFUSCATED" = 1 ]; then
+			grep -s " accepted, \| handshake failed" "$WORK/remule.log" | sed 's/^/  /' || true
+			if grep -qs " accepted, plain" "$WORK/remule.log"; then
+				echo "FAIL: aMule connected to remule unobfuscated"; dump_logs; exit 1
+			fi
+			if ! grep -qs " accepted, obfuscated" "$WORK/remule.log"; then
+				echo "FAIL: remule accepted no obfuscated connection"; dump_logs; exit 1
+			fi
+			echo "PASS: aMule, requiring obfuscation, downloaded from remule over an obfuscated connection"
+		fi
 		exit 0
 	fi
 	if [ $((now - start)) -ge "$TIMEOUT" ]; then

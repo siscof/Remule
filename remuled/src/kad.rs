@@ -137,6 +137,7 @@ fn load(a: &KadStart) -> Result<(Kad, KadPrefs), String> {
         udp_key_secret: rand::thread_rng().gen(),
         user_hash: a.user_hash,
         tcp_port: a.tcp_port,
+        udp_port: a.udp_port,
         tcp_firewalled: !a.listening,
         udp_firewalled: !a.reachable,
     };

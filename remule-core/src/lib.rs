@@ -35,6 +35,7 @@ pub mod part_file;
 pub mod publish;
 pub mod shared;
 pub mod statistics;
+pub mod udp_check;
 pub mod upload_queue;
 pub mod uploader;
 pub mod verify;

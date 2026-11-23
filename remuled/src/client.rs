@@ -54,6 +54,7 @@ use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
 use crate::udp_port::UdpPort;
 use remule_core::download_queue::UdpOut;
+use remule_core::udp_check::CheckRequest;
 
 /// Kad source searches are repeated this often (`GetKadSourceReaskTime`).
 const KAD_REASK: Duration = Duration::from_secs(30 * 60);
@@ -195,7 +196,9 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
         Report::SourceAdded { .. }
         | Report::SourceDropped { .. }
         | Report::Queued { rank: None, .. }
-        | Report::KadFirewallAck { .. } => return,
+        | Report::KadFirewallAck { .. }
+        | Report::UdpCheckEnded { .. }
+        | Report::UdpCheckRequested { .. } => return,
         Report::Queued {
             addr,
             rank: Some(n),
@@ -955,6 +958,17 @@ pub async fn run(
                 if matches!(r, Report::Completed { .. }) {
                     done += 1;
                 }
+                // The UDP firewall test's TCP half: its end, and others'
+                // requests, are Kad's to act on.
+                match (&r, &kad_node) {
+                    (Report::UdpCheckEnded { ip, cancelled }, Some(k)) => {
+                        k.handle.udp_check_ended(*ip, *cancelled).await;
+                    }
+                    (Report::UdpCheckRequested { ip, internal, external, key, known }, Some(k)) => {
+                        k.handle.answer_udp_check(*ip, *internal, *external, *key, *known).await;
+                    }
+                    _ => {}
+                }
                 // The buddy links: ours stops the buddy search, one we serve
                 // stops Kad's offers.
                 match (&r, &kad_node) {
@@ -1052,6 +1066,19 @@ pub async fn run(
                     Some(KadEvent::BuddyRequest { buddy_id, user_hash, tcp }) => {
                         info!("[{:>5}s] Kad: buddy request from {tcp}, offered", start.elapsed().as_secs());
                         let _ = cmd.send(Command::BuddyRequest { buddy_id, user_hash, tcp });
+                    }
+                    // The UDP firewall test: ask this node over TCP.
+                    Some(KadEvent::UdpFirewallCheck { tcp }) => {
+                        if let Some(k) = &kad_node {
+                            if let Some((internal, external, key)) = k.handle.udp_check_request(*tcp.ip()).await {
+                                let request = CheckRequest { internal, external, key };
+                                let _ = cmd.send(Command::UdpFirewallCheck { tcp, request });
+                            }
+                        }
+                    }
+                    Some(KadEvent::UdpFirewalled(f)) => {
+                        info!("[{:>5}s] Kad: UDP {}", start.elapsed().as_secs(),
+                            if f { "firewalled" } else { "open: others reach our UDP port" });
                     }
                     Some(KadEvent::CallbackRequest { buddy_id, file, from }) => {
                         debug!("[{:>5}s] Kad: callback request from {from}", start.elapsed().as_secs());

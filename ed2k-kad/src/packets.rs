@@ -190,6 +190,13 @@ pub enum KadPacket {
     },
     /// `KADEMLIA_FIREWALLED_ACK_RES` (before Kad version 7): (null)
     FirewalledAckRes,
+    /// `KADEMLIA2_FIREWALLUDP`: the answer to our UDP firewall check, sent
+    /// to one of our ports: `<error 1><the port it was sent to 2>`; a
+    /// non-zero error means the test proves nothing (it knows us already).
+    FirewallUdp {
+        error: u8,
+        incoming_port: u16,
+    },
     /// `KADEMLIA_FINDBUDDY_REQ`: a firewalled node looks for a buddy.
     /// `<buddy ID 16><user hash 16><tcp port 2>`; the buddy ID is the
     /// search target, our Kad ID with every bit flipped.
@@ -324,6 +331,7 @@ impl KadPacket {
             KadPacket::FirewalledReq { .. } => return V1::FirewalledReq.into(),
             KadPacket::FirewalledRes { .. } => return V1::FirewalledRes.into(),
             KadPacket::FirewalledAckRes => return V1::FirewalledAckRes.into(),
+            KadPacket::FirewallUdp { .. } => Opcode::FirewallUdp,
             KadPacket::FindBuddyReq { .. } => return V1::FindBuddyReq.into(),
             KadPacket::FindBuddyRes { .. } => return V1::FindBuddyRes.into(),
             KadPacket::CallbackReq { .. } => return V1::CallbackReq.into(),
@@ -359,6 +367,12 @@ impl KadPacket {
                 tcp_port,
             } => {
                 w.uint128(*buddy_id).uint128(*user_hash).u16(*tcp_port);
+            }
+            KadPacket::FirewallUdp {
+                error,
+                incoming_port,
+            } => {
+                w.u8(*error).u16(*incoming_port);
             }
             KadPacket::FindBuddyRes {
                 buddy_id,
@@ -569,6 +583,11 @@ impl KadPacket {
         };
         Ok(match op {
             Opcode::BootstrapReq => KadPacket::BootstrapReq,
+            // CHECK_PACKET_MIN_SIZE(3)
+            Opcode::FirewallUdp => KadPacket::FirewallUdp {
+                error: r.u8().map_err(e)?,
+                incoming_port: r.u16().map_err(e)?,
+            },
             Opcode::BootstrapRes => {
                 let id = r.uint128().map_err(e)?;
                 let tcp_port = r.u16().map_err(e)?;
@@ -686,10 +705,6 @@ impl KadPacket {
                 tcp_port: r.u16().map_err(e)?,
                 user_hash: r.uint128().map_err(e)?,
                 connect_options: r.u8().map_err(e)?,
-            },
-            _ => KadPacket::Other {
-                opcode,
-                payload: p.payload,
             },
         })
     }

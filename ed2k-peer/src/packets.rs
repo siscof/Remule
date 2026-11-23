@@ -330,6 +330,30 @@ pub fn reask_callback_tcp(from: std::net::SocketAddrV4, ping: &[u8]) -> Packet {
     emule(Extended::ReaskCallbackTcp, p)
 }
 
+/// `OP_FWCHECKUDPREQ` (Kad version 6 and up): test our UDP ports, send
+/// `KADEMLIA2_FIREWALLUDP` to them. `<internal Kad port 2><external Kad
+/// port 2><our verify key for you 4>`
+pub fn fw_check_udp_req(internal: u16, external: u16, key: u32) -> Packet {
+    let mut p = Vec::with_capacity(8);
+    p.extend_from_slice(&internal.to_le_bytes());
+    p.extend_from_slice(&external.to_le_bytes());
+    p.extend_from_slice(&key.to_le_bytes());
+    emule(Extended::FwCheckUdpReq, p)
+}
+
+/// The ports and key of an `OP_FWCHECKUDPREQ`, if `p` is one.
+pub fn parse_fw_check_udp_req(p: &Packet) -> Option<(u16, u16, u32)> {
+    if p.protocol != Protocol::Emule as u8 || p.opcode != u8::from(Extended::FwCheckUdpReq) {
+        return None;
+    }
+    let b = p.payload.get(..8)?;
+    Some((
+        u16::from_le_bytes([b[0], b[1]]),
+        u16::from_le_bytes([b[2], b[3]]),
+        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+    ))
+}
+
 /// `OP_BUDDYPING`
 pub fn buddy_ping() -> Packet {
     emule(Extended::BuddyPing, Vec::new())

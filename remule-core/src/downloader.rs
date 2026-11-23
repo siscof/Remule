@@ -36,7 +36,9 @@ use crate::download_queue::{
     Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report, UdpOut,
 };
 use crate::part_file::PartFile;
+use crate::udp_check::{CheckRequest, UdpChecks};
 use crate::uploader::Uploader;
+use ed2k_peer::packets::parse_fw_check_udp_req;
 use ed2k_peer::PeerPacket;
 use ed2k_types::ed2k::client_udp::Opcode as UdpOpcode;
 
@@ -92,6 +94,12 @@ pub enum Command {
     /// Whether others can connect to us now (a HighID, Kad's firewall
     /// check, or told so).
     SetReachable(bool),
+    /// Kad's UDP firewall test wants the node at `tcp` asked
+    /// ([`crate::udp_check`]).
+    UdpFirewallCheck {
+        tcp: SocketAddrV4,
+        request: CheckRequest,
+    },
     /// Kad offered to serve a firewalled node (`ed2k_kad::Event::BuddyRequest`).
     BuddyRequest {
         buddy_id: ed2k_types::UInt128,
@@ -321,6 +329,7 @@ pub async fn run_with(
     let conn_cfg = ConnConfig::new(config.bandwidth.clone());
     let own_hash = queue.config().ours.user_hash;
     let mut buddies = Buddies::new(queue.config().ours.clone());
+    let mut udp_checks = UdpChecks::new(queue.config().ours.clone());
     // `AddTrackCallbackRequests`: direct callback requests by IP.
     let mut direct_callbacks: HashMap<Ipv4Addr, Instant> = HashMap::new();
     let mut ticker = tokio::time::interval(config.tick);
@@ -341,12 +350,14 @@ pub async fn run_with(
                     a.extend(up.tick(now, &mut || queue.new_conn_id()));
                 }
                 a.extend(buddies.tick(now));
+                a.extend(udp_checks.tick(now));
                 a
             }
             Some(ev) = net_rx.recv() => {
                 let now = Instant::now();
                 match ev {
                     NetEvent::Connected(c) if buddies.owns(c) => buddies.connected(c, now),
+                    NetEvent::Connected(c) if udp_checks.owns(c) => udp_checks.connected(c, now),
                     NetEvent::Connected(c) => match uploader.as_mut() {
                         // A waiting peer we call back.
                         Some(up) if up.owns(c) => up.connected(c, now),
@@ -360,6 +371,23 @@ pub async fn run_with(
                         }
                         Vec::new()
                     }
+                    // `OP_FWCHECKUDPREQ`: a node wants its UDP ports tested;
+                    // Kad answers (`ProcessFirewallCheckUDPRequest`).
+                    NetEvent::Packet(c, p) if parse_fw_check_udp_req(&p).is_some() => {
+                        if let (Some((internal, external, key)), Some(SocketAddr::V4(a))) =
+                            (parse_fw_check_udp_req(&p), peer_addrs.get(&c))
+                        {
+                            let _ = reports.send(Report::UdpCheckRequested {
+                                ip: *a.ip(),
+                                internal,
+                                external,
+                                key,
+                                known: queue.is_source_conn(c),
+                            });
+                        }
+                        Vec::new()
+                    }
+                    NetEvent::Packet(c, p) if udp_checks.owns(c) => udp_checks.packet(c, p, now),
                     // A Kad buddy link; callbacks through it are answered by
                     // the upload side.
                     NetEvent::Packet(c, p) if buddies.owns(c) => {
@@ -410,6 +438,8 @@ pub async fn run_with(
                         peer_addrs.remove(&c);
                         if buddies.owns(c) {
                             buddies.closed(c)
+                        } else if udp_checks.owns(c) {
+                            udp_checks.closed(c)
                         } else { match uploader.as_mut() {
                             Some(up) if up.owns(c) => {
                                 up.closed(c);
@@ -470,6 +500,7 @@ pub async fn run_with(
                             up.set_our_id(id);
                         }
                         buddies.set_ours(queue.config().ours.clone());
+                        udp_checks.set_ours(queue.config().ours.clone());
                         Vec::new()
                     }
                     Some(Command::CreditHistory(reply)) => {
@@ -492,6 +523,10 @@ pub async fn run_with(
                     Some(Command::BuddyOffer { tcp, kad_port, user_hash, connect_options }) => {
                         let conn = queue.new_conn_id();
                         buddies.offer(tcp, kad_port, user_hash, connect_options, conn, now)
+                    }
+                    Some(Command::UdpFirewallCheck { tcp, request }) => {
+                        let conn = queue.new_conn_id();
+                        udp_checks.start(tcp, request, conn, now)
                     }
                     Some(Command::SetReachable(r)) => {
                         queue.set_reachable(r);

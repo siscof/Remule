@@ -752,3 +752,15 @@ fn reask_relay_packets() {
     v6.payload[..4].copy_from_slice(&[0xFF; 4]);
     assert!(PeerPacket::parse(v6, ctx).is_err());
 }
+
+/// `OP_FWCHECKUDPREQ`: internal port, external port, verify key.
+#[test]
+fn fw_check_udp_request() {
+    use crate::packets::{fw_check_udp_req, parse_fw_check_udp_req};
+    let p = fw_check_udp_req(4672, 4673, 0x0102_0304);
+    assert_eq!((p.protocol, p.opcode), (0xC5, 0xA7));
+    assert_eq!(p.payload, vec![0x40, 0x12, 0x41, 0x12, 4, 3, 2, 1]);
+    let p = Packet::parse_tcp(&p.to_tcp_bytes().unwrap()).unwrap();
+    assert_eq!(parse_fw_check_udp_req(&p), Some((4672, 4673, 0x0102_0304)));
+    assert_eq!(parse_fw_check_udp_req(&crate::packets::buddy_ping()), None);
+}

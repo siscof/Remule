@@ -35,6 +35,9 @@ pub struct Snapshot {
     pub firewalled: bool,
     /// Our public IP as nodes tell it (unspecified if unknown).
     pub public_ip: Ipv4Addr,
+    /// The UDP firewall test's answer, and whether it is verified.
+    pub udp_firewalled: bool,
+    pub udp_verified: bool,
     pub stats: Stats,
     pub index: IndexStats,
 }
@@ -76,6 +79,15 @@ enum Command {
     Bootstrap(SocketAddrV4),
     FirewallAck(Ipv4Addr),
     ServingBuddy(bool),
+    UdpCheckRequest(Ipv4Addr, oneshot::Sender<(u16, u16, u32)>),
+    UdpCheckEnded(Ipv4Addr, bool),
+    AnswerUdpCheck {
+        to: Ipv4Addr,
+        internal: u16,
+        external: u16,
+        key: u32,
+        known: bool,
+    },
     BuddySearch(bool, oneshot::Sender<Option<u32>>),
     Snapshot(oneshot::Sender<Snapshot>),
     Nodes(oneshot::Sender<Option<NodesDat>>),
@@ -216,6 +228,37 @@ impl KadHandle {
             .unwrap_or((usize::MAX, usize::MAX))
     }
 
+    /// [`Kad::udp_check_request`]: what `OP_FWCHECKUDPREQ` to `ip` carries.
+    pub async fn udp_check_request(&self, ip: Ipv4Addr) -> Option<(u16, u16, u32)> {
+        self.ask(|tx| Command::UdpCheckRequest(ip, tx)).await
+    }
+
+    /// [`Kad::udp_check_ended`]
+    pub async fn udp_check_ended(&self, ip: Ipv4Addr, cancelled: bool) {
+        let _ = self.cmd.send(Command::UdpCheckEnded(ip, cancelled)).await;
+    }
+
+    /// [`Kad::answer_udp_check`]
+    pub async fn answer_udp_check(
+        &self,
+        to: Ipv4Addr,
+        internal: u16,
+        external: u16,
+        key: u32,
+        known: bool,
+    ) {
+        let _ = self
+            .cmd
+            .send(Command::AnswerUdpCheck {
+                to,
+                internal,
+                external,
+                key,
+                known,
+            })
+            .await;
+    }
+
     /// We serve a buddy (or no longer): Kad offers no more while we do.
     pub async fn set_serving_buddy(&self, serving: bool) {
         let _ = self.cmd.send(Command::ServingBuddy(serving)).await;
@@ -273,6 +316,8 @@ fn snapshot(kad: &Kad, now: u64) -> Snapshot {
         external_port: kad.external_port,
         firewalled: kad.is_firewalled(now),
         public_ip: Ipv4Addr::from(kad.public_ip()),
+        udp_firewalled: kad.udp_firewall.peek().0,
+        udp_verified: kad.udp_firewall.peek().1,
         stats: kad.stats.clone(),
         index: kad.index.stats(),
     }
@@ -355,6 +400,20 @@ async fn run(
                         kad.firewall_ack(ip, t);
                     }
                     Command::ServingBuddy(serving) => kad.serving_buddy = serving,
+                    Command::UdpCheckRequest(ip, tx) => {
+                        let _ = tx.send(kad.udp_check_request(ip));
+                    }
+                    Command::UdpCheckEnded(ip, cancelled) => {
+                        let out = kad.udp_check_ended(ip, cancelled, t);
+                        socket.send(out.send).await;
+                        for e in out.events {
+                            let _ = events.send(e).await;
+                        }
+                    }
+                    Command::AnswerUdpCheck { to, internal, external, key, known } => {
+                        let out = kad.answer_udp_check(to, internal, external, key, known, t);
+                        socket.send(out).await;
+                    }
                     Command::BuddySearch(have, tx) => {
                         let id = match kad.buddy_search(have, t) {
                             Some((id, out)) => {

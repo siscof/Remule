@@ -581,6 +581,7 @@ impl Net {
                 udp_key_secret: rng.gen(),
                 user_hash: Md4Hash(rng.gen()),
                 tcp_port: 4662,
+                udp_port: 4672,
                 tcp_firewalled: false,
                 udp_firewalled: false,
             };
@@ -791,12 +792,18 @@ fn answers_hello_req_and_ping_and_ignores_the_unrequested() {
         misc_options: 0,
     });
     let out = net.nodes[0].handle(b, &hello.to_datagram(), 1001);
-    // The answer, and (a firewall check running) a check request.
-    assert_eq!(out.send.len(), 2);
-    assert!(matches!(
-        KadPacket::parse(&out.send[1].bytes).unwrap(),
-        KadPacket::Firewalled2Req { .. }
-    ));
+    // The answer, (a firewall check running) a check request, and (our
+    // external port unknown) a ping.
+    assert_eq!(out.send.len(), 3);
+    let sent: Vec<KadPacket> = out
+        .send
+        .iter()
+        .map(|d| read_as(&net.nodes[1], net.addrs[0], &d.bytes))
+        .collect();
+    assert!(sent.contains(&KadPacket::Ping));
+    assert!(sent
+        .iter()
+        .any(|p| matches!(p, KadPacket::Firewalled2Req { .. })));
     assert!(net.nodes[0].routing.get(ids[1]).is_some());
     // Ping: pong with the port it came from.
     let out = net.nodes[0].handle(b, &KadPacket::Ping.to_datagram(), 1002);
@@ -821,7 +828,8 @@ fn answers_hello_req_and_ping_and_ignores_the_unrequested() {
         misc_options: 1,
     });
     let out = net.nodes[1].handle(a, &fw.to_datagram(), 1004);
-    assert_eq!(out.send.len(), 2);
+    // The answer, a check request and the external-port ping.
+    assert_eq!(out.send.len(), 3);
     assert!(net.nodes[1].routing.get(UInt128::new(5)).is_none());
 }
 
@@ -1025,7 +1033,8 @@ fn the_tcp_firewall_check() {
         assert!(!net.nodes[0].is_firewalled(net.now));
     }
     let answered = net.now;
-    assert!(net.nodes[0].tick(answered + GRACE - 1).events.is_empty());
+    let ev = net.nodes[0].tick(answered + GRACE - 1).events;
+    assert!(ev.is_empty(), "{ev:?}");
     assert_eq!(
         net.nodes[0].tick(answered + GRACE).events,
         [Event::Firewalled(true)]
@@ -1055,7 +1064,16 @@ fn no_firewall_check_without_tcp() {
         misc_options: 0,
     });
     let out = net.nodes[0].handle(net.addrs[1], &hello.to_datagram(), net.now);
-    assert_eq!(out.send.len(), 1);
+    // The hello answer and a ping for our external port; no check request.
+    let sent: Vec<KadPacket> = out
+        .send
+        .iter()
+        .map(|d| read_as(&net.nodes[1], net.addrs[0], &d.bytes))
+        .collect();
+    assert!(matches!(
+        &sent[..],
+        [KadPacket::HelloRes(_), KadPacket::Ping]
+    ));
     let ask = KadPacket::Firewalled2Req {
         tcp_port: 4662,
         user_hash: UInt128::new(1),
@@ -1074,6 +1092,7 @@ fn nodes_dat_round_trip() {
         udp_key_secret: 1,
         user_hash: Md4Hash([0; 16]),
         tcp_port: 1,
+        udp_port: 1,
         tcp_firewalled: true,
         udp_firewalled: true,
     };
@@ -1174,12 +1193,13 @@ fn legacy_challenges_verify_old_nodes() {
         .collect();
     assert!(parsed.contains(&KadPacket::Ping));
     assert!(!parsed.iter().any(|p| matches!(p, KadPacket::Req { .. })));
-    // Version 8 proves itself with the ACK: neither.
+    // Version 8 proves itself with the ACK: no challenge (a ping only to
+    // learn our external port).
     let mut net = Net::new(&ids, &mut rng);
     let out = net.nodes[0].handle(b, &old(8).to_datagram(), 1000);
     assert!(!out.send.iter().any(|d| matches!(
         read_as(&net.nodes[1], net.addrs[0], &d.bytes),
-        KadPacket::Ping | KadPacket::Req { .. }
+        KadPacket::Req { .. }
     )));
 }
 
@@ -1482,5 +1502,110 @@ fn a_lone_close_node_is_asked_for_sources() {
             .any(|(to, p, _)| *to == 1 && matches!(p, KadPacket::SearchSourceReq { .. })),
         "{:?}",
         net.requests
+    );
+}
+
+/// A round of the UDP firewall test in the node: on connecting it looks up
+/// a random target; the nodes named in the answers that it does not know go
+/// to the tester, which (the external port settled) has one asked over TCP;
+/// that node's `KADEMLIA2_FIREWALLUDP` (`answer_udp_check`) to our port
+/// says open. A test that ends without it counts as failed.
+#[test]
+fn a_udp_firewall_round() {
+    let mut rng = StdRng::seed_from_u64(91);
+    let ids: Vec<UInt128> = (0..4).map(|_| UInt128::new(rng.gen())).collect();
+    let mut net = Net::new(&ids, &mut rng);
+    let link = |net: &mut Net, i: usize, j: usize| {
+        let a = net.addrs[j];
+        let mut v = true;
+        net.nodes[i].routing.add(
+            ids[j],
+            u32::from(*a.ip()),
+            a.port(),
+            4662,
+            8,
+            UdpKey::default(),
+            &mut v,
+            false,
+            false,
+            1000,
+        );
+    };
+    // Node 0 knows node 1 only; node 1 knows 2 and 3.
+    link(&mut net, 0, 1);
+    link(&mut net, 1, 2);
+    link(&mut net, 1, 3);
+    // Contacts it has had for a while (type 2): those it hands out.
+    for j in [2, 3] {
+        net.nodes[1].routing.get_mut(ids[j]).unwrap().kind = 2;
+    }
+    // Our external port, as two nodes saw it.
+    net.nodes[0].extern_port.vote(4672, 1);
+    net.nodes[0].extern_port.vote(4672, 2);
+    assert!(!net.nodes[0].extern_port.finding(false));
+    // The first packet: connected; the lookup goes to node 1.
+    let out = net.nodes[0].handle(net.addrs[1], &KadPacket::Ping.to_datagram(), net.now);
+    let reqs: Vec<_> = out
+        .send
+        .iter()
+        .filter(|d| d.to == net.addrs[1])
+        .filter(|d| {
+            matches!(
+                read_as(&net.nodes[1], net.addrs[0], &d.bytes),
+                KadPacket::Req { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    assert_eq!(reqs.len(), 1, "the lookup asks node 1");
+    net.post(0, reqs);
+    let events = net.deliver();
+    let checks: Vec<SocketAddrV4> = events
+        .iter()
+        .filter_map(|(i, e)| match e {
+            Event::UdpFirewallCheck { tcp } if *i == 0 => Some(*tcp),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(checks.len(), 2, "{events:?}");
+    // Neither went into node 0's routing table.
+    assert!(net.nodes[0].routing.get(ids[2]).is_none());
+    let tested = checks[0];
+    let n = net
+        .addrs
+        .iter()
+        .position(|a| a.ip() == tested.ip())
+        .unwrap();
+    assert!(n == 2 || n == 3);
+    assert!(!net.nodes[0].udp_firewall.peek().1, "not verified yet");
+    // The TCP half: node 0 asks with its ports and key; node n answers.
+    let (internal, external, key) = net.nodes[0].udp_check_request(*tested.ip());
+    assert_eq!((internal, external), (4672, 4672));
+    let from0 = *net.addrs[0].ip();
+    let answer = net.nodes[n].answer_udp_check(from0, internal, external, key, false, net.now);
+    assert_eq!(answer.len(), 1, "one port: one packet");
+    net.post(n, answer);
+    let events = net.deliver();
+    assert!(
+        events.contains(&(0, Event::UdpFirewalled(false))),
+        "{events:?}"
+    );
+    assert_eq!(
+        net.nodes[0].udp_firewall.peek(),
+        (false, true),
+        "open, verified"
+    );
+    assert!(!net.nodes[0].udp_firewalled(net.now));
+
+    // A node that knows us (a transfer with us, say) answers with an
+    // error: proves nothing.
+    let key1 = net.nodes[0].udp_check_request(*net.addrs[1].ip()).2;
+    let answer = net.nodes[1].answer_udp_check(from0, 4672, 0, key1, true, net.now);
+    assert_eq!(
+        read_as(&net.nodes[0], net.addrs[1], &answer[0].bytes),
+        KadPacket::FirewallUdp {
+            error: 1,
+            incoming_port: 4672
+        }
     );
 }

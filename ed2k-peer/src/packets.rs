@@ -277,6 +277,14 @@ pub enum PeerPacket {
     BuddyPong,
     /// `OP_CALLBACK`, from our buddy: someone wants us to connect to it.
     Callback(BuddyCallback),
+    /// `OP_REASKCALLBACKTCP`, from our buddy: a UDP reask for us that it
+    /// passes on, with the asker's address (to answer over UDP).
+    /// `<IP 4 (network order)><UDP port 2>` then the `OP_REASKFILEPING`
+    /// payload.
+    ReaskCallbackTcp {
+        from: std::net::SocketAddrV4,
+        ping: Vec<u8>,
+    },
     /// Anything else, for the caller to handle or ignore.
     Other(Packet),
 }
@@ -311,6 +319,15 @@ fn edonkey(op: Standard, payload: Vec<u8>) -> Packet {
 
 fn emule(op: Extended, payload: Vec<u8>) -> Packet {
     Packet::new(Protocol::Emule, op, payload)
+}
+
+/// `OP_REASKCALLBACKTCP` (the buddy passing on a reask it got over UDP).
+pub fn reask_callback_tcp(from: std::net::SocketAddrV4, ping: &[u8]) -> Packet {
+    let mut p = Vec::with_capacity(6 + ping.len());
+    p.extend_from_slice(&from.ip().octets());
+    p.extend_from_slice(&from.port().to_le_bytes());
+    p.extend_from_slice(ping);
+    emule(Extended::ReaskCallbackTcp, p)
 }
 
 /// `OP_BUDDYPING`
@@ -870,6 +887,23 @@ impl PeerPacket {
                     ));
                 }
                 PeerPacket::QueueRanking(u16::from_le_bytes([p[0], p[1]]))
+            }
+            Extended::ReaskCallbackTcp => {
+                // An IPv6 asker (0xFFFFFFFF, from eMuleAI and eMule-Qt) has
+                // nothing to answer on here.
+                if p.len() < 6 + 16 || p[..4] == [0xFF; 4] {
+                    return Err(BadPacket::new(
+                        "callback reask",
+                        format!("{} bytes, or an IPv6 asker", p.len()),
+                    ));
+                }
+                PeerPacket::ReaskCallbackTcp {
+                    from: std::net::SocketAddrV4::new(
+                        std::net::Ipv4Addr::new(p[0], p[1], p[2], p[3]),
+                        u16::from_le_bytes([p[4], p[5]]),
+                    ),
+                    ping: p[6..].to_vec(),
+                }
             }
             Extended::BuddyPing => PeerPacket::BuddyPing,
             Extended::BuddyPong => PeerPacket::BuddyPong,

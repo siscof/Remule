@@ -144,6 +144,11 @@ fn load(a: &KadStart) -> Result<(Kad, KadPrefs), String> {
     let mut kad = Kad::new(cfg, now);
     kad.load_public_ip(prefs.public_ip);
     kad.routing.filter_lan = !a.allow_lan;
+    // Told we are reachable, and listening: not firewalled until the
+    // check says so.
+    if a.reachable && a.listening {
+        kad.assume_tcp_open();
+    }
     kad.trace_wire = a.trace_wire;
     for (i, name) in INDEX_FILES.iter().enumerate() {
         let Ok(b) = std::fs::read(a.dir.join(name)) else {

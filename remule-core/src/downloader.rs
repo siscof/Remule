@@ -31,6 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::buddy::Buddies;
 use crate::download_queue::{
     Action, ConnId, DownloadQueue, Endpoint, FileProgress, Origin, QueueStats, Report, UdpOut,
 };
@@ -77,6 +78,32 @@ pub enum Command {
     Udp {
         from: SocketAddrV4,
         datagram: Vec<u8>,
+    },
+    /// Kad runs with this ID (buddy callbacks are checked against it).
+    SetKadId(Option<ed2k_types::UInt128>),
+    /// Kad found a node offering to be our buddy
+    /// (`ed2k_kad::Event::BuddyOffer`).
+    BuddyOffer {
+        tcp: SocketAddrV4,
+        kad_port: u16,
+        user_hash: Md4Hash,
+        connect_options: u8,
+    },
+    /// Whether others can connect to us now (a HighID, Kad's firewall
+    /// check, or told so).
+    SetReachable(bool),
+    /// Kad offered to serve a firewalled node (`ed2k_kad::Event::BuddyRequest`).
+    BuddyRequest {
+        buddy_id: ed2k_types::UInt128,
+        user_hash: Md4Hash,
+        tcp: SocketAddrV4,
+    },
+    /// A callback request for a buddy came over Kad
+    /// (`ed2k_kad::Event::CallbackRequest`).
+    BuddyCallback {
+        buddy_id: ed2k_types::UInt128,
+        file: Md4Hash,
+        from: SocketAddrV4,
     },
     /// Hang up, save the files, and return the queue.
     Shutdown,
@@ -293,6 +320,7 @@ pub async fn run_with(
     let mut conns: HashMap<ConnId, ConnHandle> = HashMap::new();
     let conn_cfg = ConnConfig::new(config.bandwidth.clone());
     let own_hash = queue.config().ours.user_hash;
+    let mut buddies = Buddies::new(queue.config().ours.clone());
     let mut ticker = tokio::time::interval(config.tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -310,11 +338,13 @@ pub async fn run_with(
                 if let Some(up) = uploader.as_mut() {
                     a.extend(up.tick(now, &mut || queue.new_conn_id()));
                 }
+                a.extend(buddies.tick(now));
                 a
             }
             Some(ev) = net_rx.recv() => {
                 let now = Instant::now();
                 match ev {
+                    NetEvent::Connected(c) if buddies.owns(c) => buddies.connected(c, now),
                     NetEvent::Connected(c) => match uploader.as_mut() {
                         // A waiting peer we call back.
                         Some(up) if up.owns(c) => up.connected(c, now),
@@ -327,6 +357,28 @@ pub async fn run_with(
                             let _ = reports.send(Report::KadFirewallAck { ip: *a.ip() });
                         }
                         Vec::new()
+                    }
+                    // A Kad buddy link; callbacks through it are answered by
+                    // the upload side.
+                    NetEvent::Packet(c, p) if buddies.owns(c) => {
+                        let (mut a, callbacks) = buddies.packet(c, p, now);
+                        if let Some(up) = uploader.as_mut() {
+                            for cb in callbacks {
+                                a.extend(up.answer_callback(cb.addr, cb.file, now, &mut || queue.new_conn_id()));
+                            }
+                        }
+                        a
+                    }
+                    // The firewalled node we offered to serve, connecting.
+                    NetEvent::Packet(c, p) if queue.is_unmatched_incoming(c) && is_expected_buddy(&buddies, &p, peer_addrs.get(&c), now) => {
+                        let Ok(PeerPacket::Hello(h)) = PeerPacket::parse(p, Default::default()) else {
+                            unreachable!()
+                        };
+                        let Some(SocketAddr::V4(a)) = peer_addrs.get(&c) else {
+                            unreachable!()
+                        };
+                        queue.forget(c);
+                        buddies.accept(c, &h, *a.ip(), now)
                     }
                     NetEvent::Packet(c, p) => match uploader.as_mut() {
                         Some(up) if up.owns(c) => up.packet(c, p, now),
@@ -349,13 +401,15 @@ pub async fn run_with(
                     NetEvent::Closed(c) => {
                         conns.remove(&c);
                         peer_addrs.remove(&c);
-                        match uploader.as_mut() {
+                        if buddies.owns(c) {
+                            buddies.closed(c)
+                        } else { match uploader.as_mut() {
                             Some(up) if up.owns(c) => {
                                 up.closed(c);
                                 Vec::new()
                             }
                             _ => queue.closed(c, now),
-                        }
+                        } }
                     }
                 }
             }
@@ -408,6 +462,7 @@ pub async fn run_with(
                         if let Some(up) = uploader.as_mut() {
                             up.set_our_id(id);
                         }
+                        buddies.set_ours(queue.config().ours.clone());
                         Vec::new()
                     }
                     Some(Command::CreditHistory(reply)) => {
@@ -422,6 +477,25 @@ pub async fn run_with(
                     Some(Command::RemoveCategory(cat)) => {
                         queue.remove_category(cat);
                         Vec::new()
+                    }
+                    Some(Command::SetKadId(id)) => {
+                        buddies.set_kad_id(id);
+                        Vec::new()
+                    }
+                    Some(Command::BuddyOffer { tcp, kad_port, user_hash, connect_options }) => {
+                        let conn = queue.new_conn_id();
+                        buddies.offer(tcp, kad_port, user_hash, connect_options, conn, now)
+                    }
+                    Some(Command::SetReachable(r)) => {
+                        queue.set_reachable(r);
+                        Vec::new()
+                    }
+                    Some(Command::BuddyRequest { buddy_id, user_hash, tcp }) => {
+                        buddies.expect(buddy_id, user_hash, *tcp.ip(), now);
+                        Vec::new()
+                    }
+                    Some(Command::BuddyCallback { buddy_id, file, from }) => {
+                        buddies.relay(buddy_id, file, from)
                     }
                     Some(Command::Udp { from, datagram }) => {
                         if datagram.get(1) == Some(&(UdpOpcode::ReaskFilePing as u8)) {
@@ -529,6 +603,23 @@ pub async fn run_with(
 }
 
 /// `OP_KAD_FWTCPCHECK_ACK` (eMule protocol, no payload).
+/// Whether the first packet of an incoming connection is the hello of the
+/// firewalled node we offered to serve as its Kad buddy.
+fn is_expected_buddy(
+    buddies: &Buddies,
+    p: &Packet,
+    from: Option<&SocketAddr>,
+    now: Instant,
+) -> bool {
+    let Some(SocketAddr::V4(a)) = from else {
+        return false;
+    };
+    match PeerPacket::parse(p.clone(), Default::default()) {
+        Ok(PeerPacket::Hello(h)) => buddies.wants_incoming(&h, *a.ip(), now),
+        _ => false,
+    }
+}
+
 fn is_kad_firewall_ack(p: &Packet) -> bool {
     p.protocol == u8::from(Protocol::Emule) && p.opcode == u8::from(Extended::KadFwTcpCheckAck)
 }

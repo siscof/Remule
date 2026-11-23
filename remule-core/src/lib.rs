@@ -24,6 +24,7 @@
 //!   `remule-net`.
 
 pub mod blocks;
+pub mod buddy;
 pub mod credits;
 pub mod download_queue;
 pub mod downloader;
@@ -43,6 +44,8 @@ pub use part_file::{AichStatus, Completion, FileEvent, OpenError, PartFile, Sour
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_buddy;
 #[cfg(test)]
 mod tests_part_file;
 #[cfg(test)]

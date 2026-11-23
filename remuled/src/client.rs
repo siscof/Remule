@@ -58,7 +58,7 @@ use remule_core::download_queue::UdpOut;
 /// Kad source searches are repeated this often (`GetKadSourceReaskTime`).
 const KAD_REASK: Duration = Duration::from_secs(30 * 60);
 /// Seconds after Kad connects before searching, so the table fills.
-const KAD_WARMUP: u64 = 20;
+pub const KAD_WARMUP: u64 = 20;
 /// Shared files are offered to the server this often (new ones as they come).
 const OFFER_EVERY: Duration = Duration::from_secs(60);
 
@@ -69,6 +69,10 @@ pub struct KadSettings {
     pub dir: PathBuf,
     /// The `nodes.dat` to start from (default: the one in `dir`).
     pub nodes: Option<PathBuf>,
+    /// Nodes to bootstrap from as well.
+    pub bootstrap: Vec<SocketAddrV4>,
+    /// Seconds after Kad connects before the first source searches.
+    pub warmup: u64,
 }
 
 /// How to run.
@@ -198,6 +202,17 @@ fn log_report(t: Duration, r: &Report, names: &HashMap<Md4Hash, String>) {
             ..
         } => format!("{addr}: queue rank {n}"),
         Report::DownloadStarted { file, addr } => format!("{addr}: sending {}", name(file)),
+        Report::BuddyLinked {
+            addr,
+            serving: false,
+            ..
+        } => format!("Kad: {addr} is our buddy"),
+        Report::BuddyLinked {
+            addr,
+            serving: true,
+            ..
+        } => format!("Kad: we are {addr}'s buddy"),
+        Report::BuddyLost { addr, why, .. } => format!("Kad: buddy {addr} lost ({why})"),
         Report::PartVerified { file, part } => format!("{}: part {part} verified", name(file)),
         Report::PartCorrupt { file, part } => format!("{}: part {part} CORRUPT", name(file)),
         Report::AichRecovered { file, part, bytes } => {
@@ -784,7 +799,7 @@ pub async fn run(
                 &KadStart {
                     dir: k.dir.clone(),
                     nodes: k.nodes.clone(),
-                    bootstrap: Vec::new(),
+                    bootstrap: k.bootstrap.clone(),
                     udp_port: c.udp_port,
                     tcp_port: c.tcp_port,
                     user_hash: c.user_hash,
@@ -798,6 +813,14 @@ pub async fn run(
         ),
         None => None,
     };
+    // Buddy callbacks are checked against our Kad ID.
+    if let Some(k) = &kad_node {
+        let _ = cmd.send(Command::SetKadId(Some(k.prefs.kad_id)));
+    }
+    // Our Kad buddy, once up (we are firewalled): its IP and Kad port.
+    let mut own_buddy: Option<SocketAddrV4> = None;
+    // What the downloader was last told of whether others reach us.
+    let mut told_reachable: Option<bool> = None;
 
     // External connections: a view of the client, refreshed every second,
     // and what they ask of it.
@@ -932,6 +955,17 @@ pub async fn run(
                 if matches!(r, Report::Completed { .. }) {
                     done += 1;
                 }
+                // The buddy links: ours stops the buddy search, one we serve
+                // stops Kad's offers.
+                match (&r, &kad_node) {
+                    (Report::BuddyLinked { serving: false, addr, kad_port }, _) => {
+                        own_buddy = Some(SocketAddrV4::new(*addr.ip(), *kad_port));
+                    }
+                    (Report::BuddyLost { serving: false, .. }, _) => own_buddy = None,
+                    (Report::BuddyLinked { serving: true, .. }, Some(k)) => k.handle.set_serving_buddy(true).await,
+                    (Report::BuddyLost { serving: true, .. }, Some(k)) => k.handle.set_serving_buddy(false).await,
+                    _ => {}
+                }
                 log_report(start.elapsed(), &r, &names);
             }
             ev = async { match &mut server { Some(s) => s.next_event().await, None => std::future::pending().await } } => {
@@ -971,7 +1005,8 @@ pub async fn run(
                         info!("[{:>5}s] Kad connected", start.elapsed().as_secs());
                         kad_connected = Some(Instant::now());
                         kad_since = Some(unix_now());
-                        next_kad_ask = Some(Instant::now() + Duration::from_secs(KAD_WARMUP));
+                        let warmup = c.kad.as_ref().map_or(KAD_WARMUP, |k| k.warmup);
+                        next_kad_ask = Some(Instant::now() + Duration::from_secs(warmup));
                     }
                     Some(KadEvent::Found { search, found: Found::Source(s) }) => {
                         if let (Some(&file), Some(ep)) = (kad_searches.get(&search), Endpoint::from_kad(&s)) {
@@ -1009,6 +1044,19 @@ pub async fn run(
                         }
                     }
                     Some(KadEvent::Wire(w)) => eprintln!("{}", kad::wire_line(&w)),
+                    // Buddies: the TCP side is the downloader's.
+                    Some(KadEvent::BuddyOffer { tcp, kad_port, user_hash, connect_options }) => {
+                        info!("[{:>5}s] Kad: buddy offer from {tcp}", start.elapsed().as_secs());
+                        let _ = cmd.send(Command::BuddyOffer { tcp, kad_port, user_hash, connect_options });
+                    }
+                    Some(KadEvent::BuddyRequest { buddy_id, user_hash, tcp }) => {
+                        info!("[{:>5}s] Kad: buddy request from {tcp}, offered", start.elapsed().as_secs());
+                        let _ = cmd.send(Command::BuddyRequest { buddy_id, user_hash, tcp });
+                    }
+                    Some(KadEvent::CallbackRequest { buddy_id, file, from }) => {
+                        debug!("[{:>5}s] Kad: callback request from {from}", start.elapsed().as_secs());
+                        let _ = cmd.send(Command::BuddyCallback { buddy_id, file, from });
+                    }
                     None => kad_node = None,
                 }
             }
@@ -1142,7 +1190,7 @@ pub async fn run(
                                     log_reach(t, was, reach);
                                 }
                                 Effect::StartKad => {
-                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None });
+                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None, bootstrap: Vec::new(), warmup: KAD_WARMUP });
                                     // The stopped node's socket may still be closing.
                                     let mut started = Err(String::new());
                                     for _ in 0..20 {
@@ -1166,6 +1214,7 @@ pub async fn run(
                                     match started {
                                         Ok(n) => {
                                             info!("[{:>5}s] Kad started", t.as_secs());
+                                            let _ = cmd.send(Command::SetKadId(Some(n.prefs.kad_id)));
                                             kad_node = Some(n);
                                         }
                                         Err(e) => warn!("Kad: {e}"),
@@ -1369,7 +1418,15 @@ pub async fn run(
                     let publishes = {
                         let mut sh = sh.lock().unwrap_or_else(|e| e.into_inner());
                         publisher.update_keywords(&sh);
-                        publisher.kad_publish(&mut sh, running, reach.reachable(), c.tcp_port, 0x03, unix_now().into())
+                        publisher.kad_publish(
+                            &mut sh,
+                            running,
+                            reach.reachable(),
+                            own_buddy.map(|b| (b, ed2k_types::UInt128::new(u128::MAX) ^ k.prefs.kad_id)),
+                            c.tcp_port,
+                            0x03,
+                            unix_now().into(),
+                        )
                     };
                     for p in publishes {
                         let r = match p {
@@ -1390,6 +1447,18 @@ pub async fn run(
                         for (h, size) in wanted.iter().filter(|(h, _)| !paused.contains(h)) {
                             let _ = s.get_sources(*h, *size).await;
                         }
+                    }
+                }
+                // Firewalled sources are asked for callbacks only while
+                // others can reach us.
+                if told_reachable != Some(reach.reachable()) {
+                    told_reachable = Some(reach.reachable());
+                    let _ = cmd.send(Command::SetReachable(reach.reachable()));
+                }
+                // Firewalled with no buddy: look for one when it is time.
+                if let (Some(k), Some(_)) = (&kad_node, kad_connected) {
+                    if k.handle.buddy_search(own_buddy.is_some()).await.is_some() {
+                        info!("[{:>5}s] Kad: looking for a buddy", t.as_secs());
                     }
                 }
                 if let (Some(k), Some(at)) = (&kad_node, next_kad_ask) {

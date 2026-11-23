@@ -438,8 +438,15 @@ impl Uploader {
                     out.push(Action::Report(Report::UploadStarted { user, file }));
                 }
                 Event::Closed(_) => close = true,
-                Event::Handshake(_)
-                | Event::FileRequested { .. }
+                // A peer we connected to on request: now we know who it is.
+                Event::Handshake(h) => {
+                    if p.user_hash == Md4Hash([0; 16]) {
+                        p.user_hash = h.user_hash;
+                        let ip = p.ip;
+                        self.remember_callback(&h, ip);
+                    }
+                }
+                Event::FileRequested { .. }
                 | Event::SourcesRequested { .. }
                 | Event::Unhandled(_) => {}
             }
@@ -547,6 +554,47 @@ impl Uploader {
             }
         }
         out
+    }
+
+    /// `OP_CALLBACK` through our Kad buddy: someone at `addr` wants `file`
+    /// and cannot reach us; connect to it (plain: its user hash is not
+    /// known), and serve it as if it had connected. Nothing for a file we
+    /// do not share.
+    pub fn answer_callback(
+        &mut self,
+        addr: SocketAddrV4,
+        file: Md4Hash,
+        now: Instant,
+        new_conn: &mut dyn FnMut() -> ConnId,
+    ) -> Vec<Action> {
+        let shared = {
+            let s = self.shares.lock().unwrap_or_else(|e| e.into_inner());
+            s.shared(&file).is_some()
+        };
+        if !shared {
+            return Vec::new();
+        }
+        let Ok((session, hello)) = UploadSession::connect_on_request(self.ours.clone()) else {
+            return Vec::new();
+        };
+        let conn = new_conn();
+        self.peers.insert(
+            conn,
+            Peer {
+                session,
+                // Known once it answers.
+                user_hash: Md4Hash([0; 16]),
+                ip: IpAddr::V4(*addr.ip()),
+                ident: IdentState::NotAvailable,
+                last_seen: now,
+                hello: Some(hello),
+            },
+        );
+        vec![Action::Connect {
+            conn,
+            addr: SocketAddr::V4(addr),
+            obfuscate_for: None,
+        }]
     }
 
     /// `AddUpNextClient` for a peer that is not connected: connect to it;

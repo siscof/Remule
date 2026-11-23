@@ -112,6 +112,33 @@ pub enum Event {
     },
     /// A datagram went out or came in (only with [`Kad::trace_wire`] set).
     Wire(Wire),
+    /// A node offers to be our buddy (`KADEMLIA_FINDBUDDY_RES`,
+    /// `RequestBuddy`): connect to its TCP port and keep the connection.
+    BuddyOffer {
+        tcp: SocketAddrV4,
+        /// Its Kad port: published with our sources, for callbacks.
+        kad_port: u16,
+        user_hash: Md4Hash,
+        /// Bit 0 crypt supported, 1 requested, 2 required (0 from old nodes).
+        connect_options: u8,
+    },
+    /// A firewalled node asked us to be its buddy and we offered
+    /// (`KADEMLIA_FINDBUDDY_REQ`, `IncomingBuddy`): expect it to connect;
+    /// callbacks for `buddy_id` go to it.
+    BuddyRequest {
+        buddy_id: UInt128,
+        user_hash: Md4Hash,
+        tcp: SocketAddrV4,
+    },
+    /// Someone wants the firewalled node whose buddy ID is `buddy_id` to
+    /// connect to it (`KADEMLIA_CALLBACK_REQ`): if we serve that buddy,
+    /// send it `OP_CALLBACK` (`BuildBuddyCallback`).
+    CallbackRequest {
+        buddy_id: UInt128,
+        file: Md4Hash,
+        /// The asker, and the TCP port it listens on.
+        from: SocketAddrV4,
+    },
 }
 
 /// How a datagram was sent: plain, or obfuscated with which key.
@@ -212,6 +239,12 @@ pub struct Kad {
     /// Legacy challenges out (`CPacketTracking::listChallengeRequests`):
     /// IP, when, the contact, the challenge.
     challenges: Vec<(u32, u64, UInt128, UInt128)>,
+    /// We are some firewalled node's buddy (`GetBuddyStatus() ==
+    /// Connected`): no more offers. The application keeps it.
+    pub serving_buddy: bool,
+    /// `m_nextFindBuddy`, and the flag it sets (`SetFindBuddy`).
+    next_find_buddy: u64,
+    find_buddy: bool,
 }
 
 /// How long a legacy challenge waits for its answer.
@@ -253,7 +286,34 @@ impl Kad {
             trace_wire: false,
             wire: Vec::new(),
             challenges: Vec::new(),
+            serving_buddy: false,
+            // The first buddy search waits five minutes, so that a
+            // firewalled answer is not a false one.
+            next_find_buddy: now + 5 * 60,
+            find_buddy: false,
         }
+    }
+
+    /// `CClientList::Process` for the buddy: when the time has come (5
+    /// minutes after start, then every 20), we are connected and
+    /// TCP-firewalled, and have no buddy, look for one: a `FINDBUDDY`
+    /// search toward our Kad ID with every bit flipped. The nodes it finds
+    /// get `KADEMLIA_FINDBUDDY_REQ`; offers come back as
+    /// [`Event::BuddyOffer`]. Not with obfuscation required (callbacks do
+    /// not support it): the application does not call it then.
+    pub fn buddy_search(&mut self, have_buddy: bool, now: u64) -> Option<(u32, Vec<Datagram>)> {
+        if self.next_find_buddy <= now {
+            self.find_buddy = true;
+            self.next_find_buddy = now + 20 * 60;
+        }
+        if !self.find_buddy || have_buddy || !self.is_connected(now) || !self.is_firewalled(now) {
+            return None;
+        }
+        let target = UInt128::new(u128::MAX) ^ self.cfg.kad_id;
+        // Already going: try again next time.
+        let started = self.start(SearchKind::FindBuddy, target, now)?;
+        self.find_buddy = false;
+        Some(started)
     }
 
     /// `HasActiveLegacyChallenge`
@@ -355,6 +415,15 @@ impl Kad {
         }
         self.recheck.add_confirmation();
         true
+    }
+
+    /// Start as if enough nodes had reached our TCP port (the application
+    /// knows it is reachable). The hourly check still runs and can say
+    /// otherwise.
+    pub fn assume_tcp_open(&mut self) {
+        for _ in 0..crate::firewall::CONFIRMATIONS {
+            self.recheck.add_confirmation();
+        }
     }
 
     /// `CKademliaUDPListener::FirewalledCheck`: ask a node that said hello
@@ -459,12 +528,12 @@ impl Kad {
 
     // ------------------------------------------------------------ sending
 
-    fn track(&mut self, ip: u32, op: Opcode, now: u64) {
+    fn track(&mut self, ip: u32, op: impl Into<u8>, now: u64) {
         self.tracked.push((ip, op.into(), now));
     }
 
     /// `IsOnOutTrackList` (and take it off).
-    fn was_requested(&mut self, ip: u32, op: Opcode, now: u64) -> bool {
+    fn was_requested(&mut self, ip: u32, op: impl Into<u8>, now: u64) -> bool {
         let op: u8 = op.into();
         match self
             .tracked
@@ -492,12 +561,13 @@ impl Kad {
     ) -> Datagram {
         let ip = ip_of(&to);
         // Responses are tracked to check what answers them.
-        let tracked = match p {
-            KadPacket::BootstrapReq => Some(Opcode::BootstrapReq),
-            KadPacket::HelloReq(_) => Some(Opcode::HelloReq),
-            KadPacket::HelloRes(_) => Some(Opcode::HelloRes),
-            KadPacket::Req { .. } => Some(Opcode::Req),
-            KadPacket::Ping => Some(Opcode::Ping),
+        let tracked: Option<u8> = match p {
+            KadPacket::BootstrapReq => Some(Opcode::BootstrapReq.into()),
+            KadPacket::HelloReq(_) => Some(Opcode::HelloReq.into()),
+            KadPacket::HelloRes(_) => Some(Opcode::HelloRes.into()),
+            KadPacket::Req { .. } => Some(Opcode::Req.into()),
+            KadPacket::Ping => Some(Opcode::Ping.into()),
+            KadPacket::FindBuddyReq { .. } => Some(p.opcode()),
             _ => None,
         };
         if let Some(op) = tracked {
@@ -608,6 +678,15 @@ impl Kad {
                         .into_iter()
                         .map(|(id, tags)| (id, tags.into_iter().map(SizedTag::new).collect()))
                         .collect(),
+                },
+                &to,
+                now,
+            ),
+            Action::FindBuddy { to } => self.send_to_contact(
+                &KadPacket::FindBuddyReq {
+                    buddy_id: search_target,
+                    user_hash: UInt128::from_be_bytes(self.cfg.user_hash.0),
+                    tcp_port: self.cfg.tcp_port,
                 },
                 &to,
                 now,
@@ -1150,6 +1229,65 @@ impl Kad {
                     }
                 }
             }
+            // `ProcessFindBuddyRequest`: only an open node without a buddy
+            // offers.
+            KadPacket::FindBuddyReq {
+                buddy_id,
+                user_hash,
+                tcp_port,
+            } => {
+                if self.is_firewalled(now) || self.cfg.udp_firewalled || self.serving_buddy {
+                    return;
+                }
+                let res = KadPacket::FindBuddyRes {
+                    buddy_id,
+                    user_hash: UInt128::from_be_bytes(self.cfg.user_hash.0),
+                    tcp_port: self.cfg.tcp_port,
+                    // GetMyConnectOptions(true, false), new since 0.49a.
+                    connect_options: (!sender_key.is_empty()).then_some(0x03),
+                };
+                let d = self.packet(&res, from, 0, None, sender_key, now);
+                out.send.push(d);
+                out.events.push(Event::BuddyRequest {
+                    buddy_id,
+                    user_hash: Md4Hash(user_hash.to_be_bytes()),
+                    tcp: SocketAddrV4::new(*from.ip(), tcp_port),
+                });
+            }
+            // `ProcessFindBuddyResponse`: an offer for the ID we searched.
+            KadPacket::FindBuddyRes {
+                buddy_id,
+                user_hash,
+                tcp_port,
+                connect_options,
+            } => {
+                if !self.was_requested(ip, ed2k_types::kad::v1::Opcode::FindBuddyReq, now) {
+                    self.stats.unrequested += 1;
+                    return;
+                }
+                if (buddy_id ^ UInt128::new(u128::MAX)) != self.cfg.kad_id {
+                    return;
+                }
+                out.events.push(Event::BuddyOffer {
+                    tcp: SocketAddrV4::new(*from.ip(), tcp_port),
+                    kad_port: from.port(),
+                    user_hash: Md4Hash(user_hash.to_be_bytes()),
+                    connect_options: connect_options.unwrap_or(0),
+                });
+            }
+            // `ProcessCallbackRequest`: the application relays it, if the
+            // buddy is its own.
+            KadPacket::CallbackReq {
+                buddy_id,
+                file,
+                tcp_port,
+            } => {
+                out.events.push(Event::CallbackRequest {
+                    buddy_id,
+                    file: Md4Hash(file.to_be_bytes()),
+                    from: SocketAddrV4::new(*from.ip(), tcp_port),
+                });
+            }
             KadPacket::Ping => {
                 let pong = KadPacket::Pong { port };
                 let d = self.packet(&pong, from, 0, None, sender_key, now);
@@ -1301,6 +1439,44 @@ pub fn source_publish_tags(size: u64, tcp_port: u16, crypt_options: u8) -> Vec<T
             TagName::Str(t::SOURCETYPE.to_vec()),
             TagValue::U8(if large { 4 } else { 1 }),
         ),
+        int_tag(t::SOURCEPORT, u64::from(tcp_port)),
+        Tag::new(
+            TagName::Str(t::ENCRYPTION.to_vec()),
+            TagValue::U8(crypt_options),
+        ),
+    ]
+}
+
+/// `CSearch::StorePacket` for `STOREFILE` when we are firewalled and have
+/// a buddy (`EKadSourcePublish::Buddy`): source type 3 (5 for a file over
+/// 4 GB), the buddy's IP (network order) and Kad port, and the buddy ID
+/// that callbacks for us go by, as hex in eMule's layout as everyone
+/// publishes it.
+pub fn buddy_source_publish_tags(
+    size: u64,
+    tcp_port: u16,
+    crypt_options: u8,
+    buddy: SocketAddrV4,
+    buddy_id: UInt128,
+) -> Vec<Tag> {
+    use ed2k_types::tags::kad as t;
+    let large = size > u64::from(u32::MAX);
+    let hash: String = crate::search::buddy_id_other_layout(buddy_id)
+        .to_be_bytes()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    vec![
+        Tag::new(
+            TagName::Str(t::SOURCETYPE.to_vec()),
+            TagValue::U8(if large { 5 } else { 3 }),
+        ),
+        int_tag(
+            t::SERVERIP,
+            u64::from(u32::from_le_bytes(buddy.ip().octets())),
+        ),
+        int_tag(t::SERVERPORT, u64::from(buddy.port())),
+        Tag::new(TagName::Str(t::BUDDYHASH.to_vec()), TagValue::String(hash)),
         int_tag(t::SOURCEPORT, u64::from(tcp_port)),
         Tag::new(
             TagName::Str(t::ENCRYPTION.to_vec()),

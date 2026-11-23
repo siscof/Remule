@@ -36,6 +36,10 @@ pub const RESULTS_TOTAL: u32 = 300;
 pub const STORE_LIFETIME: u64 = 140;
 /// `SEARCHSTOREFILE_TOTAL`, `SEARCHSTOREKEYWORD_TOTAL`: nodes that took a publish.
 pub const STORE_TOTAL: u32 = 10;
+/// `SEARCHFINDBUDDY_LIFETIME`: seconds.
+pub const FINDBUDDY_LIFETIME: u64 = 100;
+/// `SEARCHFINDBUDDY_TOTAL`: buddy requests sent.
+pub const FINDBUDDY_TOTAL: u32 = 10;
 /// Files per keyword publish, and per packet.
 pub const STORE_KEYWORD_FILES: usize = 150;
 pub const STORE_KEYWORD_PER_PACKET: usize = 50;
@@ -56,6 +60,9 @@ pub enum SearchKind {
     /// `STOREFILE`: publish ourselves as a source of the file. `tags` are
     /// the source tags; the file size is added for nodes of version 2 on.
     StoreSource { tags: Vec<Tag>, size: u64 },
+    /// `FINDBUDDY`: we are firewalled; ask the nodes close to our Kad ID
+    /// with every bit flipped to be our buddy.
+    FindBuddy,
 }
 
 impl SearchKind {
@@ -63,9 +70,9 @@ impl SearchKind {
         match self {
             SearchKind::Node | SearchKind::NodeComplete => FindType::FindNode.into(),
             SearchKind::Keyword { .. } | SearchKind::Source { .. } => FindType::FindValue.into(),
-            SearchKind::StoreKeyword { .. } | SearchKind::StoreSource { .. } => {
-                FindType::Store.into()
-            }
+            SearchKind::StoreKeyword { .. }
+            | SearchKind::StoreSource { .. }
+            | SearchKind::FindBuddy => FindType::Store.into(),
         }
     }
 
@@ -80,6 +87,8 @@ impl SearchKind {
     fn lifetime(&self) -> u64 {
         if self.is_store() {
             STORE_LIFETIME
+        } else if matches!(self, SearchKind::FindBuddy) {
+            FINDBUDDY_LIFETIME
         } else {
             LIFETIME
         }
@@ -102,6 +111,8 @@ pub enum Action {
     },
     /// `KADEMLIA2_PUBLISH_SOURCE_REQ`
     PublishSource { to: Contact, tags: Vec<Tag> },
+    /// `KADEMLIA_FINDBUDDY_REQ`
+    FindBuddy { to: Contact },
 }
 
 /// A file found by a keyword search (`ProcessResultKeyword`).
@@ -136,9 +147,47 @@ pub struct SourceResult {
     pub ip: Ipv4Addr,
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// A firewalled source's buddy (types 3 and 5): its IP and Kad port...
     pub buddy_ip: Ipv4Addr,
     pub buddy_port: u16,
+    /// ...and the ID callbacks for the source go by (`TAG_BUDDYHASH`, read
+    /// in aMule's layout whatever the publisher wrote).
+    pub buddy_id: Option<UInt128>,
     pub crypt_options: u8,
+}
+
+/// `ConvertBuddyIdLayout`: eMule (and emule-qt, eMuleAI) write a buddy ID
+/// with each 4-byte group reversed against aMule's (`ToByteArray`); the
+/// change is its own inverse.
+pub fn buddy_id_other_layout(id: UInt128) -> UInt128 {
+    let b = id.to_be_bytes();
+    let mut o = [0u8; 16];
+    for g in 0..4 {
+        for i in 0..4 {
+            o[g * 4 + i] = b[g * 4 + (3 - i)];
+        }
+    }
+    UInt128::from_be_bytes(o)
+}
+
+/// `MatchesBuddyIdEitherLayout`
+pub fn same_buddy_id(received: UInt128, expected: UInt128) -> bool {
+    received == expected || received == buddy_id_other_layout(expected)
+}
+
+/// A 32-digit hex string (`CMD4Hash::Decode`), either case.
+fn decode_hex16(s: &str) -> Option<[u8; 16]> {
+    let b = s.as_bytes();
+    if b.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, o) in out.iter_mut().enumerate() {
+        let hi = (b[2 * i] as char).to_digit(16)?;
+        let lo = (b[2 * i + 1] as char).to_digit(16)?;
+        *o = (hi * 16 + lo) as u8;
+    }
+    Some(out)
 }
 
 /// A result.
@@ -280,6 +329,15 @@ impl Search {
                     return (false, Vec::new());
                 }
             }
+            SearchKind::FindBuddy => {
+                if age_end < now {
+                    return (true, Vec::new());
+                }
+                if self.answers > FINDBUDDY_TOTAL || age_end - 20 < now {
+                    self.stop_at(now);
+                    return (false, Vec::new());
+                }
+            }
         }
         (false, self.jump_start(now))
     }
@@ -341,6 +399,16 @@ impl Search {
         }
         if self.kind.is_store() {
             return self.store_to(from);
+        }
+        if matches!(self.kind, SearchKind::FindBuddy) {
+            // A safeguard: no more than so many asked. Each request counts
+            // as an answer (`m_answers++`).
+            if self.answers > FINDBUDDY_TOTAL {
+                return None;
+            }
+            self.answers += 1;
+            self.requests += 1;
+            return Some(Action::FindBuddy { to: from.clone() });
         }
         // Kad1 nodes (before version 3) are not asked.
         if from.version < 3 {
@@ -589,6 +657,7 @@ pub fn source_result(answer: UInt128, tags: &[Tag]) -> Option<SourceResult> {
         udp_port: 0,
         buddy_ip: Ipv4Addr::UNSPECIFIED,
         buddy_port: 0,
+        buddy_id: None,
         crypt_options: 0,
     };
     for t in tags {
@@ -603,9 +672,16 @@ pub fn source_result(answer: UInt128, tags: &[Tag]) -> Option<SourceResult> {
         } else if n.is(tag::SOURCEUPORT) {
             r.udp_port = int as u16;
         } else if n.is(tag::SERVERIP) {
-            r.buddy_ip = Ipv4Addr::from(int as u32);
+            // The buddy's `GetIP()`: network order, unlike the Kad IPs.
+            r.buddy_ip = Ipv4Addr::from((int as u32).to_le_bytes());
         } else if n.is(tag::SERVERPORT) {
             r.buddy_port = int as u16;
+        } else if n.is(tag::BUDDYHASH) {
+            // Published in eMule's layout: turned into aMule's.
+            if let TagValue::String(s) = &t.value {
+                r.buddy_id =
+                    decode_hex16(s).map(|b| buddy_id_other_layout(UInt128::from_be_bytes(b)));
+            }
         } else if n.is(tag::ENCRYPTION) {
             r.crypt_options = int as u8;
         }

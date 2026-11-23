@@ -190,6 +190,31 @@ pub enum KadPacket {
     },
     /// `KADEMLIA_FIREWALLED_ACK_RES` (before Kad version 7): (null)
     FirewalledAckRes,
+    /// `KADEMLIA_FINDBUDDY_REQ`: a firewalled node looks for a buddy.
+    /// `<buddy ID 16><user hash 16><tcp port 2>`; the buddy ID is the
+    /// search target, our Kad ID with every bit flipped.
+    FindBuddyReq {
+        buddy_id: UInt128,
+        /// The asker's user hash, as `WriteUInt128` writes it.
+        user_hash: UInt128,
+        tcp_port: u16,
+    },
+    /// `KADEMLIA_FINDBUDDY_RES`: an offer.
+    /// `<buddy ID 16><user hash 16><tcp port 2>[<connect options 1>]`
+    FindBuddyRes {
+        buddy_id: UInt128,
+        user_hash: UInt128,
+        tcp_port: u16,
+        /// Since Kad version 7, when the request was keyed.
+        connect_options: Option<u8>,
+    },
+    /// `KADEMLIA_CALLBACK_REQ`: to a firewalled source's buddy, asking it to
+    /// have the source connect to us. `<buddy ID 16><file hash 16><tcp port 2>`
+    CallbackReq {
+        buddy_id: UInt128,
+        file: UInt128,
+        tcp_port: u16,
+    },
     /// Anything else (or older): the opcode and payload.
     Other {
         opcode: u8,
@@ -299,6 +324,9 @@ impl KadPacket {
             KadPacket::FirewalledReq { .. } => return V1::FirewalledReq.into(),
             KadPacket::FirewalledRes { .. } => return V1::FirewalledRes.into(),
             KadPacket::FirewalledAckRes => return V1::FirewalledAckRes.into(),
+            KadPacket::FindBuddyReq { .. } => return V1::FindBuddyReq.into(),
+            KadPacket::FindBuddyRes { .. } => return V1::FindBuddyRes.into(),
+            KadPacket::CallbackReq { .. } => return V1::CallbackReq.into(),
             KadPacket::Other { opcode, .. } => return *opcode,
         };
         op.into()
@@ -324,6 +352,31 @@ impl KadPacket {
             }
             KadPacket::FirewalledRes { ip } => {
                 w.u32(*ip);
+            }
+            KadPacket::FindBuddyReq {
+                buddy_id,
+                user_hash,
+                tcp_port,
+            } => {
+                w.uint128(*buddy_id).uint128(*user_hash).u16(*tcp_port);
+            }
+            KadPacket::FindBuddyRes {
+                buddy_id,
+                user_hash,
+                tcp_port,
+                connect_options,
+            } => {
+                w.uint128(*buddy_id).uint128(*user_hash).u16(*tcp_port);
+                if let Some(o) = connect_options {
+                    w.u8(*o);
+                }
+            }
+            KadPacket::CallbackReq {
+                buddy_id,
+                file,
+                tcp_port,
+            } => {
+                w.uint128(*buddy_id).uint128(*file).u16(*tcp_port);
             }
             KadPacket::SearchNotesReq { target, size } => {
                 w.uint128(*target).u64(*size);
@@ -474,6 +527,37 @@ impl KadPacket {
             Ok(V1::FirewalledAckRes) => {
                 exact(0)?;
                 return Ok(KadPacket::FirewalledAckRes);
+            }
+            // CHECK_PACKET_MIN_SIZE(34): more is read past.
+            Ok(V1::FindBuddyReq) => {
+                return Ok(KadPacket::FindBuddyReq {
+                    buddy_id: r.uint128().map_err(e)?,
+                    user_hash: r.uint128().map_err(e)?,
+                    tcp_port: r.u16().map_err(e)?,
+                });
+            }
+            Ok(V1::FindBuddyRes) => {
+                let buddy_id = r.uint128().map_err(e)?;
+                let user_hash = r.uint128().map_err(e)?;
+                let tcp_port = r.u16().map_err(e)?;
+                let connect_options = if r.remaining() == 0 {
+                    None
+                } else {
+                    Some(r.u8().map_err(e)?)
+                };
+                return Ok(KadPacket::FindBuddyRes {
+                    buddy_id,
+                    user_hash,
+                    tcp_port,
+                    connect_options,
+                });
+            }
+            Ok(V1::CallbackReq) => {
+                return Ok(KadPacket::CallbackReq {
+                    buddy_id: r.uint128().map_err(e)?,
+                    file: r.uint128().map_err(e)?,
+                    tcp_port: r.u16().map_err(e)?,
+                });
             }
             _ => {}
         }

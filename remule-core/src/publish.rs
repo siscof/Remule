@@ -9,8 +9,9 @@
 //! [`ed2k_kad::Kad::store_keyword`] and [`ed2k_kad::Kad::store_source`].
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::SocketAddrV4;
 
-use ed2k_kad::node::{keyword_publish_tags, source_publish_tags};
+use ed2k_kad::node::{buddy_source_publish_tags, keyword_publish_tags, source_publish_tags};
 use ed2k_kad::search::keyword_target;
 use ed2k_server::packets::{offer_limit, OfferedFile};
 use ed2k_server::search::kad_words;
@@ -222,17 +223,20 @@ impl Publisher {
     /// and publishes nothing). Keyword and source publishes each start at
     /// most every two seconds, one keyword in turn every 24 hours, one file
     /// as a source in turn every 5 hours (kept in `known.met`).
+    #[allow(clippy::too_many_arguments)]
     pub fn kad_publish(
         &mut self,
         shared: &mut SharedFiles,
         running: (usize, usize),
         reachable: bool,
+        buddy: Option<(SocketAddrV4, UInt128)>,
         tcp_port: u16,
         crypt_options: u8,
         now: u64,
     ) -> Vec<KadPublish> {
         let mut out = Vec::new();
-        if !reachable || shared.shared_count() == 0 {
+        // Firewalled: only with a buddy to call us back through.
+        if (!reachable && buddy.is_none()) || shared.shared_count() == 0 {
             return out;
         }
         if running.0 < MAX_KEYWORD_STORES && now >= self.next_keyword_time {
@@ -282,7 +286,18 @@ impl Publisher {
                         out.push(KadPublish::Source {
                             hash,
                             size: f.size,
-                            tags: source_publish_tags(f.size, tcp_port, crypt_options),
+                            // `DecideKadSourcePublish`: firewalled, as
+                            // reached through our buddy.
+                            tags: match (reachable, buddy) {
+                                (false, Some((at, id))) => buddy_source_publish_tags(
+                                    f.size,
+                                    tcp_port,
+                                    crypt_options,
+                                    at,
+                                    id,
+                                ),
+                                _ => source_publish_tags(f.size, tcp_port, crypt_options),
+                            },
                         });
                     }
                 }

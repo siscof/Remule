@@ -65,6 +65,18 @@ pub struct Endpoint {
     pub user_hash: Option<Md4Hash>,
     /// [`crypt`] flags.
     pub crypt: u8,
+    /// A firewalled Kad source: it is not connected to, its buddy is asked
+    /// to have it connect to us.
+    pub buddy: Option<BuddyRoute>,
+}
+
+/// A firewalled source's Kad buddy (source types 3 and 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuddyRoute {
+    /// Its IP and Kad port.
+    pub kad: SocketAddrV4,
+    /// The ID callbacks for the source go by (aMule's layout).
+    pub id: ed2k_types::UInt128,
 }
 
 impl Endpoint {
@@ -73,6 +85,7 @@ impl Endpoint {
             addr,
             user_hash: None,
             crypt: 0,
+            buddy: None,
         }
     }
 
@@ -86,19 +99,34 @@ impl Endpoint {
             addr: SocketAddrV4::new(ed2k_server::packets::id_to_ip(s.id), s.port),
             user_hash: s.user_hash,
             crypt: s.crypt_options.unwrap_or(0) & 0x07,
+            buddy: None,
         })
     }
 
     /// A source a Kad search found; `None` unless it can be reached
     /// directly (types 1 and 4, with a TCP port).
     pub fn from_kad(s: &ed2k_kad::search::SourceResult) -> Option<Endpoint> {
-        if !matches!(s.source_type, 1 | 4) || s.tcp_port == 0 {
+        if s.tcp_port == 0 {
             return None;
         }
+        let buddy = match s.source_type {
+            1 | 4 => None,
+            // `KademliaSearchFile` for types 3 and 5: reached through its
+            // buddy. Its IP only matches it when it calls.
+            3 | 5 => match s.buddy_id {
+                Some(id) if !s.buddy_ip.is_unspecified() && s.buddy_port != 0 => Some(BuddyRoute {
+                    kad: SocketAddrV4::new(s.buddy_ip, s.buddy_port),
+                    id,
+                }),
+                _ => return None,
+            },
+            _ => return None,
+        };
         Some(Endpoint {
             addr: SocketAddrV4::new(s.ip, s.tcp_port),
             user_hash: Some(s.user_hash),
             crypt: s.crypt_options & 0x07,
+            buddy,
         })
     }
 
@@ -108,6 +136,7 @@ impl Endpoint {
             addr: SocketAddrV4::new(s.ip()?, s.port),
             user_hash: s.user_hash,
             crypt: s.crypt_options.unwrap_or(0) & 0x07,
+            buddy: None,
         })
     }
 }
@@ -141,6 +170,9 @@ pub struct QueueConfig {
     /// Our key, for secure identification.
     pub identity: Option<Arc<Identity>>,
     pub our_public_ip: Option<Ipv4Addr>,
+    /// Others can connect to us (`!IsFirewalled`): firewalled Kad sources
+    /// can be asked, through their buddy, to connect.
+    pub reachable: bool,
 }
 
 impl QueueConfig {
@@ -159,6 +191,7 @@ impl QueueConfig {
             ip_filter: None,
             identity: None,
             our_public_ip: None,
+            reachable: false,
         }
     }
 }
@@ -258,6 +291,20 @@ pub enum Report {
     KadFirewallAck {
         ip: Ipv4Addr,
     },
+    /// A Kad buddy link is up ([`crate::buddy`]): ours (we are firewalled),
+    /// or one we serve.
+    BuddyLinked {
+        addr: SocketAddrV4,
+        /// Our buddy's Kad port (0 for one we serve).
+        kad_port: u16,
+        serving: bool,
+    },
+    /// A Kad buddy link ended.
+    BuddyLost {
+        addr: SocketAddrV4,
+        serving: bool,
+        why: String,
+    },
 }
 
 /// Where a source stands (`EDownloadState`, simplified).
@@ -295,6 +342,11 @@ struct Source {
     udp: Option<(u16, u8)>,
     /// Obfuscate datagrams to it (`ShouldReceiveCryptUDPPackets`).
     crypt_udp: bool,
+    /// A callback through its buddy went unasked-for (no connection came):
+    /// the next goes with the buddy ID in the other layout
+    /// (`NextBuddyIdUsesAmuleLayout`).
+    callback_unanswered: bool,
+    callback_other_layout: bool,
     /// A UDP reask went out unanswered (`m_bUDPPending`).
     udp_pending: bool,
     /// It said its queue is full (`IsRemoteQueueFull`).
@@ -427,6 +479,11 @@ impl DownloadQueue {
     /// A server login (`CServerConnect::SetClientID`): our ID, which is our
     /// address for a HighID, and the public address the server saw, for the
     /// connections made from now on. 0 and `None` when logged out.
+    /// Whether others can connect to us now.
+    pub fn set_reachable(&mut self, reachable: bool) {
+        self.config.reachable = reachable;
+    }
+
     pub fn set_our_id(&mut self, id: u32, public_ip: Option<Ipv4Addr>) {
         self.config.ours.id = id;
         self.config.our_public_ip = public_ip;
@@ -774,6 +831,8 @@ impl DownloadQueue {
                 last_source_answer: None,
                 udp: None,
                 crypt_udp: false,
+                callback_unanswered: false,
+                callback_other_layout: false,
                 udp_pending: false,
                 remote_queue_full: false,
             },
@@ -979,6 +1038,37 @@ impl DownloadQueue {
             }
             busy.push(addr);
             started += 1;
+            // A firewalled source: ask its buddy to have it connect to us
+            // (`DS_WAITCALLBACKKAD`), unless we cannot be reached either.
+            if let Some(route) = self.sources[&id].endpoint.buddy {
+                let reachable = self.config.reachable;
+                let s = self.sources.get_mut(&id).unwrap();
+                s.last_asked = Some(now);
+                if !reachable {
+                    continue;
+                }
+                if s.callback_unanswered {
+                    s.callback_other_layout = !s.callback_other_layout;
+                }
+                s.callback_unanswered = true;
+                let buddy_id = if s.callback_other_layout {
+                    ed2k_kad::search::buddy_id_other_layout(route.id)
+                } else {
+                    route.id
+                };
+                let req = ed2k_kad::packets::KadPacket::CallbackReq {
+                    buddy_id,
+                    file: ed2k_types::UInt128::from_be_bytes(s.file.0),
+                    tcp_port: self.config.ours.port,
+                };
+                // Unobfuscated: the buddy's Kad version is not known.
+                out.push(Action::SendUdp(UdpOut {
+                    to: route.kad,
+                    payload: req.to_datagram(),
+                    obfuscate_for: None,
+                }));
+                continue;
+            }
             let conn = self.id();
             let s = self.sources.get_mut(&id).unwrap();
             s.conn = Some(conn);
@@ -1177,6 +1267,7 @@ impl DownloadQueue {
         s.conn = Some(conn);
         s.state = SourceState::Connected;
         s.last_asked = Some(now);
+        s.callback_unanswered = false;
         s.endpoint.user_hash.get_or_insert(hello.user_hash);
         let e = self.files.get_mut(&s.file).unwrap();
         let view = SourceView {

@@ -84,6 +84,7 @@ impl Seeder {
             addr: SocketAddrV4::new(Ipv4Addr::from(self.hello.id.to_le_bytes()), self.hello.port),
             user_hash: Some(self.hello.user_hash),
             crypt: crypt::SUPPORTED,
+            buddy: None,
         }
     }
 
@@ -1116,4 +1117,62 @@ fn no_udp_reask_without_a_port_or_as_a_low_id() {
         }
         assert!(w.udp.is_empty());
     }
+}
+
+/// A firewalled Kad source (type 3): not connected to; its buddy is asked
+/// over Kad to have it connect (`KADEMLIA_CALLBACK_REQ`, unobfuscated),
+/// only while others can reach us; an unanswered request makes the next
+/// carry the buddy ID in the other layout; when the source connects, it
+/// is downloaded from.
+#[test]
+fn a_firewalled_source_is_asked_through_its_buddy() {
+    use crate::download_queue::BuddyRoute;
+    use ed2k_kad::packets::KadPacket;
+    use ed2k_kad::search::buddy_id_other_layout;
+    use ed2k_types::UInt128;
+    let (_dir, d, h, q) = setup("q-buddy-source");
+    let mut w = World::new(q);
+    let s = seeder_at(1, &d, &h, PartStatus::Complete);
+    let route = BuddyRoute {
+        kad: SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 4672),
+        id: UInt128::new(0x0102_0304_0506_0708),
+    };
+    let mut ep = s.endpoint();
+    ep.buddy = Some(route);
+    w.add_seeder(s.clone());
+    // Not reachable: nothing asked, no connection.
+    w.add_source(h.ed2k, ep);
+    w.tick();
+    assert!(w.udp.is_empty() && w.conns.is_empty());
+    // Reachable: at the next reask, the buddy is asked.
+    w.q.set_reachable(true);
+    w.tick_until(10, |w| !w.udp.is_empty());
+    assert!(
+        w.conns.is_empty(),
+        "a firewalled source is not connected to"
+    );
+    let req = w.udp[0].clone();
+    assert_eq!((req.to, req.obfuscate_for), (route.kad, None));
+    assert_eq!(
+        KadPacket::parse(&req.payload).unwrap(),
+        KadPacket::CallbackReq {
+            buddy_id: route.id,
+            file: UInt128::from_be_bytes(h.ed2k.0),
+            tcp_port: 4662,
+        }
+    );
+    // Unanswered: the next one tries the other layout.
+    w.tick_until(10, |w| w.udp.len() >= 2);
+    let KadPacket::CallbackReq { buddy_id, .. } = KadPacket::parse(&w.udp[1].payload).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(buddy_id, buddy_id_other_layout(route.id));
+    // The source connects to us: downloaded from as any callback.
+    let conn = w.q.incoming();
+    let addr = SocketAddr::V4(ep.addr);
+    w.conns.insert(conn, addr);
+    let a = w.q.packet(conn, wire(s.hello.to_hello().unwrap()), w.now);
+    w.run(a.into());
+    w.tick_until(20, World::completed);
 }

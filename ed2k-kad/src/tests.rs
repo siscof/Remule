@@ -1212,3 +1212,275 @@ fn an_old_nodes_hello_answer_is_challenged() {
         Ok(KadPacket::Req { receiver, .. }) if receiver == ids[1]
     )));
 }
+
+/// The buddy packets on the wire (`KADEMLIA_FINDBUDDY_REQ/RES`,
+/// `KADEMLIA_CALLBACK_REQ`): Kad 1 opcodes under the Kad 2 header; an
+/// offer's connect options only when present.
+#[test]
+fn buddy_packets_round_trip() {
+    let a = UInt128::new(0x0123_4567_89AB_CDEF_0011_2233_4455_6677);
+    let b = UInt128::new(42);
+    for p in [
+        KadPacket::FindBuddyReq {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 4662,
+        },
+        KadPacket::FindBuddyRes {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 4662,
+            connect_options: Some(3),
+        },
+        KadPacket::FindBuddyRes {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 4662,
+            connect_options: None,
+        },
+        KadPacket::CallbackReq {
+            buddy_id: a,
+            file: b,
+            tcp_port: 4711,
+        },
+    ] {
+        let d = p.to_datagram();
+        assert_eq!(d[0], 0xE4);
+        assert_eq!(KadPacket::parse(&d).unwrap(), p);
+    }
+    assert_eq!(
+        KadPacket::FindBuddyReq {
+            buddy_id: a,
+            user_hash: b,
+            tcp_port: 1
+        }
+        .to_datagram()[1],
+        0x51
+    );
+    // Shorter than 34 bytes: refused.
+    assert!(KadPacket::parse(&[0xE4, 0x52, 1, 2, 3]).is_err());
+}
+
+/// A firewalled node finds a buddy: five minutes after start it searches
+/// toward its Kad ID with every bit flipped; the open node there offers
+/// (and says so to its application), the firewalled one hears the offer.
+/// A firewalled or already serving node does not offer; an offer for
+/// another ID, or unasked, is not taken.
+#[test]
+fn a_firewalled_node_finds_a_buddy() {
+    let mut rng = StdRng::seed_from_u64(77);
+    let mut ids: Vec<UInt128> = (0..30).map(|_| UInt128::new(rng.gen())).collect();
+    let target = UInt128::new(u128::MAX) ^ ids[0];
+    // Node 5 is close to node 0's buddy target; node 6 too, but serving.
+    ids[5] = target ^ UInt128::new(777);
+    ids[6] = target ^ UInt128::new(999);
+    let mut net = Net::new(&ids, &mut rng);
+    let mut c = net.nodes[0].config().clone();
+    c.tcp_firewalled = true;
+    net.nodes[0] = Kad::new(c, net.now);
+    net.nodes[6].serving_buddy = true;
+    // Everyone but node 0 can be reached over TCP.
+    for n in &mut net.nodes[1..] {
+        n.assume_tcp_open();
+    }
+    let addrs = net.addrs.clone();
+    for i in 0..net.nodes.len() {
+        for (j, &a) in addrs.iter().enumerate() {
+            if i == j || (i + j) % 3 != 0 && j != 5 && j != 6 {
+                continue;
+            }
+            let mut v = true;
+            net.nodes[i].routing.add(
+                ids[j],
+                u32::from(*a.ip()),
+                a.port(),
+                4662,
+                8,
+                UdpKey::default(),
+                &mut v,
+                false,
+                false,
+                1000,
+            );
+        }
+    }
+    net.run(60);
+    // Not before five minutes, nor with a buddy.
+    assert!(net.nodes[0].buddy_search(false, net.now).is_none());
+    net.run(250);
+    assert!(net.nodes[0].buddy_search(true, net.now).is_none());
+    let now = net.now;
+    let (_, out) = net.nodes[0]
+        .buddy_search(false, now)
+        .expect("a buddy search");
+    // Once: the next waits 20 minutes.
+    assert!(net.nodes[0].buddy_search(false, now).is_none());
+    // An open node that is not firewalled does not search.
+    assert!(net.nodes[1].buddy_search(false, now).is_none());
+    net.post(0, out);
+    let mut events = net.deliver();
+    events.extend(net.run(30));
+    let offer = events.iter().find_map(|(i, e)| match e {
+        Event::BuddyOffer { tcp, user_hash, .. } if *i == 0 => Some((*tcp, *user_hash)),
+        _ => None,
+    });
+    let (tcp, user_hash) = offer.expect("an offer");
+    assert_eq!(tcp, SocketAddrV4::new(*net.addrs[5].ip(), 4662));
+    assert_eq!(user_hash, net.nodes[5].config().user_hash);
+    let request = events.iter().find_map(|(i, e)| match e {
+        Event::BuddyRequest {
+            buddy_id,
+            user_hash,
+            tcp,
+        } if *i == 5 => Some((*buddy_id, *user_hash, *tcp)),
+        _ => None,
+    });
+    assert_eq!(
+        request,
+        Some((
+            target,
+            net.nodes[0].config().user_hash,
+            SocketAddrV4::new(*net.addrs[0].ip(), 4662)
+        ))
+    );
+    assert!(!events
+        .iter()
+        .any(|(i, e)| *i == 6 && matches!(e, Event::BuddyRequest { .. })));
+
+    // An offer nobody asked for, or for someone else: ignored.
+    let stray = KadPacket::FindBuddyRes {
+        buddy_id: target,
+        user_hash: UInt128::new(1),
+        tcp_port: 1,
+        connect_options: None,
+    };
+    let out = net.nodes[0].handle(net.addrs[9], &stray.to_datagram(), net.now);
+    assert!(out.events.is_empty());
+    // A firewalled node does not offer.
+    let req = KadPacket::FindBuddyReq {
+        buddy_id: UInt128::new(5),
+        user_hash: UInt128::new(6),
+        tcp_port: 7,
+    };
+    let out = net.nodes[0].handle(net.addrs[9], &req.to_datagram(), net.now);
+    assert!(out.send.is_empty() && out.events.is_empty());
+}
+
+/// `KADEMLIA_CALLBACK_REQ` reaches the application with the asker's
+/// address and TCP port.
+#[test]
+fn callback_requests_reach_the_application() {
+    let mut rng = StdRng::seed_from_u64(78);
+    let ids = [UInt128::new(rng.gen()), UInt128::new(rng.gen())];
+    let mut net = Net::new(&ids, &mut rng);
+    let req = KadPacket::CallbackReq {
+        buddy_id: UInt128::new(99),
+        file: UInt128::from_be_bytes([7; 16]),
+        tcp_port: 4711,
+    };
+    let out = net.nodes[0].handle(net.addrs[1], &req.to_datagram(), 1000);
+    // (The first packet also says Kad is connected.)
+    let events: Vec<Event> = out
+        .events
+        .into_iter()
+        .filter(|e| *e != Event::Connected)
+        .collect();
+    assert_eq!(
+        events,
+        vec![Event::CallbackRequest {
+            buddy_id: UInt128::new(99),
+            file: Md4Hash([7; 16]),
+            from: SocketAddrV4::new(*net.addrs[1].ip(), 4711),
+        }]
+    );
+}
+
+/// A firewalled source published through its buddy (`TAG_SOURCETYPE` 3,
+/// `TAG_SERVERIP`/`PORT`, `TAG_BUDDYHASH`) reads back as published: the
+/// buddy's IP in network order, the ID in aMule's layout though written
+/// in eMule's.
+#[test]
+fn buddy_sources_round_trip() {
+    use crate::node::buddy_source_publish_tags;
+    use crate::search::{buddy_id_other_layout, source_result};
+    use ed2k_types::tags::kad as t;
+    let buddy = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 4672);
+    let id = UInt128::from_be_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    let tags = buddy_source_publish_tags(1000, 4662, 3, buddy, id);
+    let ip_tag = tags.iter().find(|x| x.name.is(t::SERVERIP)).unwrap();
+    assert_eq!(
+        ip_tag.as_int(),
+        Some(u64::from(u32::from_le_bytes([198, 51, 100, 7])))
+    );
+    let hash = tags.iter().find(|x| x.name.is(t::BUDDYHASH)).unwrap();
+    assert_eq!(
+        hash.value,
+        TagValue::String("0403020108070605 0C0B0A09100F0E0D".replace(' ', ""))
+    );
+    // As an index answers it: the sender's IP added.
+    let mut answered = tags.clone();
+    answered.push(Tag::new(
+        TagName::Str(t::SOURCEIP.to_vec()),
+        TagValue::int(u64::from(u32::from(Ipv4Addr::new(192, 0, 2, 50)))),
+    ));
+    let r = source_result(UInt128::new(77), &answered).unwrap();
+    assert_eq!(r.source_type, 3);
+    assert_eq!((r.buddy_ip, r.buddy_port), (*buddy.ip(), 4672));
+    assert_eq!(r.buddy_id, Some(id));
+    assert_eq!((r.ip, r.tcp_port), (Ipv4Addr::new(192, 0, 2, 50), 4662));
+    // Large files are type 5; a lower-case hash reads too.
+    assert!(matches!(
+        buddy_source_publish_tags(5 << 30, 1, 0, buddy, id)[0].value,
+        TagValue::U8(5)
+    ));
+    let mut lower = answered.clone();
+    let i = lower.iter().position(|x| x.name.is(t::BUDDYHASH)).unwrap();
+    lower[i].value = TagValue::String(
+        buddy_id_other_layout(id)
+            .to_be_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    );
+    assert_eq!(
+        source_result(UInt128::new(77), &lower).unwrap().buddy_id,
+        Some(id)
+    );
+}
+
+/// A source search with only one node known, that node close to the
+/// target: it answers the lookup with nothing closer, and is then asked
+/// for sources (`JumpStart` -> `StorePacket`).
+#[test]
+fn a_lone_close_node_is_asked_for_sources() {
+    let mut rng = StdRng::seed_from_u64(81);
+    let file = Md4Hash([0x5A; 16]);
+    let target = UInt128::from_be_bytes(file.0);
+    let ids = [UInt128::new(rng.gen()), target ^ UInt128::new(3)];
+    let mut net = Net::new(&ids, &mut rng);
+    let a1 = net.addrs[1];
+    let mut v = true;
+    net.nodes[0].routing.add(
+        ids[1],
+        u32::from(*a1.ip()),
+        a1.port(),
+        4662,
+        9,
+        UdpKey::default(),
+        &mut v,
+        false,
+        false,
+        1000,
+    );
+    let (_, out) = net.nodes[0].search_sources(file, 1000, net.now).unwrap();
+    net.post(0, out);
+    net.deliver();
+    net.run(10);
+    assert!(
+        net.requests
+            .iter()
+            .any(|(to, p, _)| *to == 1 && matches!(p, KadPacket::SearchSourceReq { .. })),
+        "{:?}",
+        net.requests
+    );
+}

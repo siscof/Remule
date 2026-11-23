@@ -811,6 +811,7 @@ pub async fn run(
                     listening,
                     allow_lan: c.allow_lan,
                     trace_wire: kad::trace_from_env(),
+                    ip_filter: c.ip_filter.clone(),
                 },
             )
             .await?,
@@ -1233,6 +1234,7 @@ pub async fn run(
                                             listening,
                                             allow_lan: c.allow_lan,
                                             trace_wire: kad::trace_from_env(),
+                                            ip_filter: c.ip_filter.clone(),
                                         }).await;
                                         if started.is_ok() {
                                             break;

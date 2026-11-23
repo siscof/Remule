@@ -1352,6 +1352,7 @@ impl Kad {
                     for c in contacts {
                         if c.version > 1
                             && is_good_ip_port(c.ip, c.udp_port, filter_lan)
+                            && !self.routing.filtered(c.ip)
                             && !(c.udp_port == 53 && c.version <= 5)
                         {
                             self.udp_firewall.add_possible(Contact::new(
@@ -1392,6 +1393,7 @@ impl Kad {
                 for c in contacts {
                     if c.version <= 1
                         || !is_good_ip_port(c.ip, c.udp_port, filter_lan)
+                        || self.routing.filtered(c.ip)
                         || (c.udp_port == 53 && c.version <= 5)
                     {
                         continue;

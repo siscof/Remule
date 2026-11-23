@@ -49,9 +49,22 @@ struct Zone {
 /// What a lookup should go and find (`RandomLookup`).
 pub type LookupTarget = UInt128;
 
+/// The application's IP filter (`CIPFilter::IsFiltered`): true for an
+/// address (aMule order) that is to be left alone.
+#[derive(Clone)]
+pub struct AddressCheck(pub std::sync::Arc<dyn Fn(u32) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for AddressCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AddressCheck")
+    }
+}
+
 /// The table.
 #[derive(Debug, Clone)]
 pub struct RoutingTable {
+    /// Contacts the IP filter blocks are not taken (`CRoutingZone::Add`).
+    pub ip_filter: Option<AddressCheck>,
     me: UInt128,
     zones: Vec<Option<Zone>>,
     free: Vec<usize>,
@@ -72,6 +85,7 @@ fn subnet(ip: u32) -> u32 {
 impl RoutingTable {
     pub fn new(me: UInt128, now: u64) -> Self {
         let mut t = RoutingTable {
+            ip_filter: None,
             me,
             zones: Vec::new(),
             free: Vec::new(),
@@ -174,6 +188,11 @@ impl RoutingTable {
         }
     }
 
+    /// Whether the IP filter blocks `ip` (aMule order).
+    pub fn filtered(&self, ip: u32) -> bool {
+        self.ip_filter.as_ref().is_some_and(|f| (f.0)(ip))
+    }
+
     /// `CheckGlobalIPLimits`
     pub fn within_global_limits(&self, ip: u32) -> bool {
         if self.ips.get(&ip).copied().unwrap_or(0) >= MAX_CONTACTS_IP {
@@ -221,7 +240,10 @@ impl RoutingTable {
         from_hello: bool,
         now: u64,
     ) -> bool {
-        if !is_good_ip_port(ip, udp_port, self.filter_lan) || (udp_port == 53 && version <= 5) {
+        if !is_good_ip_port(ip, udp_port, self.filter_lan)
+            || self.filtered(ip)
+            || (udp_port == 53 && version <= 5)
+        {
             return false;
         }
         self.add_unfiltered(

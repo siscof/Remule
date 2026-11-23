@@ -1672,3 +1672,49 @@ fn direct_callback_sources_round_trip() {
         (6, 4662, 4672, 0x0B)
     );
 }
+
+/// The IP filter (`CIPFilter::IsFiltered` in `CRoutingZone::Add` and the
+/// `KADEMLIA2_RES` handler): a blocked address is not taken into the
+/// routing table, whether added directly or named in a lookup's answer.
+#[test]
+fn the_ip_filter_keeps_contacts_out() {
+    use crate::routing::AddressCheck;
+    let mut rng = StdRng::seed_from_u64(97);
+    let ids: Vec<UInt128> = (0..4).map(|_| UInt128::new(rng.gen())).collect();
+    let mut net = Net::new(&ids, &mut rng);
+    let blocked = u32::from(*net.addrs[2].ip());
+    net.nodes[0].routing.ip_filter =
+        Some(AddressCheck(std::sync::Arc::new(move |ip| ip == blocked)));
+    let add = |net: &mut Net, i: usize, j: usize| {
+        let a = net.addrs[j];
+        let mut v = true;
+        net.nodes[i].routing.add(
+            ids[j],
+            u32::from(*a.ip()),
+            a.port(),
+            4662,
+            8,
+            UdpKey::default(),
+            &mut v,
+            false,
+            false,
+            1000,
+        )
+    };
+    assert!(!add(&mut net, 0, 2), "blocked");
+    assert!(add(&mut net, 0, 1));
+    // Node 1 knows 2 and 3, and hands them out.
+    add(&mut net, 1, 2);
+    add(&mut net, 1, 3);
+    for j in [2, 3] {
+        net.nodes[1].routing.get_mut(ids[j]).unwrap().kind = 2;
+    }
+    let (_, out) = net.nodes[0].find_node(ids[3], false, net.now).unwrap();
+    net.post(0, out);
+    net.run(5);
+    assert!(
+        net.nodes[0].routing.get(ids[2]).is_none(),
+        "named in an answer, still kept out"
+    );
+    assert!(net.nodes[0].routing.get(ids[3]).is_some());
+}

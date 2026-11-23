@@ -54,6 +54,7 @@ use crate::kad::{self, KadStart};
 use crate::server_conn::{Attempt, Connector, Next, ATTEMPT_TIMEOUT, RETRY_AFTER};
 use crate::udp_port::UdpPort;
 use remule_core::download_queue::UdpOut;
+use remule_core::publish::SourceRoute;
 use remule_core::udp_check::CheckRequest;
 
 /// Kad source searches are repeated this often (`GetKadSourceReaskTime`).
@@ -1442,14 +1443,25 @@ pub async fn run(
                 // Publish on Kad, when others can reach us.
                 if let (Some(k), Some(sh), true) = (&kad_node, &shares, kad_connected.is_some()) {
                     let running = k.handle.store_counts().await;
+                    // `DecideKadSourcePublish`: open, else a direct UDP
+                    // callback, else through our buddy, else nothing.
+                    let route = if reach.reachable() {
+                        Some(SourceRoute::Open)
+                    } else if let Some(udp_port) = k.handle.direct_callback().await {
+                        Some(SourceRoute::DirectCallback { udp_port })
+                    } else {
+                        own_buddy.map(|at| SourceRoute::Buddy {
+                            at,
+                            id: ed2k_types::UInt128::new(u128::MAX) ^ k.prefs.kad_id,
+                        })
+                    };
                     let publishes = {
                         let mut sh = sh.lock().unwrap_or_else(|e| e.into_inner());
                         publisher.update_keywords(&sh);
                         publisher.kad_publish(
                             &mut sh,
                             running,
-                            reach.reachable(),
-                            own_buddy.map(|b| (b, ed2k_types::UInt128::new(u128::MAX) ^ k.prefs.kad_id)),
+                            route,
                             c.tcp_port,
                             0x03,
                             unix_now().into(),

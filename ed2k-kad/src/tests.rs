@@ -1609,3 +1609,66 @@ fn a_udp_firewall_round() {
         }
     );
 }
+
+/// `DirectCallbackAvailable` / `NeedsBuddy`: TCP-firewalled, but the UDP
+/// test says open: sources go out as type 6, and no buddy is looked for.
+#[test]
+fn udp_open_means_direct_callbacks_and_no_buddy() {
+    // A TCP-firewalled node, connected, five minutes on.
+    let node = |seed: u64| {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let ids: Vec<UInt128> = (0..2).map(|_| UInt128::new(rng.gen())).collect();
+        let mut net = Net::new(&ids, &mut rng);
+        let mut c = net.nodes[0].config().clone();
+        c.tcp_firewalled = true;
+        net.nodes[0] = Kad::new(c, net.now);
+        net.nodes[0].handle(net.addrs[1], &KadPacket::Ping.to_datagram(), net.now);
+        (net, ids)
+    };
+    let (mut plain, _) = node(95);
+    let later = plain.now + 400;
+    assert_eq!(plain.nodes[0].direct_callback(later), None);
+    assert!(
+        plain.nodes[0].buddy_search(false, later).is_some(),
+        "needs a buddy"
+    );
+
+    let (mut net, ids) = node(96);
+    let t = &mut net.nodes[0].udp_firewall;
+    t.add_possible(Contact::new(
+        ids[1],
+        u32::from(*net.addrs[1].ip()),
+        4672,
+        4662,
+        8,
+        UdpKey::default(),
+        false,
+        0,
+    ));
+    let c = t.next_client(true, |_| false, |_| false).unwrap();
+    t.result(true, false, c.ip, 4672, 4672, later);
+    assert_eq!(net.nodes[0].direct_callback(later), Some(Some(4672)));
+    assert!(
+        net.nodes[0].buddy_search(false, later).is_none(),
+        "no buddy needed"
+    );
+}
+
+/// A type 6 publish reads back as a source with its UDP port and the
+/// direct callback bit.
+#[test]
+fn direct_callback_sources_round_trip() {
+    use crate::node::direct_callback_source_publish_tags;
+    use crate::search::source_result;
+    use ed2k_types::tags::kad as t;
+    let mut tags = direct_callback_source_publish_tags(4662, Some(4672), 0x03);
+    tags.push(Tag::new(
+        TagName::Str(t::SOURCEIP.to_vec()),
+        TagValue::int(u64::from(u32::from(Ipv4Addr::new(192, 0, 2, 50)))),
+    ));
+    let r = source_result(UInt128::new(5), &tags).unwrap();
+    assert_eq!(
+        (r.source_type, r.tcp_port, r.udp_port, r.crypt_options),
+        (6, 4662, 4672, 0x0B)
+    );
+}

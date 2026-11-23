@@ -139,7 +139,7 @@ jobs:
   amulecmd-interop:
     runs-on: ubuntu-latest
     container: fedora:latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     env:
       AMULE_REF: 688c51eb77654d1fdc2a2967d1dd530c28b74ca5
     steps:
@@ -156,7 +156,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/amulecmd
-          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}
+          key: amulecmd-amulegui-amuleapi-amuled-fedora-${{ env.AMULE_REF }}-reask1-daemon-only
       - name: Build amulecmd, amulegui, amuleapi and amuled
         if: steps.amulecmd-cache.outputs.cache-hit != 'true'
         run: |
@@ -169,11 +169,18 @@ jobs:
             -DENABLE_NLS=NO -DENABLE_UPNP=NO -DENABLE_IP2COUNTRY=NO \
             -DENABLE_MEDIA_PROBE=OFF -DENABLE_VERSION_CHECK=OFF -DENABLE_BFD=NO \
             -DTRANSLATED_MANPAGES=NO
-          cmake --build build --target amulecmd amulegui amuleapi amuled -j "$(nproc)"
+          cmake --build build --target amulecmd amulegui amuleapi -j "$(nproc)"
           mkdir -p /opt/amulecmd
           cp "$(find build -type f -name amulecmd -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amulegui -perm -u+x | head -1)" /opt/amulecmd/
           cp "$(find build -type f -name amuleapi -perm -u+x | head -1)" /opt/amulecmd/
+          # amuled only, for udp-reask-with-amule.sh: SourceReaskMinutes may
+          # go down to 1 (aMule's least is 15), so aMule reasks within the
+          # job; the default stays 15. The tools above, amuleapi among them
+          # (its preferences schema reads these limits), keep aMule's own.
+          grep -q 'SOURCE_REASK_MINUTES{ 15, 15, 60 }' src/SourceSearchLimits.h
+          sed -i 's/SOURCE_REASK_MINUTES{ 15, 15, 60 }/SOURCE_REASK_MINUTES{ 1, 15, 60 }/' src/SourceSearchLimits.h
+          cmake --build build --target amuled -j "$(nproc)"
           cp "$(find build -type f -name amuled -perm -u+x | head -1)" /opt/amulecmd/
           # amuleapi's curl suite and static frontend, where run-all.sh
           # looks for them (it climbs three levels from its own folder).
@@ -185,7 +192,8 @@ jobs:
           cargo build --release -p remuled -p remulecmd -p remule-gui -p remule-cli
           cargo build --release -p remule-ec --example gui_check
       # MIGRATION_PLAN.md 8.6: aMule, queued by remule, asks again over UDP.
-      # Only this aMule has SourceReaskMinutes (15 minutes at the least).
+      # Only this aMule has SourceReaskMinutes (1 minute here: its least,
+      # 15, is lowered when it is built).
       - name: UDP reask, aMule asks remule
         run: bash scripts/interop/udp-reask-with-amule.sh
         env:

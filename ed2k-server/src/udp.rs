@@ -195,6 +195,80 @@ pub fn parse_global_search_results(datagram: &[u8]) -> Option<Vec<crate::search:
     Some(out)
 }
 
+// ------------------------------------------------------ global sources
+
+/// `MAX_FILES_PER_UDP_PACKET`: at most this many files in one source
+/// request (to a server with `SRV_UDPFLG_EXT_GETSOURCES`).
+pub const MAX_FILES_PER_UDP_PACKET: usize = 31;
+
+/// The source request for some downloads (hash and size) to one server
+/// (`WriteGlobalSourceRequest`, `SendGlobGetSourcesUDPPacket`):
+/// `OP_GLOBGETSOURCES2` with each size (a large file's as 0 then 64 bits)
+/// to a server with `SRV_UDPFLG_EXT_GETSOURCES2`, else `OP_GLOBGETSOURCES`
+/// with the hashes only.
+pub fn global_get_sources(files: &[(ed2k_types::Md4Hash, u64)], udp_flags: u32) -> Packet {
+    use ed2k_types::ed2k::{server_udp::flags, OLD_MAX_FILE_SIZE};
+    let with_size = udp_flags & flags::EXT_GETSOURCES2 != 0;
+    let mut w = ed2k_codec::Writer::new();
+    for &(hash, size) in files {
+        w.hash(hash);
+        if with_size {
+            if size > OLD_MAX_FILE_SIZE {
+                w.u32(0).u64(size);
+            } else {
+                w.u32(size as u32);
+            }
+        }
+    }
+    let op = if with_size {
+        Opcode::GlobGetSources2
+    } else {
+        Opcode::GlobGetSources
+    };
+    Packet::new(Protocol::Edonkey, op, w.into_bytes())
+}
+
+/// `OP_GLOBFOUNDSOURCES` (decrypted): a file's hash and its sources
+/// (`<count 1>(<ID 4><port 2>)*`), maybe followed by more such answers
+/// packed in the datagram. What could be read before anything broken;
+/// `None` for another kind of datagram.
+pub fn parse_global_found_sources(
+    datagram: &[u8],
+) -> Option<Vec<(ed2k_types::Md4Hash, Vec<crate::packets::Source>)>> {
+    let head = [Protocol::Edonkey as u8, u8::from(Opcode::GlobFoundSources)];
+    if datagram.len() < 2 || datagram[..2] != head {
+        return None;
+    }
+    let mut r = Reader::new(&datagram[2..]);
+    let mut out = Vec::new();
+    loop {
+        let read = (|| -> Result<_, ed2k_codec::io::Error> {
+            let hash = r.hash()?;
+            let count = r.u8()?;
+            let mut sources = Vec::with_capacity(count.into());
+            for _ in 0..count {
+                sources.push(crate::packets::Source {
+                    id: r.u32()?,
+                    port: r.u16()?,
+                    crypt_options: None,
+                    user_hash: None,
+                });
+            }
+            Ok((hash, sources))
+        })();
+        let Ok(found) = read else { break };
+        out.push(found);
+        // Another packed answer?
+        let rest = r.rest();
+        if rest.len() > 2 && rest[..2] == head {
+            r = Reader::new(&rest[2..]);
+        } else {
+            break;
+        }
+    }
+    Some(out)
+}
+
 // --------------------------------------------------- server descriptions
 
 /// `INV_SERV_DESC_LEN`: the low half of a description challenge, an

@@ -37,6 +37,7 @@ pub mod ec_stats;
 pub mod ec_update;
 pub mod firewall;
 pub mod friends;
+pub mod global_sources;
 pub mod graphs;
 pub mod http;
 pub mod kad;

@@ -782,3 +782,38 @@ fn server_descriptions() {
         (Some("old"), Some("desc"))
     );
 }
+
+/// `OP_GLOBGETSOURCES2` carries each size (a large one as 0 then 64 bits),
+/// `OP_GLOBGETSOURCES` the hashes only; packed `OP_GLOBFOUNDSOURCES`
+/// answers are all read.
+#[test]
+fn global_source_requests_and_answers() {
+    use ed2k_types::ed2k::server_udp::flags;
+    let files = [
+        (Md4Hash([1; 16]), 1000u64),
+        (Md4Hash([2; 16]), 5_000_000_000),
+    ];
+    let p = udp::global_get_sources(&files, flags::EXT_GETSOURCES | flags::EXT_GETSOURCES2);
+    assert_eq!(p.opcode, 0x94);
+    let mut want = vec![1u8; 16];
+    want.extend_from_slice(&1000u32.to_le_bytes());
+    want.extend_from_slice(&[2; 16]);
+    want.extend_from_slice(&0u32.to_le_bytes());
+    want.extend_from_slice(&5_000_000_000u64.to_le_bytes());
+    assert_eq!(p.payload, want);
+    let p = udp::global_get_sources(&files[..1], 0);
+    assert_eq!((p.opcode, p.payload.clone()), (0x9A, vec![1u8; 16]));
+
+    let mut w = Writer::new();
+    w.u8(0xE3).u8(0x9B).hash(Md4Hash([1; 16])).u8(2);
+    w.u32(0x0400_0A0A).u16(4662).u32(77).u16(4662);
+    w.u8(0xE3).u8(0x9B).hash(Md4Hash([2; 16])).u8(1);
+    w.u32(0x0500_0A0A).u16(4663);
+    let found = udp::parse_global_found_sources(&w.into_bytes()).unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].0, Md4Hash([1; 16]));
+    assert_eq!(found[0].1.len(), 2);
+    assert_eq!((found[0].1[1].id, found[0].1[1].port), (77, 4662));
+    assert_eq!((found[1].0, found[1].1[0].port), (Md4Hash([2; 16]), 4663));
+    assert!(udp::parse_global_found_sources(&[0xE3, 0x99]).is_none());
+}

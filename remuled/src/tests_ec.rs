@@ -363,6 +363,7 @@ async fn ask(req: Packet, s: &Status, shutting_down: bool) -> (Packet, bool, Vec
                     seen.push(format!("category removed {c}"));
                 }
                 Control::IpFilterUpdate(url) => seen.push(format!("ipfilter update {url}")),
+                Control::NodesUpdate(url) => seen.push(format!("nodes update {url}")),
             }
         }
         seen

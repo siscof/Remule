@@ -121,6 +121,8 @@ struct World {
     kad_running: bool,
     kad_connected: bool,
     live: Option<ed2k_server::session::ServerInfo>,
+    config: PathBuf,
+    server_met_busy: bool,
 }
 
 impl World {
@@ -144,6 +146,8 @@ impl World {
                 tcp_flags: 0x19,
                 ..Default::default()
             }),
+            config: PathBuf::from("no-such-config-dir"),
+            server_met_busy: false,
         }
     }
 
@@ -161,9 +165,132 @@ impl World {
                 ip_filter: None,
                 filter_lan: true,
                 now: Instant::now(),
+                config: &self.config,
+                server_met_busy: self.server_met_busy,
             },
         )
     }
+}
+
+/// `EC_OP_SERVER_UPDATE_FROM_URL`: one http(s) URL, or none for each of
+/// `addresses.dat`'s (read afresh: valid ones, each once); refused with
+/// aMule's reasons, and the busy flag while a download runs.
+#[test]
+fn a_server_list_is_fetched_from_a_url_or_addresses_dat() {
+    let mut w = World::new();
+    let update = |tags: Vec<Tag>| {
+        let mut p = Packet::new(EC_OP_SERVER_UPDATE_FROM_URL);
+        p.tags = tags;
+        p
+    };
+    let url = |u: &str| Tag::string(EC_TAG_STRING, u);
+    let (r, e) = w.ask(update(vec![url("http://example.org/server.met")]));
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(
+        e,
+        [Effect::UpdateServerMet(vec![
+            "http://example.org/server.met".into()
+        ])]
+    );
+    for bad in [
+        vec![url("ftp://example.org/server.met")],
+        vec![url("http:// example.org/x")],
+        vec![url("not a url")],
+        vec![Tag::int(EC_TAG_STRING, 5)],
+        vec![url("http://a/1"), url("http://a/2")],
+    ] {
+        let (r, e) = w.ask(update(bad));
+        assert_eq!(
+            (r.opcode, message(&r)),
+            (EC_OP_FAILED, "Invalid URL".to_owned())
+        );
+        assert!(e.is_empty());
+    }
+    // No URL and no addresses.dat.
+    let (r, e) = w.ask(update(Vec::new()));
+    assert_eq!(message(&r), "No server list sources configured");
+    assert!(e.is_empty());
+    // addresses.dat's, valid ones once each.
+    let d = TempDir::new("addresses");
+    std::fs::write(
+        d.0.join("addresses.dat"),
+        "http://one.example/server.met\r\n  https://two.example/s.met  \n\nftp://x/y\nhttp://one.example/server.met\n",
+    )
+    .unwrap();
+    w.config = d.0.clone();
+    let (r, e) = w.ask(update(vec![url("")]));
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(
+        e,
+        [Effect::UpdateServerMet(vec![
+            "http://one.example/server.met".into(),
+            "https://two.example/s.met".into()
+        ])]
+    );
+    // One at a time.
+    w.server_met_busy = true;
+    let (r, e) = w.ask(update(Vec::new()));
+    assert_eq!(
+        message(&r),
+        "A server list download is already in progress."
+    );
+    assert_eq!(r.tag(EC_TAG_SERVER_UPDATE_BUSY).unwrap().as_int(), 1);
+    assert!(e.is_empty());
+}
+
+/// A downloaded list merges as `LoadServerMet` merges one: new usable
+/// servers added (and tried by the connector), known ones renamed and
+/// given a description, unusable addresses left out.
+#[test]
+fn a_downloaded_server_list_is_merged() {
+    let mut w = World::new();
+    let mut known = info(1);
+    known.name = "renamed".into();
+    known.description = "now described".into();
+    let mut fresh = info(7);
+    fresh.name = String::new();
+    let mut bad = info(8);
+    bad.ip = Some(Ipv4Addr::new(0, 1, 2, 3));
+    let mut portless = info(9);
+    portless.port = 0;
+    let added = ec_servers::merge_met(
+        &mut w.list,
+        &met(&[known, fresh, bad, portless]),
+        &mut w.connector,
+        None,
+        false,
+    );
+    assert_eq!(added, 1);
+    assert!(w.list.changed());
+    let names: Vec<&str> = w.list.entries().iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["renamed", "server 2", "server 3", "Server 10.0.0.7"]
+    );
+    assert_eq!(w.list.entries()[0].description, "now described");
+}
+
+/// `EC_OP_KAD_BOOTSTRAP_FROM_IP`: the node in Kad's order (most significant
+/// byte first), unless Kad is disabled.
+#[test]
+fn kad_is_bootstrapped_from_a_node() {
+    let mut w = World::new();
+    let req = Packet::new(EC_OP_KAD_BOOTSTRAP_FROM_IP)
+        .with(Tag::int(EC_TAG_BOOTSTRAP_IP, 0xC633_6407))
+        .with(Tag::int(EC_TAG_BOOTSTRAP_PORT, 4672));
+    let (r, e) = w.ask(req.clone());
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(
+        e,
+        [Effect::BootstrapKad(SocketAddrV4::new(
+            Ipv4Addr::new(198, 51, 100, 7),
+            4672
+        ))]
+    );
+    w.kad = false;
+    let (r, e) = w.ask(req);
+    assert_eq!(message(&r), "Kad is disabled in preferences.");
+    assert!(e.is_empty());
 }
 
 fn message(p: &Packet) -> String {
@@ -712,4 +839,142 @@ async fn an_ec_client_stops_and_starts_kad() {
         .unwrap();
     // Kad's state was saved when it stopped.
     assert!(d.0.join("preferencesKad.dat").is_file());
+}
+
+/// A web server that answers every request with `body`.
+async fn web(listener: tokio::net::TcpListener, body: Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        let body = body.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.write_all(&body).await;
+        });
+    }
+}
+
+/// `EC_OP_SERVER_UPDATE_FROM_URL` through a running daemon: the list
+/// fetched over HTTP is merged (a new server added, a known one renamed)
+/// and saved; `EC_OP_KAD_UPDATE_FROM_URL` replaces `nodes.dat` and
+/// remembers the URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_and_node_lists_are_fetched_over_http() {
+    let d = TempDir::new("fetch");
+    let ec_port = free_port();
+    std::fs::write(
+        d.0.join("amule.conf"),
+        format!(
+            "[eMule]\nPort={}\nUDPPort={}\nConnectToKad=0\nConnectToED2K=1\nAutoconnect=0\nFilterLanIPs=0\n\
+             [ExternalConnect]\nAcceptExternalConnections=1\nECPort={ec_port}\nECPassword={SECRET}\n",
+            free_port(),
+            free_port()
+        ),
+    )
+    .unwrap();
+    let alpha = free_port();
+    let delta = free_port();
+    let met = |servers: Vec<ServerRecord>| {
+        ServerMet {
+            version: 0xE0,
+            servers,
+            legacy_counts: false,
+        }
+        .write()
+    };
+    std::fs::write(d.0.join("server.met"), met(vec![record(alpha, "Alpha")])).unwrap();
+    let served = met(vec![record(alpha, "Alpha Renamed"), record(delta, "Delta")]);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let met_url = format!(
+        "http://127.0.0.1:{}/server.met",
+        l.local_addr().unwrap().port()
+    );
+    tokio::spawn(web(l, served));
+    let nodes = b"not really a nodes.dat".to_vec();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let nodes_url = format!(
+        "http://127.0.0.1:{}/nodes.dat",
+        l.local_addr().unwrap().port()
+    );
+    tokio::spawn(web(l, nodes.clone()));
+    let loaded = config::load(&d.0).unwrap();
+    let daemon = tokio::spawn(crate::client::run(
+        loaded.client,
+        Vec::new(),
+        Vec::new(),
+        std::future::pending(),
+    ));
+    wait_for_ec(ec_port).await;
+
+    let dir = d.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
+        let names = |c: &mut Client| -> Vec<String> {
+            let r = c
+                .request(&Packet::new(EC_OP_GET_SERVER_LIST).with_detail(EC_DETAIL_CMD))
+                .unwrap();
+            r.tags
+                .iter()
+                .map(|t| t.child_str(EC_TAG_SERVER_NAME))
+                .collect()
+        };
+        assert_eq!(names(&mut c), ["Alpha"]);
+        let r = c
+            .request(
+                &Packet::new(EC_OP_SERVER_UPDATE_FROM_URL)
+                    .with(Tag::string(EC_TAG_STRING, &met_url)),
+            )
+            .unwrap();
+        assert_eq!(r.opcode, EC_OP_NOOP);
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = names(&mut c);
+            if got.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(got, ["Alpha Renamed", "Delta"]);
+
+        let r = c
+            .request(
+                &Packet::new(EC_OP_KAD_UPDATE_FROM_URL)
+                    .with(Tag::string(EC_TAG_STRING, &nodes_url)),
+            )
+            .unwrap();
+        assert_eq!(r.opcode, EC_OP_NOOP);
+        let mut replaced = false;
+        for _ in 0..100 {
+            if std::fs::read(dir.join("nodes.dat")).is_ok_and(|b| b == nodes) {
+                replaced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(replaced, "nodes.dat was not replaced");
+        assert_eq!(
+            c.request(&Packet::new(EC_OP_SHUTDOWN)).unwrap().opcode,
+            EC_OP_NOOP
+        );
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
+    // The merged list was saved, and the nodes URL remembered.
+    let saved = ServerMet::read(&std::fs::read(d.0.join("server.met")).unwrap()).unwrap();
+    assert_eq!(saved.servers.len(), 2);
+    let conf = std::fs::read_to_string(d.0.join("amule.conf")).unwrap();
+    assert!(conf.contains("KadNodesUrl=http://127.0.0.1:"), "{conf}");
 }

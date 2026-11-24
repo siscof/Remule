@@ -8,7 +8,10 @@
 //!   `EC_OP_SERVER_ADD`, `EC_OP_SERVER_REMOVE` (`Get_EC_Response_Server`,
 //!   `Get_EC_Response_Server_Add`).
 //! * `EC_OP_CONNECT`, `EC_OP_DISCONNECT`: both networks;
-//!   `EC_OP_KAD_START`, `EC_OP_KAD_STOP`.
+//!   `EC_OP_KAD_START`, `EC_OP_KAD_STOP`, `EC_OP_KAD_BOOTSTRAP_FROM_IP`.
+//! * `EC_OP_SERVER_UPDATE_FROM_URL`: `server.met` fetched from a URL, or
+//!   from each of `addresses.dat`'s, and merged into the list
+//!   (`UpdateServerMetFromURL`, `LoadServerMet`).
 //!
 //! The client loop owns the list and the [`Connector`]; [`handle`] answers
 //! a request from them without IO and says what the loop must then do
@@ -43,6 +46,8 @@ pub fn is_server_request(opcode: u8) -> bool {
             | EC_OP_DISCONNECT
             | EC_OP_KAD_START
             | EC_OP_KAD_STOP
+            | EC_OP_KAD_BOOTSTRAP_FROM_IP
+            | EC_OP_SERVER_UPDATE_FROM_URL
     )
 }
 
@@ -179,7 +184,7 @@ impl ServerList {
 }
 
 /// What the client loop does after a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     /// Drop the attempt in progress (`StopConnectionTry`).
     CancelAttempt,
@@ -187,6 +192,12 @@ pub enum Effect {
     Disconnect,
     /// Do what the connector says next.
     Follow(Next),
+    /// Fetch `server.met` from these URLs in turn, merging each
+    /// (`UpdateServerMetFromURL`).
+    UpdateServerMet(Vec<String>),
+    /// Start Kad if it is not running, and bootstrap from this node
+    /// (`BootstrapKad`).
+    BootstrapKad(SocketAddrV4),
     StartKad,
     StopKad,
 }
@@ -205,6 +216,76 @@ pub struct Ctx<'a> {
     pub ip_filter: Option<&'a AddressFilter>,
     pub filter_lan: bool,
     pub now: Instant,
+    /// The config directory (`addresses.dat`).
+    pub config: &'a Path,
+    /// A server list download is under way.
+    pub server_met_busy: bool,
+}
+
+/// `ServerListSources::IsValid`: an http or https URL naming a host, with
+/// no white space or control characters.
+pub fn valid_list_url(url: &str) -> bool {
+    if url.contains(['\n', '\r', '\0', ' ', '\t']) {
+        return false;
+    }
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    })
+}
+
+/// `GetServerListURLs`: `addresses.dat`, read afresh, one URL a line; the
+/// valid ones, each once.
+pub fn list_sources(config: &Path) -> Vec<String> {
+    let text = std::fs::read(config.join("addresses.dat"))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split(['\r', '\n']) {
+        let url = line.trim();
+        if valid_list_url(url) && !out.iter().any(|u| u == url) {
+            out.push(url.to_owned());
+        }
+    }
+    out
+}
+
+/// `LoadServerMet` merging a downloaded list: each server added as
+/// `AddServer` adds one (a usable, unfiltered address not listed yet), a
+/// listed one renamed and its description taken when it has one. The
+/// number added.
+pub fn merge_met(
+    list: &mut ServerList,
+    met: &ServerMet,
+    connector: &mut Connector,
+    ip_filter: Option<&AddressFilter>,
+    filter_lan: bool,
+) -> usize {
+    let mut added = 0;
+    for rec in &met.servers {
+        let s = ServerInfo::from_record(rec);
+        let Some(ip) = s.ip else { continue };
+        let addr = SocketAddrV4::new(ip, s.port);
+        if let Some(e) = list.find_mut(addr) {
+            e.name = s.name.clone();
+            if !s.description.is_empty() {
+                e.description = s.description.clone();
+            }
+            list.changed = true;
+            continue;
+        }
+        if s.port == 0
+            || !is_good_ip(ip, filter_lan)
+            || ip_filter.is_some_and(|f| f.blocks_server(ip))
+        {
+            continue;
+        }
+        list.entries.push(s);
+        list.changed = true;
+        connector.add(SocketAddr::V4(addr));
+        added += 1;
+    }
+    info!("{added} servers added");
+    added
 }
 
 /// `CEC_Server_Tag(server, detail_level)`.
@@ -346,6 +427,18 @@ pub fn handle(req: &Packet, ctx: &mut Ctx<'_>) -> (Packet, Vec<Effect>) {
                 failed("Kad is disabled in preferences.")
             }
         }
+        EC_OP_SERVER_UPDATE_FROM_URL => server_update(req, ctx, &mut out),
+        EC_OP_KAD_BOOTSTRAP_FROM_IP => {
+            if ctx.kad {
+                let ip = req.tag(EC_TAG_BOOTSTRAP_IP).map_or(0, Tag::as_int) as u32;
+                let port = req.tag(EC_TAG_BOOTSTRAP_PORT).map_or(0, Tag::as_int) as u16;
+                // Kad's order: the most significant byte first.
+                out.push(Effect::BootstrapKad(SocketAddrV4::new(ip.into(), port)));
+                Packet::new(EC_OP_NOOP)
+            } else {
+                failed("Kad is disabled in preferences.")
+            }
+        }
         EC_OP_KAD_STOP => {
             if ctx.kad_running {
                 out.push(Effect::StopKad);
@@ -443,6 +536,45 @@ fn server_add(req: &Packet, ctx: &mut Ctx<'_>) -> Packet {
     });
     ctx.list.changed = true;
     ctx.connector.add(SocketAddr::V4(addr));
+    Packet::new(EC_OP_NOOP)
+}
+
+/// `EC_OP_SERVER_UPDATE_FROM_URL`: one URL, or none for `addresses.dat`'s.
+/// The download runs on; a refusal says why, and whether a download is
+/// already under way.
+fn server_update(req: &Packet, ctx: &mut Ctx<'_>, out: &mut Vec<Effect>) -> Packet {
+    if req.tags.len() > 1
+        || req
+            .tags
+            .first()
+            .is_some_and(|t| t.ty != remule_ec::codes::EC_TAGTYPE_STRING)
+    {
+        return failed("Invalid URL");
+    }
+    let url = req.tags.first().map(Tag::as_str).unwrap_or_default();
+    let refuse = |reason: &str| {
+        info!("{reason}");
+        let p = failed(reason);
+        if ctx.server_met_busy {
+            p.with(Tag::int(EC_TAG_SERVER_UPDATE_BUSY, 1))
+        } else {
+            p
+        }
+    };
+    if ctx.server_met_busy {
+        return refuse("A server list download is already in progress.");
+    }
+    let sources = if url.is_empty() {
+        list_sources(ctx.config)
+    } else if valid_list_url(&url) {
+        vec![url]
+    } else {
+        return refuse("Invalid URL");
+    };
+    if sources.is_empty() {
+        return refuse("No server list sources configured");
+    }
+    out.push(Effect::UpdateServerMet(sources));
     Packet::new(EC_OP_NOOP)
 }
 

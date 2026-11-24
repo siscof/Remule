@@ -733,6 +733,20 @@ pub async fn run(
         }
     };
     let (udp_out_tx, mut udp_out_rx) = mpsc::unbounded_channel::<UdpOut>();
+    // The server UDP port (TCP + 3): global searches over the other servers.
+    let (server_udp_tx, mut server_udp_rx) = mpsc::unbounded_channel();
+    let server_udp =
+        match crate::server_udp::ServerUdp::bind(c.tcp_port.saturating_add(3), server_udp_tx).await
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("Server UDP: {e} (global searches ask the connected server only)");
+                None
+            }
+        };
+    // The global search timer's resolution.
+    let mut sweep_tick = tokio::time::interval(Duration::from_millis(250));
+    sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Our public IP as the server tells it: obfuscated datagrams are keyed with it.
     let mut public_ip: Option<std::net::Ipv4Addr> = None;
 
@@ -945,6 +959,35 @@ pub async fn run(
             d = async { match &udp_port { Some(_) => udp_out_rx.recv().await, None => std::future::pending().await } } => {
                 if let (Some(d), Some(p)) = (d, &udp_port) {
                     p.send_ed2k(&d, public_ip).await;
+                }
+            }
+            // A global search asks one more server, now and then.
+            _ = sweep_tick.tick() => {
+                let connected = match server_since {
+                    Some((SocketAddr::V4(a), _)) if server.is_some() => Some(a),
+                    _ => None,
+                };
+                if let Some(ask) = searches.sweep(Instant::now(), server_list.entries(), connected) {
+                    if let Some(u) = &server_udp {
+                        u.send(&ask.packet, &ask.server, public_ip).await;
+                    }
+                }
+            }
+            // Server UDP in: global search answers.
+            d = server_udp_rx.recv() => {
+                if let Some((from, datagram)) = d {
+                    let plain = crate::server_udp::decode(&datagram, from, server_list.entries(), public_ip);
+                    let trace = server_udp.as_ref().is_some_and(|u| u.trace());
+                    if trace {
+                        eprintln!(
+                            "server udp <- {from} {:#04x} {}",
+                            plain.get(1).copied().unwrap_or(0),
+                            if plain != datagram { "obfuscated" } else { "plain" }
+                        );
+                    }
+                    if let Some(results) = ed2k_server::udp::parse_global_search_results(&plain) {
+                        searches.udp_results(*from.ip(), results);
+                    }
                 }
             }
             d = async { match &udp_port { Some(_) => ed2k_udp_rx.recv().await, None => std::future::pending().await } } => {

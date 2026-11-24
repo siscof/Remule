@@ -769,6 +769,10 @@ pub async fn run(
         };
     // The servers' status pings.
     let mut server_stats = crate::server_stats::ServerStats::default();
+    // Sources asked of the other servers over UDP, and the downloads seen
+    // wanting sources (the new ones go first).
+    let mut global_sources = crate::global_sources::GlobalSources::default();
+    let mut seen_wanted: HashSet<Md4Hash> = HashSet::new();
     // The global search timer's resolution.
     let mut sweep_tick = tokio::time::interval(Duration::from_millis(250));
     sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1024,6 +1028,21 @@ pub async fn run(
                     );
                     if let Some(results) = inc.results {
                         searches.udp_results(*from.ip(), results);
+                    }
+                    // AddSources(SF_REMOTE_SERVER): LowIDs cannot be called
+                    // back through a server we are not logged into.
+                    for (hash, sources) in inc.sources.unwrap_or_default() {
+                        if !wanted.iter().any(|(h, _)| *h == hash) {
+                            debug!("Sources received for unknown file");
+                            continue;
+                        }
+                        let eps: Vec<Endpoint> = sources.iter().filter_map(Endpoint::from_server).collect();
+                        info!("[{:>5}s] server {from} (UDP): {} sources ({} reachable) for {}",
+                            start.elapsed().as_secs(), sources.len(), eps.len(),
+                            names.get(&hash).map(String::as_str).unwrap_or("?"));
+                        if !eps.is_empty() {
+                            let _ = cmd.send(Command::AddSources { file: hash, sources: eps, origin: Origin::Server });
+                        }
                     }
                     if let Some(u) = &server_udp {
                         for o in inc.out {
@@ -1510,6 +1529,38 @@ pub async fn run(
                 }
                 // Every server failed a while ago: a new sweep.
                 searches.poll(now);
+                // Downloads added or resumed are asked about first
+                // (`RequestGlobalSources`).
+                let connected_addr = match server_since {
+                    Some((SocketAddr::V4(a), _)) if server.is_some() => Some(a),
+                    _ => None,
+                };
+                let now_wanted: HashSet<Md4Hash> = wanted.iter().map(|(h, _)| *h).filter(|h| !paused.contains(h)).collect();
+                for h in now_wanted.difference(&seen_wanted) {
+                    global_sources.request(*h, server_list.entries(), connected_addr);
+                }
+                seen_wanted = now_wanted;
+                // One source request to another server (`SendGlobalSources`),
+                // while logged in.
+                if let (Some(u), Some(_)) = (&server_udp, &server) {
+                    if !wanted.is_empty() {
+                        let (tx, rx) = oneshot::channel();
+                        if cmd.send(Command::Progress(tx)).is_ok() {
+                            if let Ok((files, _)) = rx.await {
+                                let max_udp = crate::global_sources::max_sources_udp(300);
+                                let downloads: Vec<crate::global_sources::Wanted> = files.iter()
+                                    .filter(|f| matches!(f.status, remule_core::part_file::Status::Ready | remule_core::part_file::Status::Empty)
+                                        && !f.paused && !f.stopped && !f.done
+                                        && (f.sources as u32) < max_udp)
+                                    .map(|f| crate::global_sources::Wanted { hash: f.hash, size: f.size })
+                                    .collect();
+                                if let Some(ask) = global_sources.send(now, &downloads, server_list.entries(), connected_addr) {
+                                    u.send(&ask.packet, &ask.server, public_ip).await;
+                                }
+                            }
+                        }
+                    }
+                }
                 // One server's status ping (`ServerStats`), while logged in.
                 if let (Some(u), Some(_)) = (&server_udp, &server) {
                     let o = server_stats.tick(

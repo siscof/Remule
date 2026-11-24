@@ -72,6 +72,8 @@ pub enum Out {
 pub struct Incoming {
     /// A global search answer, for the searches to take.
     pub results: Option<Vec<SearchResult>>,
+    /// Sources a server we asked over UDP found, by file.
+    pub sources: Option<Vec<(ed2k_types::Md4Hash, Vec<ed2k_server::packets::Source>)>>,
     pub out: Vec<Out>,
 }
 
@@ -219,6 +221,15 @@ impl ServerStats {
         match Opcode::try_from(plain[1]) {
             Ok(Opcode::GlobSearchRes) => {
                 inc.results = udp::parse_global_search_results(&plain);
+            }
+            Ok(Opcode::GlobFoundSources) => {
+                // From a listed server (its obfuscation port, or any port
+                // of a server at that IP).
+                if idx.is_some() || list.entries().iter().any(|s| s.ip == Some(*from.ip())) {
+                    inc.sources = udp::parse_global_found_sources(&plain);
+                } else {
+                    debug!("OP_GLOBFOUNDSOURCES packet from unknown server {from}");
+                }
             }
             Ok(Opcode::GlobServStatRes) => match idx {
                 Some(i) => self.status(i, &plain, now, unix, list, public_ip, rng, &mut inc),

@@ -1187,3 +1187,89 @@ async fn remule_gui_s_requests_against_a_running_daemon() {
         .unwrap()
         .unwrap();
 }
+
+/// A server reached only over UDP that answers source requests: each file
+/// asked about gets two sources, the answers packed in one datagram. The
+/// requests (opcode, then payload) are told on `asked`.
+async fn udp_source_server(
+    sock: tokio::net::UdpSocket,
+    asked: std::sync::mpsc::Sender<(u8, Vec<u8>)>,
+) {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+            return;
+        };
+        if n < 2 || buf[0] != 0xE3 || !matches!(buf[1], 0x9A | 0x94) {
+            continue;
+        }
+        let _ = asked.send((buf[1], buf[2..n].to_vec()));
+        let step = if buf[1] == 0x94 { 20 } else { 16 };
+        let mut out = Vec::new();
+        for hash in buf[2..n].chunks(step) {
+            out.extend_from_slice(&[0xE3, 0x9B]);
+            out.extend_from_slice(&hash[..16]);
+            out.push(2);
+            for last in [7u8, 8] {
+                out.extend_from_slice(&[198, 51, 100, last]);
+                out.extend_from_slice(&4662u16.to_le_bytes());
+            }
+        }
+        let _ = sock.send_to(&out, from).await;
+    }
+}
+
+/// A download added over EC is asked about over UDP of the other server
+/// of the list (`OP_GLOBGETSOURCES`, not of the one we are logged into),
+/// and the sources it answers with join the download.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_other_servers_are_asked_for_sources_over_udp() {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = sock.local_addr().unwrap().port();
+    let (asked_tx, asked) = std::sync::mpsc::channel();
+    tokio::spawn(udp_source_server(sock, asked_tx));
+    let other = ServerRecord {
+        ip: Ipv4Addr::LOCALHOST,
+        port: udp_port - 4,
+        tags: Vec::new(),
+    };
+    let (_d, ec_port, daemon) = searching_daemon("globsrc", vec![other]).await;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
+        let mut ask = |p: Packet| c.request(&p).unwrap();
+        for _ in 0..100 {
+            let r = ask(Packet::new(EC_OP_GET_CONNSTATE).with_detail(EC_DETAIL_CMD));
+            if r.tags[0].as_int() & 1 == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let link = format!("ed2k://|file|udp-sources.bin|77000|{}|/", "42".repeat(16));
+        let r = ask(Packet::new(EC_OP_ADD_LINK).with(Tag::string(EC_TAG_STRING, &link)));
+        assert_eq!(r.opcode, EC_OP_NOOP, "{r:?}");
+        let mut sources = 0;
+        for _ in 0..100 {
+            let q = ask(Packet::new(EC_OP_GET_DLOAD_QUEUE));
+            sources = q
+                .tags
+                .first()
+                .map_or(0, |t| t.child_int(EC_TAG_PARTFILE_SOURCE_COUNT));
+            if sources >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Asked once, with the hash (no UDP flags known: OP_GLOBGETSOURCES).
+        assert_eq!(asked.try_recv(), Ok((0x9A, vec![0x42; 16])));
+        assert!(asked.try_recv().is_err());
+        assert_eq!(sources, 2, "the UDP server's sources joined the download");
+        assert_eq!(ask(Packet::new(EC_OP_SHUTDOWN)).opcode, EC_OP_NOOP);
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
+}

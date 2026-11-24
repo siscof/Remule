@@ -96,6 +96,8 @@ pub struct ClientConfig {
     /// Log in again when the server connection is lost, and try the list
     /// again 30 s after every server failed (aMule's `Reconnect`).
     pub reconnect: bool,
+    /// `AutoConnectStaticOnly`: only static servers are tried.
+    pub static_only: bool,
     /// `DeadServerRetry` when `RemoveDeadServer` is on: servers whose status
     /// pings failed this often are dropped.
     pub dead_server_retries: Option<u32>,
@@ -723,6 +725,16 @@ pub async fn run(
     // What is known of each, for the EC server list.
     let mut server_list = ServerList::load(&c.config, &servers);
     let mut connector = Connector::new(servers, c.obfuscate_server, c.reconnect);
+    // Static servers (`staticservers.dat`), and whether only they are tried.
+    for e in server_list.entries() {
+        if let Some(ip) = e.ip {
+            let a = SocketAddrV4::new(ip, e.port);
+            if server_list.is_static(a) {
+                connector.set_static(SocketAddr::V4(a), true);
+            }
+        }
+    }
+    connector.set_static_only(c.static_only);
     let mut attempting: Option<Attempting> = None;
     // Whether others can connect to us: found out as we run.
     let mut reach = Reachability {
@@ -1351,6 +1363,7 @@ pub async fn run(
                             now: Instant::now(),
                             config: &c.config,
                             server_met_busy,
+                            ecid: &|id| server_ids.0.iter().find(|(_, v)| **v == id).map(|(a, _)| *a),
                         });
                         let _ = reply.send(packet);
                         for e in effects {
@@ -1512,7 +1525,8 @@ pub async fn run(
                                 info.files = l.files;
                                 tcp_flags = l.tcp_flags;
                             }
-                            Some(crate::ec_update::UpdateServer { ecid: server_ids.id(addr), info, tcp_flags })
+                            let is_static = server_list.is_static(addr);
+                            Some(crate::ec_update::UpdateServer { ecid: server_ids.id(addr), info, tcp_flags, is_static })
                         }).collect();
                         let _ = reply.send(crate::ec_update::UpdateData { shared, servers, friends: friends.view() });
                     }

@@ -252,6 +252,7 @@ async fn the_daemon_runs_the_kad_firewall_check() {
         obfuscate_server: false,
         autoconnect: false,
         reconnect: false,
+        static_only: false,
         dead_server_retries: None,
         kad: Some(KadSettings {
             dir: kad_dir,

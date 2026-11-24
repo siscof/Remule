@@ -47,6 +47,7 @@ fn shared(ecid: u32) -> SharedBase {
 
 fn server(ecid: u32) -> UpdateServer {
     UpdateServer {
+        is_static: false,
         ecid,
         info: ServerInfo {
             ip: Some(Ipv4Addr::new(1, 2, 3, 4)),

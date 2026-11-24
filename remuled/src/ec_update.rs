@@ -95,6 +95,8 @@ pub struct UpdateServer {
     pub ecid: u32,
     pub info: ServerInfo,
     pub tcp_flags: u32,
+    /// `IsStaticMember`.
+    pub is_static: bool,
 }
 
 /// What the client gives for one update.
@@ -129,8 +131,7 @@ fn server_tag(s: &UpdateServer) -> Tag {
         .with(int(EC_TAG_SERVER_PING, i.ping.into()))
         .with(int(EC_TAG_SERVER_PRIO, i.preference.into()))
         .with(int(EC_TAG_SERVER_FAILED, i.failed.into()))
-        // Static servers (`staticservers.dat`) are not kept: none is.
-        .with(int(EC_TAG_SERVER_STATIC, 0))
+        .with(int(EC_TAG_SERVER_STATIC, u64::from(s.is_static)))
         .with(int(EC_TAG_SERVER_USERS, i.users.into()))
         .with(int(EC_TAG_SERVER_USERS_MAX, i.max_users.into()))
         .with(int(EC_TAG_SERVER_FILES, i.files.into()))

@@ -264,6 +264,7 @@ async fn the_daemon_shares_from_an_amule_directory() {
         obfuscate_server: false,
         autoconnect: true,
         reconnect: true,
+        static_only: false,
         dead_server_retries: None,
         kad: None,
         tcp_port: free_port(),

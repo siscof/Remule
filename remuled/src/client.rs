@@ -782,6 +782,8 @@ pub async fn run(
     // Server lists and nodes.dat fetched for EC requests.
     let (met_tx, mut met_rx) = mpsc::unbounded_channel::<MetFetch>();
     let mut server_met_busy = false;
+    // A list of this update loaded (`m_serverMetLoaded`).
+    let mut server_met_loaded = false;
     let (nodes_tx, mut nodes_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, String>>();
     // The servers' status pings.
     let mut server_stats = crate::server_stats::ServerStats::default();
@@ -1026,12 +1028,25 @@ pub async fn run(
                             crate::ec_servers::merge_met(&mut server_list, &met, &mut connector, c.ip_filter.as_deref(), !c.allow_lan);
                             server_list.mark_changed();
                             server_list.save_if_changed(&c.config);
+                            server_met_loaded = true;
                             info!("Finished downloading the server list from {url}");
                         }
                         Err(e) => warn!("Failed to download server.met from {url}: {e}"),
                     }
                 }
-                Some(MetFetch::Done) | None => server_met_busy = false,
+                Some(MetFetch::Done) | None => {
+                    server_met_busy = false;
+                    // HTTP_ServerMet: once the whole update is done and a
+                    // list loaded, connect, unless connected or connecting.
+                    let ed2k = c.ec.as_ref().is_some_and(|e| e.ed2k);
+                    if std::mem::take(&mut server_met_loaded) && ed2k && server.is_none() && attempting.is_none() {
+                        let next = connector.start(Instant::now());
+                        if next == crate::server_conn::Next::Idle {
+                            warn!("No valid servers to which to connect found in server list");
+                        }
+                        follow(next, &c, &mut attempting, start.elapsed());
+                    }
+                }
             },
             // nodes.dat fetched: Kad stopped (it saves its nodes, which
             // would overwrite the new file), the file replaced, Kad started.
@@ -1417,6 +1432,7 @@ pub async fn run(
                                 },
                                 Effect::UpdateServerMet(urls) => {
                                     server_met_busy = true;
+                                    server_met_loaded = false;
                                     let tx = met_tx.clone();
                                     tokio::spawn(async move {
                                         for url in urls {

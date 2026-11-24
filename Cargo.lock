@@ -1185,6 +1185,7 @@ name = "ed2k-server"
 version = "0.1.0"
 dependencies = [
  "ed2k-codec",
+ "ed2k-crypto",
  "ed2k-types",
  "rand 0.8.5",
  "remule-net",

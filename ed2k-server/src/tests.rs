@@ -687,3 +687,97 @@ fn offers_follow_the_server_dialect() {
     assert_eq!(packets::offer_limit(100, 0), 100);
     assert_eq!(packets::offer_limit(100, 50), 49);
 }
+
+/// The global search request for a server, by its UDP flags
+/// (`OnGlobalSearchTimer`).
+#[test]
+fn global_search_requests() {
+    use ed2k_types::ed2k::server_udp::flags;
+    let q = [1u8, 2, 3];
+    let op = |p: Option<Packet>| p.map(|p| p.opcode);
+    assert_eq!(op(udp::global_search(&q, false, 0)), Some(0x98));
+    assert_eq!(
+        op(udp::global_search(&q, false, flags::EXT_GETFILES)),
+        Some(0x92)
+    );
+    let p = udp::global_search(&q, true, flags::EXT_GETFILES | flags::LARGEFILES).unwrap();
+    assert_eq!(p.opcode, 0x90);
+    assert_eq!(p.payload, vec![1, 0, 0, 0, 0x89, 0x0E, 0x01, 1, 2, 3]);
+    // A 64-bit search: not to a server without large files.
+    assert_eq!(op(udp::global_search(&q, true, flags::EXT_GETFILES)), None);
+    assert_eq!(
+        op(udp::global_search(&q, true, flags::LARGEFILES)),
+        Some(0x98)
+    );
+}
+
+/// `OP_GLOBSEARCHRES`, two answers packed in one datagram.
+#[test]
+fn global_search_results() {
+    let mut w = Writer::new();
+    w.u8(0xE3).u8(0x99);
+    result_bytes(&mut w, 1, "a.iso", 1000, 3);
+    w.u8(0xE3).u8(0x99);
+    result_bytes(&mut w, 2, "b.iso", 2000, 4);
+    let r = udp::parse_global_search_results(&w.into_bytes()).unwrap();
+    assert_eq!(r.len(), 2);
+    assert_eq!((r[0].hash, r[1].hash), (Md4Hash([1; 16]), Md4Hash([2; 16])));
+    assert!(udp::parse_global_search_results(&[0xE3, 0x97, 0]).is_none());
+}
+
+/// The obfuscated ping: a raw challenge with padding; the answer, as a
+/// server obfuscates it with the challenge, read back.
+#[test]
+fn crypt_ping() {
+    let mut rng = rand::thread_rng();
+    let c = 0x1234_5678;
+    let p = udp::crypt_ping(c, &mut rng);
+    assert!((4..20).contains(&p.len()));
+    assert_eq!(p[..4], c.to_le_bytes());
+    let mut answer = vec![0xE3, 0x97];
+    answer.extend_from_slice(&c.to_le_bytes());
+    answer.extend_from_slice(&500u32.to_le_bytes()); // users
+    answer.extend_from_slice(&9000u32.to_le_bytes()); // files
+    let wire = ed2k_crypto::udp::encrypt_from_server(&answer, c, 0x5A, 0x0102);
+    let s = udp::parse_crypt_ping_answer(&wire, c).unwrap();
+    assert_eq!((s.users, s.files), (500, 9000));
+    assert!(udp::parse_crypt_ping_answer(&wire, c + 1).is_none());
+    // The plain ping's datagrams are left as they are.
+    assert_eq!(udp::deobfuscate(&answer, 0), answer);
+}
+
+/// `OP_SERVER_DESC_RES`, old and new.
+#[test]
+fn server_descriptions() {
+    use ed2k_types::tags::ServerTag;
+    let c = udp::desc_challenge(&mut rand::thread_rng());
+    assert_eq!(c & 0xFFFF, 0xF0FF);
+    assert_eq!(udp::desc_request(c).payload, c.to_le_bytes());
+    // New: <challenge><tag count><tags>.
+    let mut w = Writer::new();
+    w.u8(0xE3).u8(0xA3).u32(c).u32(2);
+    Tag::string(ServerTag::ServerName as u8, "eMule Sunrise")
+        .write_ed2k(&mut w, ed2k_codec::io::StrEncoding::Utf8)
+        .unwrap();
+    Tag::string(ServerTag::Description as u8, "a server")
+        .write_ed2k(&mut w, ed2k_codec::io::StrEncoding::Utf8)
+        .unwrap();
+    let d = udp::parse_desc_answer(&w.into_bytes(), c).unwrap();
+    assert_eq!(
+        (d.name.as_deref(), d.description.as_deref()),
+        (Some("eMule Sunrise"), Some("a server"))
+    );
+    // Old: <name><description>.
+    let mut w = Writer::new();
+    w.u8(0xE3)
+        .u8(0xA3)
+        .u16(3)
+        .bytes(b"old")
+        .u16(4)
+        .bytes(b"desc");
+    let d = udp::parse_desc_answer(&w.into_bytes(), c).unwrap();
+    assert_eq!(
+        (d.name.as_deref(), d.description.as_deref()),
+        (Some("old"), Some("desc"))
+    );
+}

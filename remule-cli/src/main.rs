@@ -93,6 +93,11 @@ enum Command {
         /// Also print each result's ed2k link.
         #[arg(short, long)]
         verbose: bool,
+        /// A global search: also ask these servers (IP:PORT, repeat) over UDP,
+        /// one every 750 ms after the TCP search (obfuscated with --obfuscate,
+        /// where a server supports it).
+        #[arg(long)]
+        global: Vec<SocketAddr>,
     },
     /// Join Kad from a nodes.dat, keep a routing table, run keyword and source searches.
     Kad {
@@ -234,6 +239,10 @@ enum Command {
         /// Seconds to wait for the answer.
         #[arg(long, default_value_t = 5)]
         wait: u64,
+        /// The obfuscated ping (to the TCP port + 12, answered with the
+        /// challenge as the key).
+        #[arg(long)]
+        obfuscated: bool,
     },
 }
 
@@ -328,6 +337,7 @@ fn main() -> ExitCode {
             nick,
             port,
             verbose,
+            global,
         } => run_async(server::search(server::SearchArgs {
             server,
             query,
@@ -341,6 +351,7 @@ fn main() -> ExitCode {
             more,
             limit,
             verbose,
+            global,
         })),
         Command::Kad {
             nodes,
@@ -437,9 +448,11 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Command::Ping { server, wait } => {
-            run_async(server::ping(server, Duration::from_secs(wait)))
-        }
+        Command::Ping {
+            server,
+            wait,
+            obfuscated,
+        } => run_async(server::ping(server, Duration::from_secs(wait), obfuscated)),
         Command::Inspect {
             dir,
             verbose,

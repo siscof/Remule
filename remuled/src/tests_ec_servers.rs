@@ -899,7 +899,14 @@ async fn server_and_node_lists_are_fetched_over_http() {
         .write()
     };
     std::fs::write(d.0.join("server.met"), met(vec![record(alpha, "Alpha")])).unwrap();
-    let served = met(vec![record(alpha, "Alpha Renamed"), record(delta, "Delta")]);
+    // Served gzipped, as list sites often do.
+    let served = {
+        use std::io::Write;
+        let plain = met(vec![record(alpha, "Alpha Renamed"), record(delta, "Delta")]);
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(&plain).unwrap();
+        e.finish().unwrap()
+    };
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let met_url = format!(
         "http://127.0.0.1:{}/server.met",

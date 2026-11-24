@@ -145,7 +145,9 @@ async fn download(
 async fn fetch_server_met(dir: &Path, url: &str) -> Result<usize, String> {
     let (body, tmp) = download(dir, "server.met", url).await?;
     let _ = std::fs::remove_file(&tmp);
-    let downloaded = ServerMet::read(&body).map_err(|e| format!("not a server.met: {e}"))?;
+    let downloaded = ServerMet::read_packed(&body)
+        .ok_or_else(|| "unknown format encountered".to_owned())?
+        .map_err(|e| format!("not a server.met: {e}"))?;
     let path = dir.join("server.met");
     let current = std::fs::read(&path)
         .ok()

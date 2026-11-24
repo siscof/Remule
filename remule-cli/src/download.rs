@@ -141,6 +141,7 @@ pub async fn run(a: DownloadArgs) -> Result<(), String> {
         obfuscate_server: a.obfuscate_server,
         autoconnect: true,
         reconnect: true,
+        dead_server_retries: None,
         kad: a.kad.clone().map(|dir| KadSettings {
             dir,
             nodes: a.kad_nodes.clone(),

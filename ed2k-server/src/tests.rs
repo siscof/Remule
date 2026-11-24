@@ -767,14 +767,15 @@ fn server_descriptions() {
         (d.name.as_deref(), d.description.as_deref()),
         (Some("eMule Sunrise"), Some("a server"))
     );
-    // Old: <name><description>.
+    // Old: two strings, the description first (SetDescription, then
+    // SetListName).
     let mut w = Writer::new();
     w.u8(0xE3)
         .u8(0xA3)
-        .u16(3)
-        .bytes(b"old")
         .u16(4)
-        .bytes(b"desc");
+        .bytes(b"desc")
+        .u16(3)
+        .bytes(b"old");
     let d = udp::parse_desc_answer(&w.into_bytes(), c).unwrap();
     assert_eq!(
         (d.name.as_deref(), d.description.as_deref()),

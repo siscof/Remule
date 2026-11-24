@@ -87,6 +87,9 @@ pub struct KadStart {
     pub allow_lan: bool,
     /// Hand every datagram to the application as an `Event::Wire`.
     pub trace_wire: bool,
+    /// The IP filter: contacts it blocks stay out of the routing table
+    /// (`CRoutingZone::Add`) and lookups. Reloads are seen through the `Arc`.
+    pub ip_filter: Option<std::sync::Arc<remule_core::ip_filter::AddressFilter>>,
 }
 
 /// Load the state, bind the UDP port and start the node.
@@ -145,6 +148,11 @@ fn load(a: &KadStart) -> Result<(Kad, KadPrefs), String> {
     let mut kad = Kad::new(cfg, now);
     kad.load_public_ip(prefs.public_ip);
     kad.routing.filter_lan = !a.allow_lan;
+    if let Some(f) = a.ip_filter.clone() {
+        kad.routing.ip_filter = Some(ed2k_kad::routing::AddressCheck(std::sync::Arc::new(
+            move |ip| f.blocks_client(std::net::Ipv4Addr::from(ip)),
+        )));
+    }
     // Told we are reachable, and listening: not firewalled until the
     // check says so.
     if a.reachable && a.listening {

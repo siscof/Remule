@@ -173,6 +173,7 @@ pub async fn run(a: KadArgs) -> Result<(), String> {
         listening: false,
         allow_lan: a.allow_lan,
         trace_wire: remuled::kad::trace_from_env(),
+        ip_filter: None,
     })
     .await?;
     let mut h = node.handle;

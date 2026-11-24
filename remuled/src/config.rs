@@ -237,12 +237,21 @@ pub fn ip_filter(
             }
         }
     }
-    let lists: Vec<IpFilterFile> = ["ipfilter.dat", "ipfilter_static.dat"]
-        .iter()
-        .filter_map(|n| load_filter_list(&dir.join(n), notes, info))
-        .collect();
-    let refs: Vec<&IpFilterFile> = lists.iter().collect();
     let int = |key: &str| conf.get(key).and_then(ed2k_formats::amule_conf::parse_long);
+    let mut lists: Vec<IpFilterFile> = Vec::new();
+    let own = load_filter_list(&dir.join("ipfilter.dat"), notes, info);
+    // `IPFilterSystem`: with no ranges of its own, the system-wide list.
+    let none_own = own.as_ref().is_none_or(|f| f.range_count() == 0);
+    lists.extend(own);
+    if none_own && int("/eMule/IPFilterSystem").is_some_and(|v| v != 0) {
+        lists.extend(load_filter_list(&system_ip_filter(), notes, info));
+    }
+    lists.extend(load_filter_list(
+        &dir.join("ipfilter_static.dat"),
+        notes,
+        info,
+    ));
+    let refs: Vec<&IpFilterFile> = lists.iter().collect();
     let flag = |key: &str| int(key).is_none_or(|v| v != 0);
     let level = int("/eMule/FilterLevel").map_or(DEFAULT_LEVEL, |v| v.clamp(0, 255) as u32);
     Arc::new(AddressFilter::new(
@@ -251,6 +260,19 @@ pub fn ip_filter(
         flag("/ExternalConnect/IpFilterClients"),
         flag("/ExternalConnect/IpFilterServers"),
     ))
+}
+
+/// The system-wide IP filter (`IPFilterSystem`): `ipfilter.dat` in the
+/// shared data folder, `/usr/share/amule` (next to the program on Windows).
+pub fn system_ip_filter() -> PathBuf {
+    if cfg!(windows) {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("ipfilter.dat")))
+            .unwrap_or_else(|| PathBuf::from("ipfilter.dat"))
+    } else {
+        PathBuf::from("/usr/share/amule/ipfilter.dat")
+    }
 }
 
 /// `CIPFilter::Reload`: the lists and `amule.conf`'s filter settings read

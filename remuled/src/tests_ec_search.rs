@@ -16,7 +16,9 @@ use remule_ec::codes::*;
 use remule_ec::{Client, ConnectOptions, Packet, Tag};
 
 use crate::config;
-use crate::ec_search::{download_status, Kind, Lifecycle, Networks, SearchList};
+use crate::ec_search::{download_status, Kind, Lifecycle, Networks, SearchList, SWEEP_EVERY};
+use ed2k_formats::server_met::ServerInfo;
+use ed2k_types::ed2k::server_udp::{flags, Opcode};
 
 const ED2K: Networks = Networks {
     ed2k_connected: true,
@@ -256,12 +258,138 @@ fn progress_is_told_as_get_search_progress_tells_it() {
     list.server_results(Vec::new());
     assert_eq!(list.lifecycle(), Lifecycle::Running);
     list.kad_done(9);
+    // Still sweeping the other servers (none but the connected one).
+    assert_eq!(list.lifecycle(), Lifecycle::Running);
+    let here = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242);
+    let only = [server_info(here, 0)];
+    assert!(list.sweep(t0, &only, Some(here)).is_none());
+    assert!(list.sweep(t0 + SWEEP_EVERY, &only, Some(here)).is_none());
     assert_eq!(
         (list.lifecycle(), list.progress(t0)),
         (Lifecycle::Finished, 0xfffe)
     );
     let p = list.progress_reply(t0);
     assert_eq!(p.tag(EC_TAG_SEARCH_LIFECYCLE_KIND).unwrap().as_int(), 5);
+}
+
+fn server_info(a: SocketAddrV4, udp_flags: u32) -> ServerInfo {
+    ServerInfo {
+        ip: Some(*a.ip()),
+        port: a.port(),
+        udp_flags,
+        ..Default::default()
+    }
+}
+
+/// A global search, once the connected server has answered or not, asks
+/// the other servers of the list over UDP one every 750 ms
+/// (`OnGlobalSearchTimer`), each with the request it reads, and takes the
+/// answers of those it asked; its progress is the share of the list done.
+#[test]
+fn a_global_search_sweeps_the_other_servers() {
+    let t0 = Instant::now();
+    let here = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 4242);
+    let a = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 4661);
+    let b = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 4661);
+    let c = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 4), 4661);
+    let servers = [
+        server_info(a, 0),
+        server_info(here, 0),
+        server_info(b, flags::EXT_GETFILES | flags::LARGEFILES),
+        server_info(c, flags::EXT_GETFILES),
+    ];
+    let mut list = SearchList::default();
+    let plan = list
+        .plan(Kind::Global, &SearchParams::new("film"), ED2K)
+        .unwrap();
+    assert!(!plan.server_64bit);
+    list.begin(&plan, None, t0);
+    // Waiting for the connected server: no sweep yet, progress 0.
+    assert!(list
+        .sweep(t0 + Duration::from_secs(5), &servers, Some(here))
+        .is_none());
+    assert_eq!(list.progress(t0), 0);
+    // It never answers: after 12 s the timer starts, and its first tick
+    // asks the first server that is not the connected one.
+    let t = t0 + Duration::from_secs(12);
+    list.poll(t);
+    assert_eq!(list.lifecycle(), Lifecycle::Running);
+    assert!(list.sweep(t, &servers, Some(here)).is_none());
+    assert!(list
+        .sweep(t + SWEEP_EVERY / 2, &servers, Some(here))
+        .is_none());
+    let t = t + SWEEP_EVERY;
+    let ask = list.sweep(t, &servers, Some(here)).unwrap();
+    assert_eq!(ask.server.ip, Some(*a.ip()));
+    assert_eq!(ask.packet.opcode, u8::from(Opcode::GlobSearchReq));
+    assert_eq!(list.progress(t), 25);
+    // Its answer is taken; one from a server not asked is not.
+    assert!(list.udp_results(*a.ip(), vec![result(1, "a.avi", 10, 3, 0)]));
+    assert!(!list.udp_results(*b.ip(), vec![result(2, "b.avi", 10, 3, 0)]));
+    assert_eq!(list.results().len(), 1);
+    // The connected one is passed over; the next two get REQ3 and REQ2.
+    assert!(list
+        .sweep(t + SWEEP_EVERY / 2, &servers, Some(here))
+        .is_none());
+    let t = t + SWEEP_EVERY;
+    let ask = list.sweep(t, &servers, Some(here)).unwrap();
+    assert_eq!(ask.server.ip, Some(*b.ip()));
+    assert_eq!(ask.packet.opcode, u8::from(Opcode::GlobSearchReq3));
+    assert_eq!(&ask.packet.payload[..7], &[1, 0, 0, 0, 0x89, 0x0E, 0x01]);
+    assert_eq!(list.progress(t), 75);
+    let t = t + SWEEP_EVERY;
+    let ask = list.sweep(t, &servers, Some(here)).unwrap();
+    assert_eq!(ask.server.ip, Some(*c.ip()));
+    assert_eq!(ask.packet.opcode, u8::from(Opcode::GlobSearchReq2));
+    assert_eq!(list.progress(t), 100);
+    assert_eq!(list.lifecycle(), Lifecycle::Running);
+    // None left: over at the next tick.
+    let t = t + SWEEP_EVERY;
+    assert!(list.sweep(t, &servers, Some(here)).is_none());
+    assert_eq!(list.lifecycle(), Lifecycle::Finished);
+    assert!(list.sweep(t + SWEEP_EVERY, &servers, Some(here)).is_none());
+    // Late answers of servers asked still count, until it is stopped.
+    assert!(list.udp_results(*b.ip(), vec![result(2, "b.avi", 10, 3, 0)]));
+    assert_eq!(list.results().len(), 2);
+    list.stop();
+    assert!(!list.udp_results(*c.ip(), vec![result(3, "c.avi", 10, 3, 0)]));
+
+    // The server answers: the sweep starts then. Disconnected meanwhile:
+    // over at the first tick, nobody asked.
+    let mut list = SearchList::default();
+    list.begin(&plan, None, t0);
+    list.server_results(vec![result(1, "a.avi", 10, 3, 0)]);
+    assert_eq!(list.lifecycle(), Lifecycle::Running);
+    assert!(list.sweep(t0, &servers, None).is_none());
+    assert!(list.sweep(t0 + SWEEP_EVERY, &servers, None).is_none());
+    assert_eq!(list.lifecycle(), Lifecycle::Finished);
+    assert!(!list.udp_results(*a.ip(), vec![result(2, "b.avi", 10, 3, 0)]));
+
+    // A local search asks nobody else.
+    let mut list = SearchList::default();
+    local(&mut list, t0);
+    list.server_results(Vec::new());
+    assert_eq!(list.lifecycle(), Lifecycle::Finished);
+    assert!(list.sweep(t0, &servers, Some(here)).is_none());
+    assert!(list.sweep(t0 + SWEEP_EVERY, &servers, Some(here)).is_none());
+
+    // A search with a 64-bit size passes over a server without large
+    // files (one tick spent on it), as OnGlobalSearchTimer does.
+    let mut list = SearchList::default();
+    let mut big = SearchParams::new("film");
+    big.min_size = 5_000_000_000;
+    let plan = list.plan(Kind::Global, &big, ED2K).unwrap();
+    assert!(plan.server_64bit);
+    list.begin(&plan, None, t0);
+    list.server_results(Vec::new());
+    assert!(list.sweep(t0, &servers, Some(here)).is_none());
+    let t = t0 + SWEEP_EVERY;
+    assert!(
+        list.sweep(t, &servers, Some(here)).is_none(),
+        "a: no large files"
+    );
+    let ask = list.sweep(t + SWEEP_EVERY, &servers, Some(here)).unwrap();
+    assert_eq!(ask.server.ip, Some(*b.ip()));
 }
 
 #[test]
@@ -423,10 +551,11 @@ async fn searching_server(listener: tokio::net::TcpListener) {
 
 const SECRET: &str = "5ebe2294ecd0e0f08eab7690d2a6ee69"; // md5("secret")
 
-/// A daemon logged into a scripted server, with EC on: its config
-/// directory, EC port and task.
+/// A daemon logged into a scripted server, with EC on (and `others` after
+/// it in its server list): its config directory, EC port and task.
 async fn searching_daemon(
     name: &str,
+    others: Vec<ServerRecord>,
 ) -> (
     TempDir,
     u16,
@@ -446,13 +575,15 @@ async fn searching_daemon(
         ),
     )
     .unwrap();
+    let mut servers = vec![ServerRecord {
+        ip: Ipv4Addr::LOCALHOST,
+        port: server_port,
+        tags: Vec::new(),
+    }];
+    servers.extend(others);
     let met = ServerMet {
         version: 0x0E,
-        servers: vec![ServerRecord {
-            ip: Ipv4Addr::LOCALHOST,
-            port: server_port,
-            tags: Vec::new(),
-        }],
+        servers,
         legacy_counts: false,
     };
     std::fs::write(d.0.join("server.met"), met.write()).unwrap();
@@ -474,6 +605,105 @@ async fn searching_daemon(
     }
 
     (d, ec_port, daemon)
+}
+
+/// A server reached only over UDP: each `OP_GLOBSEARCHREQ` answered with
+/// two results packed in one datagram, one of them a file the connected
+/// server also has. The opcodes asked are told on `asked`.
+async fn udp_only_server(sock: tokio::net::UdpSocket, asked: std::sync::mpsc::Sender<u8>) {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+            return;
+        };
+        if n < 2 || buf[0] != 0xE3 {
+            continue;
+        }
+        let _ = asked.send(buf[1]);
+        let mut out = Vec::new();
+        for (hash, name, size, sources) in [
+            (1, "ubuntu-24.04.iso", 6_000_000, 5),
+            (3, "ubuntu-server.iso", 3_000_000, 9),
+        ] {
+            let mut w = ed2k_codec::Writer::new();
+            result_bytes(&mut w, hash, name, size, sources);
+            // OP_GLOBSEARCHRES
+            out.extend_from_slice(&[0xE3, 0x99]);
+            out.extend_from_slice(&w.into_bytes());
+        }
+        let _ = sock.send_to(&out, from).await;
+    }
+}
+
+/// A global search over EC: the connected server answers over TCP, then
+/// the other server of the list is asked over UDP and its results join
+/// the same search; it is over once the list has been swept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_global_search_asks_the_other_servers_over_udp() {
+    // The other server: its UDP port is its TCP port + 4.
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_port = sock.local_addr().unwrap().port();
+    let (asked_tx, asked) = std::sync::mpsc::channel();
+    tokio::spawn(udp_only_server(sock, asked_tx));
+    let other = ServerRecord {
+        ip: Ipv4Addr::LOCALHOST,
+        port: udp_port - 4,
+        tags: Vec::new(),
+    };
+    let (_d, ec_port, daemon) = searching_daemon("global", vec![other]).await;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
+        let mut ask = |p: Packet| c.request(&p).unwrap();
+        for _ in 0..100 {
+            let r = ask(Packet::new(EC_OP_GET_CONNSTATE).with_detail(EC_DETAIL_CMD));
+            if r.tags[0].as_int() & 1 == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let r = ask(Packet::new(EC_OP_SEARCH_START).with(
+            Tag::int(EC_TAG_SEARCH_TYPE, EC_SEARCH_GLOBAL.into())
+                .with(Tag::string(EC_TAG_SEARCH_NAME, "ubuntu"))
+                .with(Tag::string(EC_TAG_SEARCH_FILE_TYPE, "")),
+        ));
+        assert_eq!(r.opcode, EC_OP_STRINGS);
+        let mut p = None;
+        for _ in 0..100 {
+            let r = ask(Packet::new(EC_OP_SEARCH_PROGRESS));
+            if r.tag(EC_TAG_SEARCH_LIFECYCLE_STATE).map(Tag::as_int)
+                == Some(Lifecycle::Finished as u64)
+            {
+                p = Some(r);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let p = p.expect("the global search never finished");
+        // Asked once, with the plain request (no UDP flags known).
+        assert_eq!(asked.try_recv(), Ok(0x98));
+        assert!(asked.try_recv().is_err());
+        // The connected server's two, and the UDP server's new one; the
+        // file both have adds up its sources.
+        assert_eq!(p.tag(EC_TAG_SEARCH_RESULT_COUNT).unwrap().as_int(), 3);
+        let r = ask(Packet::new(EC_OP_SEARCH_RESULTS).with_detail(EC_DETAIL_FULL));
+        let by = |h: u8| {
+            r.tags
+                .iter()
+                .find(|t| t.child(EC_TAG_PARTFILE_HASH).unwrap().as_hash() == Some([h; 16]))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by(3).child_str(EC_TAG_PARTFILE_NAME), "ubuntu-server.iso");
+        assert_eq!(by(1).child_int(EC_TAG_PARTFILE_SOURCE_COUNT), 125);
+        assert_eq!(ask(Packet::new(EC_OP_SHUTDOWN)).opcode, EC_OP_NOOP);
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
 }
 
 /// A daemon logged into a scripted server: an EC client searches it,
@@ -638,7 +868,7 @@ async fn an_ec_client_searches_and_downloads_a_result() {
 /// closed, and an ID no search has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_multi_search_client_runs_searches_by_id() {
-    let (_d, ec_port, daemon) = searching_daemon("multi").await;
+    let (_d, ec_port, daemon) = searching_daemon("multi", Vec::new()).await;
     tokio::task::spawn_blocking(move || {
         let mut opts = ConnectOptions::new("127.0.0.1", ec_port, SECRET);
         opts.capabilities = vec![EC_TAG_CAN_MULTI_SEARCH, EC_TAG_CAN_SEARCH_PROGRESS_UNION];
@@ -817,7 +1047,7 @@ async fn a_refused_legacy_search_leaves_the_others_running() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remule_gui_s_requests_against_a_running_daemon() {
     use remule_ec::model::{PartFileCmd, SearchKind, SearchParams};
-    let (d, ec_port, daemon) = searching_daemon("gui").await;
+    let (d, ec_port, daemon) = searching_daemon("gui", Vec::new()).await;
     let incoming = d.0.join("Incoming");
     tokio::task::spawn_blocking(move || {
         // As the GUI connects: its own name, nothing more advertised.

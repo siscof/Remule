@@ -12,13 +12,20 @@
 //! the server and Kad parts on the client's connections; the client feeds
 //! it the server's answer and Kad's results as they come.
 //!
-//! Not yet: the global sweep over other servers by UDP (a global search
-//! asks the connected server, as a local one does), filtering results by
-//! file type, stopping a running Kad lookup (its later results are ignored),
+//! A global (or all) search, once the connected server has answered (or
+//! not, within 12 s), sweeps the other servers of the list over UDP, one
+//! every 750 ms (`OnGlobalSearchTimer`): [`Searches::sweep`] says which to
+//! ask with what, the client sends it, and the answers of servers asked
+//! come back through [`Searches::udp_results`].
+//!
+//! Not yet: filtering results by file type, stopping a running Kad lookup (its later results are ignored),
 //! re-asking Kad for more results, browsing a peer's files.
 
+use std::collections::{HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
+
+use ed2k_formats::server_met::ServerInfo;
 
 use ed2k_kad::driver::KadHandle;
 use ed2k_kad::search::KeywordResult;
@@ -37,6 +44,8 @@ use crate::ec::Control;
 
 /// `SERVER_ANSWER_TIMEOUT_MS`: how long the server may take to answer.
 pub const SERVER_ANSWER_TIMEOUT: Duration = Duration::from_secs(12);
+/// The global search timer: one more server asked this often.
+pub const SWEEP_EVERY: Duration = Duration::from_millis(750);
 /// `SEARCHKEYWORD_LIFETIME`: what the Kad progress ramp is measured against.
 pub const KEYWORD_LIFETIME: Duration = Duration::from_secs(45);
 /// `SEARCH_MAX_MIN_BITRATE_KBPS`, `SEARCH_MAX_MIN_DURATION_SECONDS`.
@@ -203,6 +212,8 @@ pub struct Plan {
     pub kind: Kind,
     /// The search request's payload, for the connected server.
     pub server: Option<Vec<u8>>,
+    /// It holds a 64-bit size (`m_64bitSearchPacket`).
+    pub server_64bit: bool,
     /// The Kad keyword search to start.
     pub kad: Option<SearchParams>,
 }
@@ -224,6 +235,32 @@ pub struct SearchList {
     kad_id: Option<u32>,
     kad_finished: bool,
     started: Option<Instant>,
+    /// The request kept for the other servers (`m_searchPacket`), and how
+    /// far the sweep over them got.
+    sweep: Option<Sweep>,
+    /// The servers asked over UDP (`m_askedServers`): only their answers
+    /// are taken.
+    asked: HashSet<Ipv4Addr>,
+}
+
+/// The UDP sweep of a global search.
+#[derive(Debug, Default)]
+struct Sweep {
+    payload: Vec<u8>,
+    uses_64bit: bool,
+    /// When the timer fires next; not set until the first look.
+    next: Option<Instant>,
+    /// The servers left (`m_serverQueue`), taken from the list at the
+    /// first tick; and how many there were.
+    queue: Option<VecDeque<ServerInfo>>,
+    total: usize,
+}
+
+/// One server to ask over UDP, and with what.
+#[derive(Debug, Clone)]
+pub struct GlobalAsk {
+    pub server: ServerInfo,
+    pub packet: ed2k_codec::Packet,
 }
 
 /// `CreateSearchData`'s parser errors, one per line.
@@ -248,6 +285,8 @@ impl SearchList {
         if self.ed2k_running {
             self.finish_ed2k();
         }
+        // The new search asks the servers now.
+        self.asked.clear();
     }
 
     /// `GetSearchBarStatusById`: a finished search 0xfffe with a Kad part,
@@ -306,14 +345,11 @@ impl SearchList {
                 return Err("No keyword for Kad search - aborting".into());
             }
         }
-        let server = if kind == Kind::Kad {
-            None
+        let (server, server_64bit) = if kind == Kind::Kad {
+            (None, false)
         } else {
-            Some(
-                encode_search(params, net.large_files)
-                    .map_err(parser_error)?
-                    .0,
-            )
+            let (p, b) = encode_search(params, net.large_files).map_err(parser_error)?;
+            (Some(p), b)
         };
         if start_kad {
             encode_kad_search(params).map_err(parser_error)?;
@@ -321,6 +357,7 @@ impl SearchList {
         Ok(Plan {
             kind,
             server: server.filter(|_| net.ed2k_connected),
+            server_64bit,
             kad: start_kad.then(|| params.clone()),
         })
     }
@@ -341,6 +378,16 @@ impl SearchList {
             self.ed2k_running = plan.server.is_some();
             self.ed2k_finished = !self.ed2k_running;
             self.answer_due = self.ed2k_running.then(|| now + SERVER_ANSWER_TIMEOUT);
+            // StartNewSearch: m_askedServers.clear().
+            self.asked.clear();
+            self.sweep = match (&plan.server, plan.kind) {
+                (Some(p), Kind::Global | Kind::All) => Some(Sweep {
+                    payload: p.clone(),
+                    uses_64bit: plan.server_64bit,
+                    ..Default::default()
+                }),
+                _ => None,
+            };
         }
         if kad_id.is_some() {
             self.kad_id = kad_id;
@@ -384,12 +431,96 @@ impl SearchList {
         parent.update_parent();
     }
 
-    /// The server's `OP_SEARCHRESULT`, then `LocalSearchEnd`. Without the
-    /// UDP sweep, a global search ends with it too.
+    /// The server's `OP_SEARCHRESULT`, then `LocalSearchEnd`: a local
+    /// search ends, a global one goes on to the other servers.
     pub fn server_results(&mut self, results: Vec<SearchResult>) {
         if !self.ed2k_running {
             return;
         }
+        self.add_server_results(results);
+        if self.answer_due.take().is_some() {
+            self.local_end();
+        }
+    }
+
+    /// `ProcessUDPSearchAnswer`: a server asked over UDP answered. False
+    /// when it is not this search's to take.
+    pub fn udp_results(&mut self, from: Ipv4Addr, results: Vec<SearchResult>) -> bool {
+        // CanFileServerAnswer, and WasServerAsked.
+        if !self.current || self.kind == Kind::Kad || !self.asked.contains(&from) {
+            return false;
+        }
+        self.add_server_results(results);
+        true
+    }
+
+    /// `LocalSearchEnd`.
+    fn local_end(&mut self) {
+        if self.sweep.is_some() {
+            // The timer starts: its first tick 750 ms after it is next looked at.
+            self.answer_due = None;
+        } else {
+            self.finish_ed2k();
+        }
+    }
+
+    /// `OnGlobalSearchTimer`: when it is time, the next of `servers` that
+    /// is not the connected one is asked, with the request it can read (or
+    /// skipped when it cannot read a 64-bit size); none left (or no
+    /// connected server), the search is over.
+    pub fn sweep(
+        &mut self,
+        now: Instant,
+        servers: &[ServerInfo],
+        connected: Option<SocketAddrV4>,
+    ) -> Option<GlobalAsk> {
+        if !self.ed2k_running || self.answer_due.is_some() {
+            return None;
+        }
+        let sw = self.sweep.as_mut()?;
+        match sw.next {
+            None => {
+                sw.next = Some(now + SWEEP_EVERY);
+                return None;
+            }
+            Some(t) if now < t => return None,
+            Some(_) => sw.next = Some(now + SWEEP_EVERY),
+        }
+        if sw.queue.is_none() {
+            sw.queue = Some(servers.iter().cloned().collect());
+            sw.total = servers.len();
+        }
+        let queue = sw.queue.as_mut()?;
+        if let Some(local) = connected {
+            while let Some(server) = queue.pop_front() {
+                let Some(ip) = server.ip else { continue };
+                if ip == *local.ip() && server.port == local.port() {
+                    // Asked already, over TCP.
+                    continue;
+                }
+                let Some(packet) =
+                    ed2k_server::udp::global_search(&sw.payload, sw.uses_64bit, server.udp_flags)
+                else {
+                    debug!(
+                        "Skipped UDP search on server {ip}:{}: No large file support",
+                        server.port
+                    );
+                    return None;
+                };
+                debug!(
+                    "Sending {:#04x} to server {ip}:{}",
+                    packet.opcode, server.port
+                );
+                self.asked.insert(ip);
+                return Some(GlobalAsk { server, packet });
+            }
+        }
+        // FinalizeGlobalSearch.
+        self.finish_ed2k();
+        None
+    }
+
+    fn add_server_results(&mut self, results: Vec<SearchResult>) {
         for r in results {
             let ecid = self.ecid();
             let ip = Ipv4Addr::from(r.client_id.to_le_bytes());
@@ -416,9 +547,6 @@ impl SearchList {
                 children: Vec::new(),
                 parent: None,
             });
-        }
-        if self.answer_due.take().is_some() {
-            self.finish_ed2k();
         }
     }
 
@@ -458,6 +586,7 @@ impl SearchList {
     /// `FinalizeLocalSearch` / `FinalizeGlobalSearch`.
     fn finish_ed2k(&mut self) {
         self.answer_due = None;
+        self.sweep = None;
         self.ed2k_running = false;
         self.ed2k_finished = true;
     }
@@ -465,12 +594,15 @@ impl SearchList {
     /// The server's answer is overdue.
     pub fn poll(&mut self, now: Instant) {
         if self.ed2k_running && self.answer_due.is_some_and(|t| now >= t) {
+            // As if the answer had been empty: Lugdunum servers send
+            // nothing when nothing matches.
             if self.kind == Kind::Local {
                 info!("Search timed out: the server did not answer.");
             } else {
                 debug!("The server did not answer the search, asking the other servers");
             }
-            self.finish_ed2k();
+            self.answer_due = None;
+            self.local_end();
         }
     }
 
@@ -501,8 +633,7 @@ impl SearchList {
                 if !self.ed2k_running && !kad {
                     return 0xfffe;
                 }
-                // The sweep never runs, so a running eD2k part is at 0.
-                let sweep = if self.ed2k_running { 0 } else { 100 };
+                let sweep = if self.ed2k_running { self.swept() } else { 100 };
                 let ramp = if kad { self.ramp(now).min(99) } else { 100 };
                 sweep.min(ramp)
             }
@@ -510,7 +641,19 @@ impl SearchList {
             Kind::Kad => 0,
             _ if !self.ed2k_running => 0,
             Kind::Local => 0xffff,
-            Kind::Global => 0,
+            Kind::Global => self.swept(),
+        }
+    }
+
+    /// The sweep's share done: 0 until it starts.
+    fn swept(&self) -> u32 {
+        match &self.sweep {
+            Some(Sweep {
+                queue: Some(q),
+                total,
+                ..
+            }) if *total > 0 => (100 - q.len() * 100 / total) as u32,
+            _ => 0,
         }
     }
 
@@ -883,6 +1026,27 @@ impl Searches {
         if let Some(l) = self.all_mut().find(|l| l.ed2k_running()) {
             l.server_results(results);
         }
+    }
+
+    /// Results from a server asked over UDP, for the search that asked it.
+    pub fn udp_results(&mut self, from: Ipv4Addr, results: Vec<SearchResult>) {
+        for l in self.all_mut() {
+            if l.udp_results(from, results.clone()) {
+                return;
+            }
+        }
+        debug!("Unrequested OP_GLOBSEARCHRES packet from {from}");
+    }
+
+    /// The global search timer of the search sweeping the servers.
+    pub fn sweep(
+        &mut self,
+        now: Instant,
+        servers: &[ServerInfo],
+        connected: Option<SocketAddrV4>,
+    ) -> Option<GlobalAsk> {
+        self.all_mut()
+            .find_map(|l| l.sweep(now, servers, connected))
     }
 
     pub fn kad_result(&mut self, search: u32, k: KeywordResult) {

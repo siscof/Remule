@@ -735,6 +735,12 @@ pub async fn run(
         }
     }
     connector.set_static_only(c.static_only);
+    // Dynamic-IP servers: their names looked up now and every half hour.
+    let (dns_tx, mut dns_rx) = mpsc::unbounded_channel();
+    for (host, port) in server_list.dyn_servers() {
+        resolve_server(host, port, dns_tx.clone());
+    }
+    let mut next_dns = Instant::now() + DNS_SOLVE_TIME;
     let mut attempting: Option<Attempting> = None;
     // Whether others can connect to us: found out as we run.
     let mut reach = Reachability {
@@ -1032,6 +1038,9 @@ pub async fn run(
                             server_list.mark_changed();
                             server_list.save_if_changed(&c.config);
                             server_met_loaded = true;
+                            for (host, port) in server_list.unresolved() {
+                                resolve_server(host, port, dns_tx.clone());
+                            }
                             info!("Finished downloading the server list from {url}");
                         }
                         Err(e) => warn!("Failed to download server.met from {url}: {e}"),
@@ -1082,6 +1091,30 @@ pub async fn run(
                     }
                     Some(Err(e)) => warn!("Failed to download the nodes list: {e}"),
                     None => {}
+                }
+            }
+            // A dynamic-IP server's name looked up: the server is tried at
+            // that address, unless the address is unusable or filtered.
+            d = dns_rx.recv() => {
+                if let Some((host, port, ip)) = d {
+                    match ip {
+                        None => warn!("Cannot resolve the host name of server {host}:{port}"),
+                        Some(ip) if !remule_core::download_queue::is_good_ip(ip, !c.allow_lan)
+                            || c.ip_filter.as_ref().is_some_and(|f| f.blocks_server(ip)) => {
+                            warn!("Server {host}:{port}: its IP {ip} is filtered or invalid");
+                        }
+                        Some(ip) => {
+                            if let Some(old) = server_list.resolved(&host, port, ip) {
+                                let new = SocketAddrV4::new(ip, port);
+                                debug!("Server {host}:{port} is at {ip}");
+                                match old {
+                                    Some(o) => connector.replace(SocketAddr::V4(o), SocketAddr::V4(new)),
+                                    None => connector.add(SocketAddr::V4(new)),
+                                }
+                                connector.set_static(SocketAddr::V4(new), server_list.is_static(new));
+                            }
+                        }
+                    }
                 }
             }
             // A global search asks one more server, now and then.
@@ -1433,6 +1466,7 @@ pub async fn run(
                                         Err(e) => warn!("Kad: {e}"),
                                     },
                                 },
+                                Effect::Resolve(host, port) => resolve_server(host, port, dns_tx.clone()),
                                 Effect::UpdateServerMet(urls) => {
                                     server_met_busy = true;
                                     server_met_loaded = false;
@@ -1628,6 +1662,12 @@ pub async fn run(
                 }
                 // Every server failed a while ago: a new sweep.
                 searches.poll(now);
+                if now >= next_dns {
+                    next_dns = now + DNS_SOLVE_TIME;
+                    for (host, port) in server_list.dyn_servers() {
+                        resolve_server(host, port, dns_tx.clone());
+                    }
+                }
                 // Downloads added or resumed are asked about first
                 // (`RequestGlobalSources`).
                 let connected_addr = match server_since {
@@ -1919,6 +1959,31 @@ async fn restart_kad(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     started
+}
+
+/// `DNS_SOLVE_TIME`: dynamic-IP servers' names are looked up again this
+/// often.
+pub const DNS_SOLVE_TIME: Duration = Duration::from_secs(30 * 60);
+
+/// Look up a dynamic-IP server's host name (`CAsyncDNS`); the answer (its
+/// first IPv4 address, or none) comes back on `tx`.
+fn resolve_server(
+    host: String,
+    port: u16,
+    tx: mpsc::UnboundedSender<(String, u16, Option<std::net::Ipv4Addr>)>,
+) {
+    tokio::spawn(async move {
+        let ip = match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(addrs) => addrs
+                .filter_map(|a| match a {
+                    SocketAddr::V4(v) => Some(*v.ip()),
+                    SocketAddr::V6(_) => None,
+                })
+                .next(),
+            Err(_) => None,
+        };
+        let _ = tx.send((host, port, ip));
+    });
 }
 
 /// A server list fetched for `EC_OP_SERVER_UPDATE_FROM_URL`.

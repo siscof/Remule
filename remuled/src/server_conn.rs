@@ -119,6 +119,17 @@ impl Connector {
         }
     }
 
+    /// A dynamic-IP server's new address, in the old one's place.
+    pub fn replace(&mut self, old: SocketAddr, new: SocketAddr) {
+        match self.servers.iter().position(|a| *a == old) {
+            Some(i) => self.servers[i] = new,
+            None => self.add(new),
+        }
+        if self.statics.remove(&old) {
+            self.statics.insert(new);
+        }
+    }
+
     /// A server taken out of the list; a sweep under way goes on with the
     /// one after it (`RemoveServer` moving `m_serverpos` on).
     pub fn remove(&mut self, addr: SocketAddr) {

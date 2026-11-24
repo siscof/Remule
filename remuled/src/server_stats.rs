@@ -678,7 +678,8 @@ mod tests {
         let mut rng = rand::thread_rng();
         let (mut l, a, _) = list();
         l.apply_statics(&[crate::ec_servers::StaticServer {
-            addr: a,
+            host: a.ip().to_string(),
+            port: a.port(),
             preference: 0,
             name: "static".into(),
         }]);

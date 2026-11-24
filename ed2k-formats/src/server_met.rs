@@ -112,6 +112,17 @@ fn read_records(
 
 impl ServerMet {
     /// Parse a whole file (`LoadServerMet` + `ReadServerMetRecords`).
+    /// `LoadServerMet` on a downloaded list: unpacked first when it is a
+    /// zip, gzip or tar (`UnpackArchive` for `server.met`), then read; `None`
+    /// when what is left is not a `.met` ("unknown format encountered").
+    pub fn read_packed(bytes: &[u8]) -> Option<Result<ServerMet, Error>> {
+        use crate::archive::{unpack, FileType};
+        match unpack(bytes, &["server.met"]) {
+            Some((plain, FileType::Met)) => Some(ServerMet::read(&plain)),
+            _ => None,
+        }
+    }
+
     pub fn read(bytes: &[u8]) -> Result<ServerMet, Error> {
         let mut r = Reader::new(bytes);
         let version = r.u8().map_err(|e| Error {

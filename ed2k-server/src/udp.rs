@@ -226,7 +226,8 @@ pub struct ServerDescription {
     pub version: Option<String>,
 }
 
-/// `OP_SERVER_DESC_RES` (decrypted), old (`<name><description>`) or new
+/// `OP_SERVER_DESC_RES` (decrypted), old (two strings, read as aMule and
+/// eMule read them: the description, then the name) or new
 /// (`<challenge 4><tags>`, the challenge ours).
 pub fn parse_desc_answer(datagram: &[u8], challenge: u32) -> Option<ServerDescription> {
     use ed2k_codec::Tag;
@@ -267,8 +268,8 @@ pub fn parse_desc_answer(datagram: &[u8], challenge: u32) -> Option<ServerDescri
             let n = r.u16().ok()? as usize;
             Some(String::from_utf8_lossy(r.bytes(n).ok()?).into_owned())
         };
-        d.name = s();
         d.description = s();
+        d.name = s();
     }
     Some(d)
 }

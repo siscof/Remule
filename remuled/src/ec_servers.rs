@@ -120,7 +120,26 @@ impl ServerList {
         &self.entries
     }
 
-    /// Whether servers were added or removed.
+    /// For what is learnt of the servers as we run (pings); call
+    /// [`ServerList::mark_changed`] after.
+    pub fn entries_mut(&mut self) -> &mut [ServerInfo] {
+        &mut self.entries
+    }
+
+    /// `server.met` is to be written again.
+    pub fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    /// `RemoveServer`.
+    pub fn remove(&mut self, a: SocketAddrV4) {
+        self.entries
+            .retain(|s| !(s.ip == Some(*a.ip()) && s.port == a.port()));
+        self.changed = true;
+    }
+
+    /// Whether servers were added or removed, or what is known of them
+    /// changed (pings).
     pub fn changed(&self) -> bool {
         self.changed
     }
@@ -451,10 +470,7 @@ fn server_cmd(req: &Packet, ctx: &mut Ctx<'_>, out: &mut Vec<Effect>) -> Packet 
                 "You are connected to the server you are trying to delete. please disconnect first.",
             ),
             Some(a) => {
-                ctx.list
-                    .entries
-                    .retain(|s| !(s.ip == Some(*a.ip()) && s.port == a.port()));
-                ctx.list.changed = true;
+                ctx.list.remove(a);
                 ctx.connector.remove(SocketAddr::V4(a));
                 Packet::new(EC_OP_NOOP)
             }

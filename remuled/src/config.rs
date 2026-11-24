@@ -369,6 +369,17 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         obfuscate_server: false,
         autoconnect: prefs.autoconnect,
         reconnect: prefs.reconnect,
+        // RemoveDeadServer (on by default), DeadServerRetry (3).
+        dead_server_retries: (conf
+            .get("/eMule/RemoveDeadServer")
+            .and_then(ed2k_formats::amule_conf::parse_long)
+            .unwrap_or(1)
+            != 0)
+            .then(|| {
+                conf.get("/eMule/DeadServerRetry")
+                    .and_then(ed2k_formats::amule_conf::parse_long)
+                    .map_or(3, |n| n.clamp(0, i64::from(u32::MAX)) as u32)
+            }),
         kad,
         tcp_port: prefs.tcp_port,
         udp_port: if udp_disabled { 0 } else { prefs.udp_port },

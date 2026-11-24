@@ -139,6 +139,14 @@ impl ServerUdp {
         let _ = self.socket.send_to(&bytes, to).await;
     }
 
+    /// Send a raw datagram (the obfuscated ping).
+    pub async fn send_raw(&self, to: SocketAddrV4, bytes: &[u8]) {
+        if self.trace {
+            eprintln!("server udp -> {to} crypt ping");
+        }
+        let _ = self.socket.send_to(bytes, to).await;
+    }
+
     pub fn trace(&self) -> bool {
         self.trace
     }

@@ -96,6 +96,9 @@ pub struct ClientConfig {
     /// Log in again when the server connection is lost, and try the list
     /// again 30 s after every server failed (aMule's `Reconnect`).
     pub reconnect: bool,
+    /// `DeadServerRetry` when `RemoveDeadServer` is on: servers whose status
+    /// pings failed this often are dropped.
+    pub dead_server_retries: Option<u32>,
     pub kad: Option<KadSettings>,
     pub tcp_port: u16,
     pub udp_port: u16,
@@ -601,6 +604,26 @@ fn new_download(
     })
 }
 
+/// What the status pings want done: sent, or a dead server dropped.
+async fn stats_out(
+    u: &crate::server_udp::ServerUdp,
+    o: crate::server_stats::Out,
+    list: &mut ServerList,
+    connector: &mut Connector,
+    public_ip: Option<std::net::Ipv4Addr>,
+) {
+    use crate::server_stats::Out;
+    match o {
+        Out::Raw { to, bytes } => u.send_raw(to, &bytes).await,
+        Out::Packet { server, packet } => u.send(&packet, &server, public_ip).await,
+        Out::Remove(a) => {
+            info!("Removed dead server {a}");
+            list.remove(a);
+            connector.remove(SocketAddr::V4(a));
+        }
+    }
+}
+
 fn unix_now() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -744,6 +767,8 @@ pub async fn run(
                 None
             }
         };
+    // The servers' status pings.
+    let mut server_stats = crate::server_stats::ServerStats::default();
     // The global search timer's resolution.
     let mut sweep_tick = tokio::time::interval(Duration::from_millis(250));
     sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -924,6 +949,12 @@ pub async fn run(
                 match r {
                     Ok((s, li)) => {
                         connector.logged_in();
+                        // ConnectionEstablished: its failures are forgotten.
+                        if let Some(SocketAddr::V4(a)) = connector.connected().map(|c| c.addr) {
+                            if let Some(e) = server_list.entries_mut().iter_mut().find(|e| e.ip == Some(*a.ip()) && e.port == a.port()) {
+                                e.failed = 0;
+                            }
+                        }
                         info!(
                             "[{:>5}s] server {addr}: logged in, {} {}",
                             t.as_secs(),
@@ -973,20 +1004,31 @@ pub async fn run(
                     }
                 }
             }
-            // Server UDP in: global search answers.
+            // Server UDP in: status and description answers, global search
+            // answers.
             d = server_udp_rx.recv() => {
                 if let Some((from, datagram)) = d {
-                    let plain = crate::server_udp::decode(&datagram, from, server_list.entries(), public_ip);
-                    let trace = server_udp.as_ref().is_some_and(|u| u.trace());
-                    if trace {
-                        eprintln!(
-                            "server udp <- {from} {:#04x} {}",
-                            plain.get(1).copied().unwrap_or(0),
-                            if plain != datagram { "obfuscated" } else { "plain" }
-                        );
+                    if let Some(u) = &server_udp {
+                        if u.trace() {
+                            let plain = crate::server_udp::decode(&datagram, from, server_list.entries(), public_ip);
+                            eprintln!(
+                                "server udp <- {from} {:#04x} {}",
+                                plain.get(1).copied().unwrap_or(0),
+                                if plain != datagram { "obfuscated" } else { "plain" }
+                            );
+                        }
                     }
-                    if let Some(results) = ed2k_server::udp::parse_global_search_results(&plain) {
+                    let inc = server_stats.datagram(
+                        from, &datagram, Instant::now(), u64::from(unix_now()), &mut server_list, public_ip,
+                        &mut rand::thread_rng(),
+                    );
+                    if let Some(results) = inc.results {
                         searches.udp_results(*from.ip(), results);
+                    }
+                    if let Some(u) = &server_udp {
+                        for o in inc.out {
+                            stats_out(u, o, &mut server_list, &mut connector, public_ip).await;
+                        }
                     }
                 }
             }
@@ -1468,6 +1510,16 @@ pub async fn run(
                 }
                 // Every server failed a while ago: a new sweep.
                 searches.poll(now);
+                // One server's status ping (`ServerStats`), while logged in.
+                if let (Some(u), Some(_)) = (&server_udp, &server) {
+                    let o = server_stats.tick(
+                        now, u64::from(unix_now()), &mut server_list, public_ip, c.dead_server_retries,
+                        &mut rand::thread_rng(),
+                    );
+                    if let Some(o) = o {
+                        stats_out(u, o, &mut server_list, &mut connector, public_ip).await;
+                    }
+                }
                 if let Some(next) = connector.poll(now) {
                     follow(next, &c, &mut attempting, t);
                 }

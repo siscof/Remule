@@ -95,3 +95,180 @@ pub fn parse_ping_answer(datagram: &[u8]) -> Option<UdpStatus> {
     }
     parse_status(&p.payload).ok()
 }
+
+// ------------------------------------------------- obfuscated ping (port + 12)
+
+/// Where a server takes the obfuscated ping, from its TCP port.
+pub const CRYPT_PING_PORT_OFFSET: u16 = 12;
+
+/// The obfuscated ping (`CServerList::ServerStats`): a raw datagram of the
+/// challenge (never 0) and up to 15 random bytes, to the server's port + 12.
+/// Its answer comes obfuscated with the challenge as the key
+/// ([`parse_crypt_ping_answer`]).
+pub fn crypt_ping<R: rand::RngCore + ?Sized>(challenge: u32, rng: &mut R) -> Vec<u8> {
+    let len = 4 + (rng.gen::<u8>() % 16) as usize;
+    let mut b = challenge.to_le_bytes().to_vec();
+    b.extend((4..len).map(|_| rng.gen::<u8>()));
+    b
+}
+
+/// The answer to an obfuscated ping: decrypted with the challenge, it must
+/// be a status answer repeating it.
+pub fn parse_crypt_ping_answer(datagram: &[u8], challenge: u32) -> Option<UdpStatus> {
+    let plain = ed2k_crypto::udp::decrypt_server(datagram, challenge)?;
+    parse_ping_answer(&plain).filter(|s| s.challenge == challenge)
+}
+
+/// Obfuscate a datagram for a server that supports it
+/// (`SRV_UDPFLG_UDPOBFUSCATION`, with the key its status gave): sent to its
+/// UDP obfuscation port.
+pub fn obfuscate<R: rand::RngCore + ?Sized>(
+    datagram: &[u8],
+    server_key: u32,
+    rng: &mut R,
+) -> Vec<u8> {
+    ed2k_crypto::udp::encrypt_server(datagram, server_key, rng)
+}
+
+/// A datagram from a server: decrypted with its key when it is obfuscated,
+/// as it is.
+pub fn deobfuscate(datagram: &[u8], server_key: u32) -> Vec<u8> {
+    if server_key != 0 {
+        if let Some(p) = ed2k_crypto::udp::decrypt_server(datagram, server_key) {
+            return p;
+        }
+    }
+    datagram.to_vec()
+}
+
+// ---------------------------------------------------------- global search
+
+/// The global search request for one server (`OnGlobalSearchTimer`), made
+/// from a search request's payload ([`crate::search::encode_search`]):
+/// `OP_GLOBSEARCHREQ3` (with the large files capability) to a server that
+/// takes large files and extended requests, `OP_GLOBSEARCHREQ2` to one with
+/// extended requests, else `OP_GLOBSEARCHREQ`. `None` when the search holds
+/// a 64-bit size and the server cannot read it.
+pub fn global_search(payload: &[u8], uses_64bit: bool, udp_flags: u32) -> Option<Packet> {
+    use ed2k_types::ed2k::server_udp::flags;
+    let large = udp_flags & flags::LARGEFILES != 0;
+    let ext = udp_flags & flags::EXT_GETFILES != 0;
+    if large && ext {
+        // <tag count 4> CT_SERVER_UDPSEARCH_FLAGS = SRVCAP_UDP_NEWTAGS_LARGEFILES
+        // as a new-style uint8 tag, then the search.
+        let mut p = 1u32.to_le_bytes().to_vec();
+        p.extend_from_slice(&[0x89, 0x0E, 0x01]);
+        p.extend_from_slice(payload);
+        return Some(Packet::new(Protocol::Edonkey, Opcode::GlobSearchReq3, p));
+    }
+    if uses_64bit && !large {
+        return None;
+    }
+    let op = if ext {
+        Opcode::GlobSearchReq2
+    } else {
+        Opcode::GlobSearchReq
+    };
+    Some(Packet::new(Protocol::Edonkey, op, payload.to_vec()))
+}
+
+/// `OP_GLOBSEARCHRES` (decrypted): one result, then maybe another
+/// `OP_GLOBSEARCHRES` header and result, and so on (servers pack several in
+/// one datagram). `None` for another kind of datagram.
+pub fn parse_global_search_results(datagram: &[u8]) -> Option<Vec<crate::search::SearchResult>> {
+    let head = [Protocol::Edonkey as u8, u8::from(Opcode::GlobSearchRes)];
+    if datagram.len() < 2 || datagram[..2] != head {
+        return None;
+    }
+    let mut r = Reader::new(&datagram[2..]);
+    let mut out = Vec::new();
+    while let Ok(res) = crate::search::SearchResult::read(&mut r) {
+        out.push(res);
+        // Another packed answer?
+        let rest = r.rest();
+        if rest.len() > 2 && rest[..2] == head {
+            r = Reader::new(&rest[2..]);
+        } else {
+            break;
+        }
+    }
+    Some(out)
+}
+
+// --------------------------------------------------- server descriptions
+
+/// `INV_SERV_DESC_LEN`: the low half of a description challenge, an
+/// impossible string length, so an old-style answer cannot be mistaken
+/// for a new one.
+pub const INV_SERV_DESC_LEN: u32 = 0xF0FF;
+
+/// A description challenge, as aMule picks it.
+pub fn desc_challenge<R: rand::RngCore + ?Sized>(rng: &mut R) -> u32 {
+    ((rng.gen::<u16>() as u32) << 16) + INV_SERV_DESC_LEN
+}
+
+/// `OP_SERVER_DESC_REQ` with a challenge (eserver 16.45 and later answer
+/// with tags).
+pub fn desc_request(challenge: u32) -> Packet {
+    Packet::new(
+        Protocol::Edonkey,
+        Opcode::ServerDescReq,
+        challenge.to_le_bytes().to_vec(),
+    )
+}
+
+/// What `OP_SERVER_DESC_RES` says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerDescription {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub dyn_ip: Option<String>,
+    pub version: Option<String>,
+}
+
+/// `OP_SERVER_DESC_RES` (decrypted), old (`<name><description>`) or new
+/// (`<challenge 4><tags>`, the challenge ours).
+pub fn parse_desc_answer(datagram: &[u8], challenge: u32) -> Option<ServerDescription> {
+    use ed2k_codec::Tag;
+    use ed2k_types::tags::ServerTag;
+    let p = Packet::parse_udp(datagram).ok()?;
+    if p.protocol != Protocol::Edonkey as u8 || p.opcode != u8::from(Opcode::ServerDescRes) {
+        return None;
+    }
+    let mut r = Reader::new(&p.payload);
+    let len = u16::from_le_bytes([*p.payload.first()?, *p.payload.get(1)?]);
+    let mut d = ServerDescription::default();
+    if p.payload.len() >= 8 && u32::from(len) == INV_SERV_DESC_LEN {
+        if r.u32().ok()? != challenge {
+            return None;
+        }
+        let n = r.u32().ok()?;
+        for _ in 0..n {
+            // Strings as UTF-8, whatever the server says (aMule #831).
+            let t = Tag::read_ed2k(&mut r, true, false).ok()?;
+            let id = match t.name {
+                ed2k_codec::TagName::Id(id) => ServerTag::try_from(id).ok(),
+                _ => None,
+            };
+            let text = t.as_str().map(str::to_owned);
+            match id {
+                Some(ServerTag::ServerName) => d.name = text,
+                Some(ServerTag::Description) => d.description = text,
+                Some(ServerTag::DynIp) => d.dyn_ip = text,
+                Some(ServerTag::Version) => {
+                    d.version =
+                        text.or_else(|| t.as_int().map(|v| format!("{}.{}", v >> 16, v & 0xFFFF)))
+                }
+                _ => {}
+            }
+        }
+    } else {
+        let mut s = || -> Option<String> {
+            let n = r.u16().ok()? as usize;
+            Some(String::from_utf8_lossy(r.bytes(n).ok()?).into_owned())
+        };
+        d.name = s();
+        d.description = s();
+    }
+    Some(d)
+}

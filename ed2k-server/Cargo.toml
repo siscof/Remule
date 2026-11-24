@@ -7,6 +7,7 @@ description = "eD2k client-to-server protocol: login, searches, sources, server 
 
 [dependencies]
 ed2k-codec = { path = "../ed2k-codec" }
+ed2k-crypto = { path = "../ed2k-crypto" }
 ed2k-types = { path = "../ed2k-types" }
 remule-net = { path = "../remule-net" }
 rand = "0.8"

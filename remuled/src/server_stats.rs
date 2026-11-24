@@ -17,6 +17,11 @@
 //! (for our IP); the ping time is measured. Every other answer is followed
 //! by a description request (`OP_SERVER_DESC_REQ` with a challenge), whose
 //! answer names and describes the server.
+//!
+//! A server's UDP key is given for our public IP. When that changes
+//! (`SetPublicIP`, `CheckForExpiredUDPKeys`), the servers holding a key
+//! for another IP are pinged again as soon as they may be: at once, or 20
+//! minutes after their last ping (`UDPSERVSTATMINREASKTIME`).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -26,7 +31,7 @@ use ed2k_codec::Packet;
 use ed2k_formats::server_met::ServerInfo;
 use ed2k_server::udp;
 use ed2k_server::SearchResult;
-use ed2k_types::ed2k::server_udp::Opcode;
+use ed2k_types::ed2k::server_udp::{flags, Opcode};
 use ed2k_types::Protocol;
 use rand::Rng;
 use tracing::debug;
@@ -40,6 +45,9 @@ pub const STAT_EVERY: Duration = Duration::from_secs(5);
 pub const REASK_SECS: u64 = 16_200;
 /// How long the obfuscated ping waits for its answer.
 pub const CRYPT_ANSWER_SECS: u64 = 20;
+/// `UDPSERVSTATMINREASKTIME`: no server is pinged twice within 20 minutes
+/// to recover its key.
+pub const MIN_REASK_SECS: u64 = 1200;
 
 /// What is kept of a server while running, not in `server.met`.
 #[derive(Debug, Default, Clone)]
@@ -53,6 +61,9 @@ struct Pinging {
     desc_challenge: u32,
     /// Status answers since the last description request (`lastdescpingedcout`).
     desc_count: u8,
+    /// When it was last pinged, in seconds since the epoch
+    /// (`GetRealLastPingedTime`; `ST_LASTPING` is moved about).
+    real_pinged: u64,
 }
 
 /// Something to do for the pings.
@@ -150,6 +161,7 @@ impl ServerStats {
         }
         let st = self.state.entry(addr).or_default();
         st.sent = Some(now);
+        st.real_pinged = unix;
         if !st.crypt_pending && public_ip.is_some() {
             // Obfuscated first; no answer within 20 s is no failure, the
             // plain ping follows.
@@ -182,6 +194,33 @@ impl ServerStats {
             server,
             packet: udp::ping(c),
         })
+    }
+
+    /// `CheckForExpiredUDPKeys`, our public IP now `ip`: a server holding
+    /// a key given for another IP is pinged again at its next turn, or once
+    /// 20 minutes have passed since its last ping.
+    pub fn public_ip_changed(&mut self, ip: Ipv4Addr, unix: u64, list: &mut ServerList) {
+        let ours = amule_ip(Some(ip));
+        let mut expired = 0;
+        for e in list.entries_mut() {
+            if e.udp_flags & flags::UDPOBFUSCATION == 0 || e.udp_key == 0 || e.udp_key_ip == ours {
+                continue;
+            }
+            expired += 1;
+            let real = addr_of(e)
+                .and_then(|a| self.state.get(&a))
+                .map_or(0, |st| st.real_pinged);
+            e.last_ping = if real != 0 && unix < real + MIN_REASK_SECS {
+                // Now + (the least delay - what has passed).
+                (unix + MIN_REASK_SECS - (unix - real)).saturating_sub(REASK_SECS)
+            } else {
+                0
+            };
+        }
+        if expired > 0 {
+            debug!("Our public IP is {ip}: {expired} servers' UDP keys to recover");
+            list.mark_changed();
+        }
     }
 
     /// The key a datagram from this server is read with: the challenge of
@@ -576,5 +615,57 @@ mod tests {
             s.tick(t, UNIX + 1, &mut l, None, Some(3), &mut rng),
             Some(Out::Packet { server, .. }) if server.ip == Some(*b.ip())
         ));
+    }
+
+    /// Our public IP changes: servers holding a key for another IP are
+    /// pinged again (obfuscated first) at their next turn, or 20 minutes
+    /// after their last ping; keys for the new IP, and servers without
+    /// obfuscation, are left alone.
+    #[test]
+    fn keys_for_another_ip_are_recovered() {
+        let mut rng = rand::thread_rng();
+        let old = Ipv4Addr::new(192, 0, 2, 1);
+        let addrs: Vec<SocketAddr> = (1..=4)
+            .map(|i| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, i), 4661)))
+            .collect();
+        let mut l = ServerList::new(&addrs, None);
+        for (i, e) in l.entries_mut().iter_mut().enumerate() {
+            e.udp_flags = if i == 3 { 0 } else { flags::UDPOBFUSCATION };
+            e.udp_key = 0x1234;
+            e.udp_key_ip = amule_ip(Some(if i == 2 { OURS } else { old }));
+            e.obfuscation_port_udp = 4669;
+            e.last_ping = UNIX - 60;
+        }
+        let mut s = ServerStats::default();
+        // The first was pinged (by us) 5 minutes ago.
+        let a = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 4661);
+        s.state.entry(a).or_default().real_pinged = UNIX - 300;
+        s.public_ip_changed(OURS, UNIX, &mut l);
+        let last: Vec<u64> = l.entries().iter().map(|e| e.last_ping).collect();
+        assert_eq!(last, vec![UNIX + 900 - REASK_SECS, 0, UNIX - 60, UNIX - 60]);
+        // The second is pinged at once, the first 15 minutes on.
+        let t0 = Instant::now();
+        let Some(Out::Raw { to, .. }) = s.tick(t0, UNIX, &mut l, Some(OURS), None, &mut rng) else {
+            panic!()
+        };
+        assert_eq!(to.ip().octets()[3], 2);
+        let t = t0 + STAT_EVERY;
+        // (Meanwhile the second's obfuscated ping went unanswered: plain.)
+        let Some(Out::Packet { server, .. }) =
+            s.tick(t, UNIX + 899, &mut l, Some(OURS), None, &mut rng)
+        else {
+            panic!()
+        };
+        assert_eq!(server.ip.unwrap().octets()[3], 2);
+        let t = t + STAT_EVERY;
+        let Some(Out::Raw { to, .. }) = s.tick(t, UNIX + 900, &mut l, Some(OURS), None, &mut rng)
+        else {
+            panic!()
+        };
+        assert_eq!(to.ip().octets()[3], 1);
+        // Nothing changes when no key is for another IP.
+        let mut l2 = ServerList::new(&addrs[2..3], None);
+        s.public_ip_changed(OURS, UNIX, &mut l2);
+        assert!(!l2.changed());
     }
 }

@@ -969,9 +969,14 @@ pub async fn run(
                         tree_track.logins += 1;
                         server_since = connector.connected().map(|a| (a.addr, unix_now()));
                         // `GetPublicIP`: a HighID is our IP.
+                        let before = public_ip;
                         public_ip = li.public_ip.or_else(|| {
                             (!li.low_id).then(|| ed2k_server::packets::id_to_ip(li.id))
                         });
+                        // SetPublicIP: keys given for another IP are recovered.
+                        if let Some(ip) = public_ip.filter(|ip| before != Some(*ip)) {
+                            server_stats.public_ip_changed(ip, u64::from(unix_now()), &mut server_list);
+                        }
                         let _ = cmd.send(Command::SetOurId { id: li.id, public_ip: li.public_ip });
                         let was = reach;
                         reach.high_id = !li.low_id;

@@ -148,15 +148,16 @@ pub fn with_statics(
         _ => 1,
     };
     let mut infos: Vec<ServerInfo> = met.servers.iter().map(ServerInfo::from_record).collect();
-    for st in statics {
+    // Those known by host name join once resolved.
+    for (st, addr) in statics.iter().filter_map(|st| Some((st, st.addr()?))) {
         let at = infos
             .iter()
-            .position(|s| s.ip == Some(*st.addr.ip()) && s.port == st.addr.port());
+            .position(|s| s.ip == Some(*addr.ip()) && s.port == addr.port());
         match at {
             Some(i) => infos[i].preference = st.preference,
             None => infos.push(ServerInfo {
-                ip: Some(*st.addr.ip()),
-                port: st.addr.port(),
+                ip: Some(*addr.ip()),
+                port: addr.port(),
                 preference: st.preference,
                 ..Default::default()
             }),

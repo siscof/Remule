@@ -337,13 +337,13 @@ fn servers_are_added_and_removed_as_the_server_list_does_it() {
             .with(Tag::string(EC_TAG_SERVER_NAME, name))
     };
     // Refused: no port, a LAN or invalid address (LAN addresses
-    // filtered), a host name, one already in the list.
+    // filtered), one already in the list. (A host name is a dynamic-IP
+    // server: see below.)
     for bad in [
         "8.8.8.8:0",
         "8.8.8.8:x",
         "192.168.1.1:4661",
         "0.0.0.0:4661",
-        "example.org:4661",
         "10.0.0.1:4661",
     ] {
         let (r, e) = w.ask(add(bad, "x"));
@@ -998,7 +998,8 @@ async fn server_and_node_lists_are_fetched_over_http() {
 
 /// `staticservers.dat` (`LoadStaticServers`): `host:port,priority,name`,
 /// comments and malformed lines skipped, an out-of-range priority normal,
-/// an empty name the address; host names not kept yet.
+/// an empty name the address; a host name kept for a dynamic-IP server
+/// (and left out of the order until it is resolved).
 #[test]
 fn static_servers_are_read_as_amule_reads_them() {
     let d = TempDir::new("statics-read");
@@ -1010,26 +1011,22 @@ fn static_servers_are_read_as_amule_reads_them() {
     .unwrap();
     let got = ec_servers::read_static_servers(&d.0);
     let v4 = |n: u8, p: u16| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, n), p);
+    let st = |host: &str, port: u16, preference: u32, name: &str| ec_servers::StaticServer {
+        host: host.into(),
+        port,
+        preference,
+        name: name.into(),
+    };
     assert_eq!(
         got,
         [
-            ec_servers::StaticServer {
-                addr: v4(1, 4661),
-                preference: 1,
-                name: "First".into()
-            },
-            ec_servers::StaticServer {
-                addr: v4(2, 4662),
-                preference: 0,
-                name: "10.0.0.2:4662".into()
-            },
-            ec_servers::StaticServer {
-                addr: v4(3, 4663),
-                preference: 0,
-                name: "Third".into()
-            },
+            st("10.0.0.1", 4661, 1, "First"),
+            st("10.0.0.2", 4662, 0, "10.0.0.2:4662"),
+            st("10.0.0.3", 4663, 0, "Third"),
+            st("example.org", 4661, 0, "Named"),
         ]
     );
+    assert_eq!(got[3].addr(), None);
     // In the order to try: high priority first, statics after the others
     // of theirs.
     let order = config::with_statics(&met(&[info(9)]), &got);
@@ -1128,4 +1125,181 @@ fn static_only_connecting_tries_the_static_servers() {
     assert!(matches!(c.failed(t), Next::RetryAt(_)));
     c.set_static_only(false);
     assert_eq!(tried(c.start(t)), Some(a(1)));
+}
+
+/// Dynamic-IP servers: kept by host name from `server.met` (`ST_DYNIP`,
+/// no IP yet), `staticservers.dat` and `EC_OP_SERVER_ADD`; resolved, then
+/// tried at their address; a new address takes the old one's place; the
+/// static file written with the name.
+#[test]
+fn dynamic_ip_servers_are_kept_by_name_and_resolved() {
+    let d = TempDir::new("dynip");
+    let mut named = info(5);
+    named.ip = Some(Ipv4Addr::UNSPECIFIED);
+    named.dyn_ip = "Dyn.Example.org".into();
+    named.name = "Dynamic".into();
+    std::fs::write(d.0.join("server.met"), met(&[info(1), named]).write()).unwrap();
+    std::fs::write(
+        d.0.join("staticservers.dat"),
+        "static.example.org:4242,0,Static Dyn\n",
+    )
+    .unwrap();
+    let mut w = World::new();
+    w.list = ServerList::load(&d.0, &[a(1)]);
+    w.config = d.0.clone();
+    let mut unresolved = w.list.unresolved();
+    unresolved.sort();
+    assert_eq!(
+        unresolved,
+        [
+            ("Dyn.Example.org".to_string(), 4661),
+            ("static.example.org".to_string(), 4242)
+        ]
+    );
+    // Added over EC by name: looked up; the same name again is refused.
+    let add = |host: &str| {
+        Packet::new(EC_OP_SERVER_ADD)
+            .with(Tag::string(EC_TAG_SERVER_ADDRESS, host))
+            .with(Tag::string(EC_TAG_SERVER_NAME, "Added"))
+    };
+    let (r, e) = w.ask(add("added.example.org:4663"));
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(e, [Effect::Resolve("added.example.org".into(), 4663)]);
+    let (r, e) = w.ask(add("ADDED.example.org:4663"));
+    assert_eq!(message(&r), "Server not added");
+    assert!(e.is_empty());
+    assert_eq!(w.list.unresolved().len(), 3);
+
+    // Resolved: given its IP; findable and pingable by address.
+    let ip = Ipv4Addr::new(198, 51, 100, 9);
+    assert_eq!(w.list.resolved("dyn.example.org", 4661, ip), Some(None));
+    assert_eq!(w.list.resolved("dyn.example.org", 4661, ip), None);
+    let at = SocketAddrV4::new(ip, 4661);
+    assert_eq!(w.list.find(at).unwrap().name, "Dynamic");
+    let moved = Ipv4Addr::new(198, 51, 100, 10);
+    assert_eq!(
+        w.list.resolved("dyn.example.org", 4661, moved),
+        Some(Some(at))
+    );
+    // The connector keeps its place.
+    let mut c = Connector::new(vec![a(1), SocketAddr::V4(at)], false, true);
+    c.replace(
+        SocketAddr::V4(at),
+        SocketAddr::V4(SocketAddrV4::new(moved, 4661)),
+    );
+    assert_eq!(
+        c.servers()[1],
+        SocketAddr::V4(SocketAddrV4::new(moved, 4661))
+    );
+
+    // The static one, resolved: static, and written back by name.
+    let sip = Ipv4Addr::new(198, 51, 100, 11);
+    w.list.resolved("static.example.org", 4242, sip);
+    let sa = SocketAddrV4::new(sip, 4242);
+    assert!(w.list.is_static(sa));
+    w.list.save_statics(&d.0);
+    assert_eq!(
+        std::fs::read_to_string(d.0.join("staticservers.dat")).unwrap(),
+        "static.example.org:4242,0,Static Dyn\n"
+    );
+    // Saved with its name in server.met (ST_DYNIP).
+    w.list.save_if_changed(&d.0);
+    let saved = ServerMet::read(&std::fs::read(d.0.join("server.met")).unwrap()).unwrap();
+    let dyns: Vec<String> = saved
+        .servers
+        .iter()
+        .map(ServerInfo::from_record)
+        .map(|s| s.dyn_ip)
+        .filter(|d| !d.is_empty())
+        .collect();
+    assert_eq!(dyns.len(), 3);
+}
+
+/// A server added over EC by host name (`localhost`) through a running
+/// daemon: listed at once, resolved, then logged into.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_added_by_name_is_resolved_and_connected_to() {
+    let d = TempDir::new("dyn-daemon");
+    let ec_port = free_port();
+    std::fs::write(
+        d.0.join("amule.conf"),
+        format!(
+            "[eMule]\nPort={}\nUDPPort={}\nConnectToKad=0\nConnectToED2K=1\nAutoconnect=0\nFilterLanIPs=0\n\
+             [ExternalConnect]\nAcceptExternalConnections=1\nECPort={ec_port}\nECPassword={SECRET}\n",
+            free_port(),
+            free_port()
+        ),
+    )
+    .unwrap();
+    // Alpha answers nothing.
+    let alpha = free_port();
+    std::fs::write(
+        d.0.join("server.met"),
+        ServerMet {
+            version: 0xE0,
+            servers: vec![record(alpha, "Alpha")],
+            legacy_counts: false,
+        }
+        .write(),
+    )
+    .unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let beta = l.local_addr().unwrap().port();
+    tokio::spawn(server(l));
+    let loaded = config::load(&d.0).unwrap();
+    let daemon = tokio::spawn(crate::client::run(
+        loaded.client,
+        Vec::new(),
+        Vec::new(),
+        std::future::pending(),
+    ));
+    wait_for_ec(ec_port).await;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Client::connect(&ConnectOptions::new("127.0.0.1", ec_port, SECRET)).unwrap();
+        let add = Packet::new(EC_OP_SERVER_ADD)
+            .with(Tag::string(
+                EC_TAG_SERVER_ADDRESS,
+                &format!("localhost:{beta}"),
+            ))
+            .with(Tag::string(EC_TAG_SERVER_NAME, "Beta"));
+        assert_eq!(c.request(&add).unwrap().opcode, EC_OP_NOOP);
+        // Listed by name; its address once resolved.
+        let mut found = None;
+        for _ in 0..100 {
+            let r = c
+                .request(&Packet::new(EC_OP_GET_SERVER_LIST).with_detail(EC_DETAIL_CMD))
+                .unwrap();
+            found = r
+                .tags
+                .iter()
+                .find(|t| t.child_str(EC_TAG_SERVER_NAME) == "Beta")
+                .and_then(Tag::as_ipv4);
+            if found.is_some_and(|(ip, _)| ip != [0; 4]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(found, Some(([127, 0, 0, 1], beta)));
+        let r = c.request(&Packet::new(EC_OP_CONNECT)).unwrap();
+        assert_eq!(r.message().unwrap(), "Connecting to eD2k...");
+        state_until(&mut c, |bits, p| bits == 1 && p == Some(beta));
+        assert_eq!(
+            c.request(&Packet::new(EC_OP_SHUTDOWN)).unwrap().opcode,
+            EC_OP_NOOP
+        );
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), daemon)
+        .await
+        .expect("the daemon did not stop")
+        .unwrap()
+        .unwrap();
+    // Kept by name in server.met.
+    let saved = ServerMet::read(&std::fs::read(d.0.join("server.met")).unwrap()).unwrap();
+    assert!(saved
+        .servers
+        .iter()
+        .map(ServerInfo::from_record)
+        .any(|s| s.dyn_ip == "localhost" && s.port == beta));
 }

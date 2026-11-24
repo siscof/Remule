@@ -78,23 +78,54 @@ fn failed(message: &str) -> Packet {
 pub struct ServerList {
     entries: Vec<ServerInfo>,
     changed: bool,
-    /// Those `staticservers.dat` keeps (`IsStaticMember`).
-    statics: std::collections::HashSet<SocketAddrV4>,
+    /// Those `staticservers.dat` keeps (`IsStaticMember`), by [`key`].
+    statics: std::collections::HashSet<(String, u16)>,
+}
+
+/// A server as `GetServerByAddress` knows it: its host name when it has a
+/// dynamic IP (case aside), else its IP; and its port.
+pub fn key(e: &ServerInfo) -> (String, u16) {
+    let addr = if e.dyn_ip.is_empty() {
+        e.ip.map(|ip| ip.to_string()).unwrap_or_default()
+    } else {
+        e.dyn_ip.to_lowercase()
+    };
+    (addr, e.port)
+}
+
+/// Whether an address is a host name, not an IP (`HasDynIP`).
+fn is_host_name(host: &str) -> bool {
+    host.parse::<std::net::Ipv4Addr>().is_err()
 }
 
 /// A line of `staticservers.dat`: `host:port,priority,name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticServer {
-    pub addr: SocketAddrV4,
+    /// An IP, or a host name (a dynamic-IP server).
+    pub host: String,
+    pub port: u16,
     pub preference: u32,
     pub name: String,
+}
+
+impl StaticServer {
+    /// Its address, when it is given by IP.
+    pub fn addr(&self) -> Option<SocketAddrV4> {
+        self.host
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .map(|ip| SocketAddrV4::new(ip, self.port))
+    }
+
+    fn key(&self) -> (String, u16) {
+        (self.host.to_lowercase(), self.port)
+    }
 }
 
 /// `LoadStaticServers`: one server a line, `host:port,priority,name`;
 /// blank lines and those starting with `#` or `/` skipped, as are lines
 /// without exactly three fields. A priority out of range is normal; a
-/// missing name is the address. Host names (dynamic-IP servers) are not
-/// kept yet.
+/// missing name is the address. A host name makes a dynamic-IP server.
 pub fn read_static_servers(dir: &Path) -> Vec<StaticServer> {
     use ed2k_formats::server_met::{PRIORITY_LOW, PRIORITY_NORMAL};
     let text = std::fs::read(dir.join("staticservers.dat"))
@@ -115,10 +146,9 @@ pub fn read_static_servers(dir: &Path) -> Vec<StaticServer> {
         }
         let (addy, prio, name) = (fields[0].trim(), fields[1].trim(), fields[2].trim());
         let (host, port) = addy.split_once(':').unwrap_or((addy, ""));
-        let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
-            warn!("staticservers.dat: {addy}: host names are not supported yet");
+        if host.is_empty() {
             continue;
-        };
+        }
         // StrToLong: the leading digits.
         let num = |t: &str| -> i64 {
             let d: String = t.chars().take_while(char::is_ascii_digit).collect();
@@ -135,7 +165,8 @@ pub fn read_static_servers(dir: &Path) -> Vec<StaticServer> {
             PRIORITY_NORMAL
         };
         out.push(StaticServer {
-            addr: SocketAddrV4::new(ip, port as u16),
+            host: host.to_owned(),
+            port: port as u16,
             preference,
             name: if name.is_empty() {
                 addy.to_owned()
@@ -189,34 +220,107 @@ impl ServerList {
             .ok()
             .and_then(|b| ServerMet::read(&b).ok());
         let mut list = Self::new(addrs, met.as_ref());
+        // Servers known by host name and not yet by IP: kept, to be
+        // resolved ([`ServerList::unresolved`]).
+        if let Some(m) = &met {
+            for s in m.servers.iter().map(ServerInfo::from_record) {
+                let unresolved = s.ip.is_none_or(|ip| ip.is_unspecified());
+                if !s.dyn_ip.is_empty() && unresolved && s.port != 0 {
+                    list.push_dyn(s);
+                }
+            }
+        }
         list.apply_statics(&read_static_servers(dir));
         list
     }
 
-    /// The static servers that are listed (those `addrs` let through).
+    /// A dynamic-IP server added unresolved, unless listed already.
+    fn push_dyn(&mut self, mut s: ServerInfo) -> bool {
+        s.ip = None;
+        let k = key(&s);
+        if self.entries.iter().any(|e| key(e) == k) {
+            return false;
+        }
+        self.entries.push(s);
+        true
+    }
+
+    /// The static servers: listed ones marked (those `addrs` let through),
+    /// and those known by host name added if they are not listed.
     pub fn apply_statics(&mut self, statics: &[StaticServer]) {
         for st in statics {
-            if let Some(e) = self.find_mut(st.addr) {
+            if st.addr().is_none() {
+                self.push_dyn(ServerInfo {
+                    dyn_ip: st.host.clone(),
+                    port: st.port,
+                    ..Default::default()
+                });
+            }
+            let k = st.key();
+            if let Some(e) = self.entries.iter_mut().find(|e| key(e) == k) {
                 e.name = st.name.clone();
                 e.preference = st.preference;
-                self.statics.insert(st.addr);
+                self.statics.insert(k);
             }
         }
     }
 
     /// `IsStaticMember`.
     pub fn is_static(&self, a: SocketAddrV4) -> bool {
-        self.statics.contains(&a)
+        self.find(a).is_some_and(|e| self.statics.contains(&key(e)))
     }
 
     /// `SetStaticServer`: marked or not, and `staticservers.dat` written.
     pub fn set_static(&mut self, a: SocketAddrV4, is_static: bool, dir: &Path) {
+        let Some(k) = self.find(a).map(key) else {
+            return;
+        };
         if is_static {
-            self.statics.insert(a);
+            self.statics.insert(k);
         } else {
-            self.statics.remove(&a);
+            self.statics.remove(&k);
         }
         self.save_statics(dir);
+    }
+
+    /// The dynamic-IP servers, by host name and port.
+    pub fn dyn_servers(&self) -> Vec<(String, u16)> {
+        self.entries
+            .iter()
+            .filter(|e| !e.dyn_ip.is_empty())
+            .map(|e| (e.dyn_ip.clone(), e.port))
+            .collect()
+    }
+
+    /// Those not resolved yet.
+    pub fn unresolved(&self) -> Vec<(String, u16)> {
+        self.entries
+            .iter()
+            .filter(|e| !e.dyn_ip.is_empty() && e.ip.is_none())
+            .map(|e| (e.dyn_ip.clone(), e.port))
+            .collect()
+    }
+
+    /// A host name resolved (`SetID` after the lookup): the server's IP
+    /// set. `Some(the address it had)` when it changed.
+    pub fn resolved(
+        &mut self,
+        host: &str,
+        port: u16,
+        ip: std::net::Ipv4Addr,
+    ) -> Option<Option<SocketAddrV4>> {
+        let k = (host.to_lowercase(), port);
+        let e = self
+            .entries
+            .iter_mut()
+            .find(|e| !e.dyn_ip.is_empty() && key(e) == k)?;
+        if e.ip == Some(ip) {
+            return None;
+        }
+        let old = e.ip.map(|o| SocketAddrV4::new(o, port));
+        e.ip = Some(ip);
+        self.changed = true;
+        Some(old)
     }
 
     /// `SetServerPrio`.
@@ -227,14 +331,20 @@ impl ServerList {
         }
     }
 
-    /// `SaveStaticServers`: `ip:port,priority,name`, one a line.
+    /// `SaveStaticServers`: `address:port,priority,name`, one a line, the
+    /// address a host name for a dynamic-IP server.
     pub fn save_statics(&self, dir: &Path) {
         let mut text = String::new();
         for e in &self.entries {
-            let Some(ip) = e.ip else { continue };
-            if self.statics.contains(&SocketAddrV4::new(ip, e.port)) {
-                text.push_str(&format!("{ip}:{},{},{}\n", e.port, e.preference, e.name));
+            if !self.statics.contains(&key(e)) {
+                continue;
             }
+            let addr = if e.dyn_ip.is_empty() {
+                e.ip.map(|ip| ip.to_string()).unwrap_or_default()
+            } else {
+                e.dyn_ip.clone()
+            };
+            text.push_str(&format!("{addr}:{},{},{}\n", e.port, e.preference, e.name));
         }
         let path = dir.join("staticservers.dat");
         if let Err(e) = std::fs::write(&path, text) {
@@ -267,8 +377,9 @@ impl ServerList {
     /// `RemoveServer(server, fromUser = true)`: a static server is written
     /// out of `staticservers.dat` too, or it comes back at the next start.
     pub fn remove_by_user(&mut self, a: SocketAddrV4, dir: &Path) {
+        let k = self.find(a).map(key);
         self.remove(a);
-        if self.statics.remove(&a) {
+        if k.is_some_and(|k| self.statics.remove(&k)) {
             self.save_statics(dir);
         }
     }
@@ -328,6 +439,8 @@ pub enum Effect {
     /// Start Kad if it is not running, and bootstrap from this node
     /// (`BootstrapKad`).
     BootstrapKad(SocketAddrV4),
+    /// Look up a dynamic-IP server's host name.
+    Resolve(String, u16),
     StartKad,
     StopKad,
 }
@@ -395,6 +508,21 @@ pub fn merge_met(
     let mut added = 0;
     for rec in &met.servers {
         let s = ServerInfo::from_record(rec);
+        // A dynamic-IP server: by its host name; resolved later.
+        if !s.dyn_ip.is_empty() {
+            let k = key(&s);
+            if let Some(e) = list.entries.iter_mut().find(|e| key(e) == k) {
+                e.name = s.name.clone();
+                if !s.description.is_empty() {
+                    e.description = s.description.clone();
+                }
+                list.changed = true;
+            } else if s.port != 0 && list.push_dyn(s) {
+                list.changed = true;
+                added += 1;
+            }
+            continue;
+        }
         let Some(ip) = s.ip else { continue };
         let addr = SocketAddrV4::new(ip, s.port);
         if let Some(e) = list.find_mut(addr) {
@@ -547,7 +675,7 @@ pub fn handle(req: &Packet, ctx: &mut Ctx<'_>) -> (Packet, Vec<Effect>) {
             }
             p
         }
-        EC_OP_SERVER_ADD => server_add(req, ctx),
+        EC_OP_SERVER_ADD => server_add(req, ctx, &mut out),
         EC_OP_SERVER_CONNECT | EC_OP_SERVER_DISCONNECT | EC_OP_SERVER_REMOVE => {
             server_cmd(req, ctx, &mut out)
         }
@@ -642,7 +770,7 @@ pub fn handle(req: &Packet, ctx: &mut Ctx<'_>) -> (Packet, Vec<Effect>) {
 }
 
 /// `Get_EC_Response_Server_Add` and `CServerList::AddServer`.
-fn server_add(req: &Packet, ctx: &mut Ctx<'_>) -> Packet {
+fn server_add(req: &Packet, ctx: &mut Ctx<'_>, out: &mut Vec<Effect>) -> Packet {
     let text = |name: u16| req.tag(name).map(Tag::as_str).unwrap_or_default();
     let full = text(EC_TAG_SERVER_ADDRESS);
     let name = text(EC_TAG_SERVER_NAME);
@@ -658,9 +786,25 @@ fn server_add(req: &Packet, ctx: &mut Ctx<'_>) -> Packet {
         warn!("Server not added: [{host}:{port}] does not specify a valid port.");
         return refused();
     }
-    // A host name would be a dynamic-IP server, which is not kept yet.
+    // A host name: a dynamic-IP server, looked up once added.
+    if is_host_name(host) {
+        let list_name = if name.is_empty() { full.clone() } else { name };
+        let s = ServerInfo {
+            dyn_ip: host.to_owned(),
+            port,
+            name: list_name.clone(),
+            ..Default::default()
+        };
+        if !ctx.list.push_dyn(s) {
+            warn!("Server not added: Server with matching IP:Port [{host}:{port}] found in list.");
+            return refused();
+        }
+        info!("Server added: Server at [{host}:{port}] using the name '{list_name}'.");
+        ctx.list.changed = true;
+        out.push(Effect::Resolve(host.to_owned(), port));
+        return Packet::new(EC_OP_NOOP);
+    }
     let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
-        warn!("Server not added: [{host}:{port}] is not an IP address (dynamic-IP servers are not supported yet).");
         return refused();
     };
     if !is_good_ip(ip, ctx.filter_lan) || ctx.ip_filter.is_some_and(|f| f.blocks_server(ip)) {

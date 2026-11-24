@@ -14,8 +14,10 @@
 //! obfuscated, then plain, and nothing else when it fails. The user can
 //! disconnect, and add or remove servers while it runs.
 //!
-//! Not ported: two attempts at a time, failure counts and dropping dead
-//! servers from the list, static-only connecting.
+//! With `AutoConnectStaticOnly`, a sweep tries the static servers only,
+//! and none starts when there are none.
+//!
+//! Not ported: two attempts at a time.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -64,6 +66,9 @@ pub struct Connector {
     state: State,
     /// `singleconnecting`: one server picked, no sweep.
     single: bool,
+    /// The static servers, and whether only they are tried.
+    statics: std::collections::HashSet<SocketAddr>,
+    static_only: bool,
 }
 
 impl Connector {
@@ -78,7 +83,28 @@ impl Connector {
             obfuscated_pass: obfuscate,
             state: State::Idle,
             single: false,
+            statics: Default::default(),
+            static_only: false,
         }
+    }
+
+    /// `AutoConnectStaticOnly`.
+    pub fn set_static_only(&mut self, on: bool) {
+        self.static_only = on;
+    }
+
+    /// A server marked static or not (`IsStaticMember`).
+    pub fn set_static(&mut self, addr: SocketAddr, on: bool) {
+        if on {
+            self.statics.insert(addr);
+        } else {
+            self.statics.remove(&addr);
+        }
+    }
+
+    /// Whether a sweep may try this server.
+    fn may_try(&self, addr: &SocketAddr) -> bool {
+        !self.static_only || self.statics.contains(addr)
     }
 
     /// The servers, in the order they are tried.
@@ -109,7 +135,8 @@ impl Connector {
         self.single = false;
         self.pos = 0;
         self.obfuscated_pass = self.obfuscate;
-        if self.servers.is_empty() {
+        // "No valid servers to which to connect found in server list"
+        if !self.servers.iter().any(|a| self.may_try(a)) {
             self.state = State::Idle;
             return Next::Idle;
         }
@@ -118,6 +145,9 @@ impl Connector {
 
     /// `TryAnotherConnectionrequest`.
     fn try_next(&mut self, now: Instant) -> Next {
+        while self.servers.get(self.pos).is_some_and(|a| !self.may_try(a)) {
+            self.pos += 1;
+        }
         if let Some(&addr) = self.servers.get(self.pos) {
             self.pos += 1;
             let a = Attempt {

@@ -75,11 +75,11 @@ fn kids(t: &Tag) -> Vec<u16> {
 fn servers_are_told_as_cec_server_tag_tells_them() {
     let s = info(1);
     // amulecmd: the address and the name.
-    let cmd = ec_servers::server_tag(&s, 0x19, EC_DETAIL_CMD);
+    let cmd = ec_servers::server_tag(&s, false, 0x19, EC_DETAIL_CMD);
     assert_eq!(cmd.as_ipv4(), Some(([10, 0, 0, 1], 4661)));
     assert_eq!(kids(&cmd), [EC_TAG_SERVER_NAME]);
     // The GUI: everything that is not zero or empty, the name last.
-    let full = ec_servers::server_tag(&s, 0x19, EC_DETAIL_FULL);
+    let full = ec_servers::server_tag(&s, false, 0x19, EC_DETAIL_FULL);
     assert_eq!(
         kids(&full),
         [
@@ -99,7 +99,7 @@ fn servers_are_told_as_cec_server_tag_tells_them() {
     assert_eq!(full.child_int(EC_TAG_SERVER_USERS_MAX), 5000);
     assert_eq!(full.child_int(EC_TAG_SERVER_TCP_FLAGS), 0x19);
     // Updates: ping and failures only.
-    let upd = ec_servers::server_tag(&s, 0x19, EC_DETAIL_UPDATE);
+    let upd = ec_servers::server_tag(&s, false, 0x19, EC_DETAIL_UPDATE);
     assert_eq!(kids(&upd), [EC_TAG_SERVER_PING, EC_TAG_SERVER_FAILED]);
     // Normal priority, no failures, no name: left out.
     let bare = ServerInfo {
@@ -107,7 +107,7 @@ fn servers_are_told_as_cec_server_tag_tells_them() {
         port: 4242,
         ..Default::default()
     };
-    assert!(ec_servers::server_tag(&bare, 0, EC_DETAIL_FULL)
+    assert!(ec_servers::server_tag(&bare, false, 0, EC_DETAIL_FULL)
         .children
         .is_empty());
 }
@@ -167,6 +167,11 @@ impl World {
                 now: Instant::now(),
                 config: &self.config,
                 server_met_busy: self.server_met_busy,
+                // ECID n is the server at 10.0.0.n.
+                ecid: &|id| match a(id as u8) {
+                    SocketAddr::V4(v) => Some(v),
+                    SocketAddr::V6(_) => None,
+                },
             },
         )
     }
@@ -977,4 +982,138 @@ async fn server_and_node_lists_are_fetched_over_http() {
     assert_eq!(saved.servers.len(), 2);
     let conf = std::fs::read_to_string(d.0.join("amule.conf")).unwrap();
     assert!(conf.contains("KadNodesUrl=http://127.0.0.1:"), "{conf}");
+}
+
+/// `staticservers.dat` (`LoadStaticServers`): `host:port,priority,name`,
+/// comments and malformed lines skipped, an out-of-range priority normal,
+/// an empty name the address; host names not kept yet.
+#[test]
+fn static_servers_are_read_as_amule_reads_them() {
+    let d = TempDir::new("statics-read");
+    std::fs::write(
+        d.0.join("staticservers.dat"),
+        "# comment\n/ another\n\n10.0.0.1:4661,1,First\n10.0.0.2:4662,,  \n\
+         10.0.0.3:4663,7,Third\nexample.org:4661,0,Named\n10.0.0.4:4664,0\n10.0.0.5:0,0,No port\n",
+    )
+    .unwrap();
+    let got = ec_servers::read_static_servers(&d.0);
+    let v4 = |n: u8, p: u16| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, n), p);
+    assert_eq!(
+        got,
+        [
+            ec_servers::StaticServer {
+                addr: v4(1, 4661),
+                preference: 1,
+                name: "First".into()
+            },
+            ec_servers::StaticServer {
+                addr: v4(2, 4662),
+                preference: 0,
+                name: "10.0.0.2:4662".into()
+            },
+            ec_servers::StaticServer {
+                addr: v4(3, 4663),
+                preference: 0,
+                name: "Third".into()
+            },
+        ]
+    );
+    // In the order to try: high priority first, statics after the others
+    // of theirs.
+    let order = config::with_statics(&met(&[info(9)]), &got);
+    let want: Vec<SocketAddr> = [v4(9, 4661), v4(1, 4661), v4(2, 4662), v4(3, 4663)]
+        .into_iter()
+        .map(SocketAddr::V4)
+        .collect();
+    assert_eq!(order, want);
+}
+
+/// Static servers in the list: marked from `staticservers.dat`, shown with
+/// `EC_TAG_SERVER_STATIC`, set and unset by ECID with
+/// `EC_OP_SERVER_SET_STATIC_PRIO` (the file rewritten), their priority set
+/// too; one the user removes is written out of the file.
+#[test]
+fn static_servers_are_kept_shown_and_set() {
+    let d = TempDir::new("statics");
+    std::fs::write(
+        d.0.join("staticservers.dat"),
+        "10.0.0.3:4661,1,Static Three\n",
+    )
+    .unwrap();
+    let addrs = [a(1), a(2), a(3)];
+    std::fs::write(
+        d.0.join("server.met"),
+        met(&[info(1), info(2), info(3)]).write(),
+    )
+    .unwrap();
+    let mut w = World::new();
+    w.list = ServerList::load(&d.0, &addrs);
+    w.config = d.0.clone();
+    let v4 = |n: u8| SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, n), 4661);
+    assert!(w.list.is_static(v4(3)) && !w.list.is_static(v4(1)));
+    assert_eq!(w.list.find(v4(3)).unwrap().name, "Static Three");
+    assert_eq!(w.list.find(v4(3)).unwrap().preference, 1);
+    let statics = |w: &mut World| -> Vec<bool> {
+        let (r, _) = w.ask(Packet::new(EC_OP_GET_SERVER_LIST).with_detail(EC_DETAIL_FULL));
+        r.tags
+            .iter()
+            .map(|t| t.child_int(EC_TAG_SERVER_STATIC) == 1)
+            .collect()
+    };
+    assert_eq!(statics(&mut w), [false, false, true]);
+
+    // Server 1 made static and low priority.
+    let set = Packet::new(EC_OP_SERVER_SET_STATIC_PRIO)
+        .with(Tag::int(EC_TAG_SERVER, 1))
+        .with(Tag::int(EC_TAG_SERVER_STATIC, 1))
+        .with(Tag::int(EC_TAG_SERVER_PRIO, 2));
+    let (r, _) = w.ask(set);
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(statics(&mut w), [true, false, true]);
+    assert_eq!(w.list.find(v4(1)).unwrap().preference, 2);
+    // Written when made static, before the priority changed (as in aMule:
+    // SetStaticServer saves, SetServerPrio does not).
+    let file = std::fs::read_to_string(d.0.join("staticservers.dat")).unwrap();
+    assert_eq!(
+        file,
+        "10.0.0.1:4661,1,server 1\n10.0.0.3:4661,1,Static Three\n"
+    );
+    // Unset; an unknown ECID changes nothing.
+    let unset = Packet::new(EC_OP_SERVER_SET_STATIC_PRIO)
+        .with(Tag::int(EC_TAG_SERVER, 1))
+        .with(Tag::int(EC_TAG_SERVER_STATIC, 0));
+    w.ask(unset);
+    let (r, _) = w.ask(
+        Packet::new(EC_OP_SERVER_SET_STATIC_PRIO)
+            .with(Tag::int(EC_TAG_SERVER, 99))
+            .with(Tag::int(EC_TAG_SERVER_STATIC, 1)),
+    );
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(statics(&mut w), [false, false, true]);
+    // Removed by the user: gone from the file too.
+    let (r, _) = w.ask(Packet::new(EC_OP_SERVER_REMOVE).with(srv(3)));
+    assert_eq!(r.opcode, EC_OP_NOOP);
+    assert_eq!(
+        std::fs::read_to_string(d.0.join("staticservers.dat")).unwrap(),
+        ""
+    );
+}
+
+/// `AutoConnectStaticOnly`: a sweep tries the static servers only, and
+/// none starts without one.
+#[test]
+fn static_only_connecting_tries_the_static_servers() {
+    let t = Instant::now();
+    let mut c = Connector::new(vec![a(1), a(2), a(3)], false, true);
+    c.set_static_only(true);
+    assert_eq!(c.start(t), Next::Idle);
+    c.set_static(a(2), true);
+    let tried = |n: Next| match n {
+        Next::Connect(at) => Some(at.addr),
+        _ => None,
+    };
+    assert_eq!(tried(c.start(t)), Some(a(2)));
+    assert!(matches!(c.failed(t), Next::RetryAt(_)));
+    c.set_static_only(false);
+    assert_eq!(tried(c.start(t)), Some(a(1)));
 }

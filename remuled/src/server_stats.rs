@@ -150,9 +150,12 @@ impl ServerStats {
                 return None;
             }
         }
-        let e = &mut list.entries_mut()[i];
+        let e = &list.entries()[i];
         let addr = addr_of(e)?;
-        if let Some(retries) = dead_retries {
+        // IsPastDeadThreshold: a static server is never dropped.
+        let is_static = list.is_static(addr);
+        let e = &mut list.entries_mut()[i];
+        if let Some(retries) = dead_retries.filter(|_| !is_static) {
             if e.failed >= retries.max(1) {
                 debug!("Removing dead server {addr} ({} failures)", e.failed);
                 self.state.remove(&addr);
@@ -667,5 +670,23 @@ mod tests {
         let mut l2 = ServerList::new(&addrs[2..3], None);
         s.public_ip_changed(OURS, UNIX, &mut l2);
         assert!(!l2.changed());
+    }
+
+    /// IsPastDeadThreshold: a static server is pinged, never dropped.
+    #[test]
+    fn a_static_server_is_never_dropped() {
+        let mut rng = rand::thread_rng();
+        let (mut l, a, _) = list();
+        l.apply_statics(&[crate::ec_servers::StaticServer {
+            addr: a,
+            preference: 0,
+            name: "static".into(),
+        }]);
+        l.entries_mut()[0].failed = 9;
+        let mut s = ServerStats::default();
+        assert!(matches!(
+            s.tick(Instant::now(), UNIX, &mut l, None, Some(3), &mut rng),
+            Some(Out::Packet { server, .. }) if server.ip == Some(*a.ip())
+        ));
     }
 }

@@ -48,6 +48,7 @@ pub fn is_server_request(opcode: u8) -> bool {
             | EC_OP_KAD_STOP
             | EC_OP_KAD_BOOTSTRAP_FROM_IP
             | EC_OP_SERVER_UPDATE_FROM_URL
+            | EC_OP_SERVER_SET_STATIC_PRIO
     )
 }
 
@@ -77,6 +78,73 @@ fn failed(message: &str) -> Packet {
 pub struct ServerList {
     entries: Vec<ServerInfo>,
     changed: bool,
+    /// Those `staticservers.dat` keeps (`IsStaticMember`).
+    statics: std::collections::HashSet<SocketAddrV4>,
+}
+
+/// A line of `staticservers.dat`: `host:port,priority,name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticServer {
+    pub addr: SocketAddrV4,
+    pub preference: u32,
+    pub name: String,
+}
+
+/// `LoadStaticServers`: one server a line, `host:port,priority,name`;
+/// blank lines and those starting with `#` or `/` skipped, as are lines
+/// without exactly three fields. A priority out of range is normal; a
+/// missing name is the address. Host names (dynamic-IP servers) are not
+/// kept yet.
+pub fn read_static_servers(dir: &Path) -> Vec<StaticServer> {
+    use ed2k_formats::server_met::{PRIORITY_LOW, PRIORITY_NORMAL};
+    let text = std::fs::read(dir.join("staticservers.dat"))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('/') {
+            continue;
+        }
+        // wxStringTokenizer: empty fields count, but not a trailing one.
+        let mut fields: Vec<&str> = line.split(',').collect();
+        if fields.last() == Some(&"") {
+            fields.pop();
+        }
+        if fields.len() != 3 {
+            continue;
+        }
+        let (addy, prio, name) = (fields[0].trim(), fields[1].trim(), fields[2].trim());
+        let (host, port) = addy.split_once(':').unwrap_or((addy, ""));
+        let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+            warn!("staticservers.dat: {addy}: host names are not supported yet");
+            continue;
+        };
+        // StrToLong: the leading digits.
+        let num = |t: &str| -> i64 {
+            let d: String = t.chars().take_while(char::is_ascii_digit).collect();
+            d.parse().unwrap_or(0)
+        };
+        let port = num(port);
+        if port <= 0 || port > i64::from(u16::MAX) {
+            continue;
+        }
+        let p = num(prio);
+        let preference = if (0..=i64::from(PRIORITY_LOW)).contains(&p) {
+            p as u32
+        } else {
+            PRIORITY_NORMAL
+        };
+        out.push(StaticServer {
+            addr: SocketAddrV4::new(ip, port as u16),
+            preference,
+            name: if name.is_empty() {
+                addy.to_owned()
+            } else {
+                name.to_owned()
+            },
+        });
+    }
+    out
 }
 
 fn v4(a: SocketAddr) -> Option<SocketAddrV4> {
@@ -110,15 +178,68 @@ impl ServerList {
         ServerList {
             entries,
             changed: false,
+            statics: Default::default(),
         }
     }
 
-    /// With `dir/server.met`, if there is one.
+    /// With `dir/server.met`, if there is one, and `dir/staticservers.dat`'s
+    /// servers marked static, named and given their priority.
     pub fn load(dir: &Path, addrs: &[SocketAddr]) -> Self {
         let met = std::fs::read(dir.join("server.met"))
             .ok()
             .and_then(|b| ServerMet::read(&b).ok());
-        Self::new(addrs, met.as_ref())
+        let mut list = Self::new(addrs, met.as_ref());
+        list.apply_statics(&read_static_servers(dir));
+        list
+    }
+
+    /// The static servers that are listed (those `addrs` let through).
+    pub fn apply_statics(&mut self, statics: &[StaticServer]) {
+        for st in statics {
+            if let Some(e) = self.find_mut(st.addr) {
+                e.name = st.name.clone();
+                e.preference = st.preference;
+                self.statics.insert(st.addr);
+            }
+        }
+    }
+
+    /// `IsStaticMember`.
+    pub fn is_static(&self, a: SocketAddrV4) -> bool {
+        self.statics.contains(&a)
+    }
+
+    /// `SetStaticServer`: marked or not, and `staticservers.dat` written.
+    pub fn set_static(&mut self, a: SocketAddrV4, is_static: bool, dir: &Path) {
+        if is_static {
+            self.statics.insert(a);
+        } else {
+            self.statics.remove(&a);
+        }
+        self.save_statics(dir);
+    }
+
+    /// `SetServerPrio`.
+    pub fn set_priority(&mut self, a: SocketAddrV4, preference: u32) {
+        if let Some(e) = self.find_mut(a) {
+            e.preference = preference;
+            self.changed = true;
+        }
+    }
+
+    /// `SaveStaticServers`: `ip:port,priority,name`, one a line.
+    pub fn save_statics(&self, dir: &Path) {
+        let mut text = String::new();
+        for e in &self.entries {
+            let Some(ip) = e.ip else { continue };
+            if self.statics.contains(&SocketAddrV4::new(ip, e.port)) {
+                text.push_str(&format!("{ip}:{},{},{}\n", e.port, e.preference, e.name));
+            }
+        }
+        let path = dir.join("staticservers.dat");
+        if let Err(e) = std::fs::write(&path, text) {
+            warn!("Failed to open '{}': {e}", path.display());
+        }
     }
 
     pub fn entries(&self) -> &[ServerInfo] {
@@ -141,6 +262,15 @@ impl ServerList {
         self.entries
             .retain(|s| !(s.ip == Some(*a.ip()) && s.port == a.port()));
         self.changed = true;
+    }
+
+    /// `RemoveServer(server, fromUser = true)`: a static server is written
+    /// out of `staticservers.dat` too, or it comes back at the next start.
+    pub fn remove_by_user(&mut self, a: SocketAddrV4, dir: &Path) {
+        self.remove(a);
+        if self.statics.remove(&a) {
+            self.save_statics(dir);
+        }
     }
 
     /// Whether servers were added or removed, or what is known of them
@@ -220,6 +350,8 @@ pub struct Ctx<'a> {
     pub config: &'a Path,
     /// A server list download is under way.
     pub server_met_busy: bool,
+    /// The server an ECID names.
+    pub ecid: &'a dyn Fn(u32) -> Option<SocketAddrV4>,
 }
 
 /// `ServerListSources::IsValid`: an http or https URL naming a host, with
@@ -289,7 +421,7 @@ pub fn merge_met(
 }
 
 /// `CEC_Server_Tag(server, detail_level)`.
-pub fn server_tag(s: &ServerInfo, tcp_flags: u32, detail: u8) -> Tag {
+pub fn server_tag(s: &ServerInfo, is_static: bool, tcp_flags: u32, detail: u8) -> Tag {
     let ip = s.ip.map_or([0; 4], |ip| ip.octets());
     let mut t = Tag::ipv4(EC_TAG_SERVER, ip, s.port);
     let mut add = |c: Tag| t.children.push(c);
@@ -309,11 +441,11 @@ pub fn server_tag(s: &ServerInfo, tcp_flags: u32, detail: u8) -> Tag {
         }
         EC_DETAIL_WEB | EC_DETAIL_FULL | EC_DETAIL_CMD => {
             if detail != EC_DETAIL_CMD {
-                // Static servers (`staticservers.dat`) are not kept: none is.
                 for c in [
                     nonzero(EC_TAG_SERVER_PING, s.ping),
                     nonzero(EC_TAG_SERVER_PRIO, s.preference & 0xFF),
                     nonzero(EC_TAG_SERVER_FAILED, s.failed & 0xFF),
+                    nonzero(EC_TAG_SERVER_STATIC, u32::from(is_static)),
                     text(EC_TAG_SERVER_VERSION, &s.version),
                     text(EC_TAG_SERVER_DESC, &s.description),
                     nonzero(EC_TAG_SERVER_USERS, s.users),
@@ -408,7 +540,9 @@ pub fn handle(req: &Packet, ctx: &mut Ctx<'_>) -> (Packet, Vec<Effect>) {
                     } else {
                         0
                     };
-                    p = p.with(server_tag(s, flags, detail));
+                    let st =
+                        s.ip.is_some_and(|ip| ctx.list.is_static(SocketAddrV4::new(ip, s.port)));
+                    p = p.with(server_tag(s, st, flags, detail));
                 }
             }
             p
@@ -428,6 +562,21 @@ pub fn handle(req: &Packet, ctx: &mut Ctx<'_>) -> (Packet, Vec<Effect>) {
             }
         }
         EC_OP_SERVER_UPDATE_FROM_URL => server_update(req, ctx, &mut out),
+        // The server by its ECID; static, priority or both.
+        EC_OP_SERVER_SET_STATIC_PRIO => {
+            let ecid = req.tag(EC_TAG_SERVER).map_or(0, Tag::as_int) as u32;
+            if let Some(a) = (ctx.ecid)(ecid).filter(|a| ctx.list.find(*a).is_some()) {
+                if let Some(t) = req.tag(EC_TAG_SERVER_STATIC) {
+                    let on = t.as_int() > 0;
+                    ctx.list.set_static(a, on, ctx.config);
+                    ctx.connector.set_static(SocketAddr::V4(a), on);
+                }
+                if let Some(t) = req.tag(EC_TAG_SERVER_PRIO) {
+                    ctx.list.set_priority(a, t.as_int() as u32);
+                }
+            }
+            Packet::new(EC_OP_NOOP)
+        }
         EC_OP_KAD_BOOTSTRAP_FROM_IP => {
             if ctx.kad {
                 let ip = req.tag(EC_TAG_BOOTSTRAP_IP).map_or(0, Tag::as_int) as u32;
@@ -602,7 +751,7 @@ fn server_cmd(req: &Packet, ctx: &mut Ctx<'_>, out: &mut Vec<Effect>) -> Packet 
                 "You are connected to the server you are trying to delete. please disconnect first.",
             ),
             Some(a) => {
-                ctx.list.remove(a);
+                ctx.list.remove_by_user(a, ctx.config);
                 ctx.connector.remove(SocketAddr::V4(a));
                 Packet::new(EC_OP_NOOP)
             }

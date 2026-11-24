@@ -132,16 +132,38 @@ pub fn shared_dir_intents(dir: &Path) -> shareddir_dat::SharedDirs {
 /// The servers of a `server.met`, high priority first, then normal, then
 /// low, each in file order. Servers known only by name are left out.
 pub fn servers(met: &ServerMet) -> Vec<std::net::SocketAddr> {
+    with_statics(met, &[])
+}
+
+/// [`servers`], with `staticservers.dat`'s added after the others and
+/// their priority taking the place of the list's (`LoadStaticServers`).
+pub fn with_statics(
+    met: &ServerMet,
+    statics: &[crate::ec_servers::StaticServer],
+) -> Vec<std::net::SocketAddr> {
     let rank = |p: u32| match p {
         PRIORITY_HIGH => 0,
         PRIORITY_NORMAL => 1,
         PRIORITY_LOW => 2,
         _ => 1,
     };
-    let mut v: Vec<(u32, std::net::SocketAddr)> = met
-        .servers
-        .iter()
-        .map(ServerInfo::from_record)
+    let mut infos: Vec<ServerInfo> = met.servers.iter().map(ServerInfo::from_record).collect();
+    for st in statics {
+        let at = infos
+            .iter()
+            .position(|s| s.ip == Some(*st.addr.ip()) && s.port == st.addr.port());
+        match at {
+            Some(i) => infos[i].preference = st.preference,
+            None => infos.push(ServerInfo {
+                ip: Some(*st.addr.ip()),
+                port: st.addr.port(),
+                preference: st.preference,
+                ..Default::default()
+            }),
+        }
+    }
+    let mut v: Vec<(u32, std::net::SocketAddr)> = infos
+        .into_iter()
         .filter_map(|s| {
             let ip = s.ip.filter(|ip| !ip.is_unspecified())?;
             (s.port != 0).then(|| (rank(s.preference), (ip, s.port).into()))
@@ -319,19 +341,27 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         .is_some_and(|v| v != 0);
 
     let servers = if prefs.connect_to_ed2k {
+        let statics = crate::ec_servers::read_static_servers(dir);
+        let empty = ServerMet {
+            version: 0,
+            servers: Vec::new(),
+            legacy_counts: false,
+        };
         match read_opt(&dir.join("server.met")) {
             Some(b) => match ServerMet::read(&b) {
-                Ok(m) => servers(&m),
+                Ok(m) => with_statics(&m, &statics),
                 Err(e) => {
                     notes.push(format!("server.met: {e}"));
-                    servers(&ServerMet {
-                        version: 0,
-                        servers: e.salvaged,
-                        legacy_counts: false,
-                    })
+                    with_statics(
+                        &ServerMet {
+                            servers: e.salvaged,
+                            ..empty
+                        },
+                        &statics,
+                    )
                 }
             },
-            None => Vec::new(),
+            None => with_statics(&empty, &statics),
         }
     } else {
         Vec::new()
@@ -369,6 +399,10 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
         obfuscate_server: false,
         autoconnect: prefs.autoconnect,
         reconnect: prefs.reconnect,
+        static_only: conf
+            .get("/eMule/AutoConnectStaticOnly")
+            .and_then(ed2k_formats::amule_conf::parse_long)
+            .is_some_and(|v| v != 0),
         // RemoveDeadServer (on by default), DeadServerRetry (3).
         dead_server_retries: (conf
             .get("/eMule/RemoveDeadServer")

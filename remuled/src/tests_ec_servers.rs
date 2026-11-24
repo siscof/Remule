@@ -869,8 +869,9 @@ async fn web(listener: tokio::net::TcpListener, body: Vec<u8>) {
 
 /// `EC_OP_SERVER_UPDATE_FROM_URL` through a running daemon: the list
 /// fetched over HTTP is merged (a new server added, a known one renamed)
-/// and saved; `EC_OP_KAD_UPDATE_FROM_URL` replaces `nodes.dat` and
-/// remembers the URL.
+/// and saved, then a server is connected to (`HTTP_ServerMet`: Alpha does
+/// not answer, Delta logs us in); `EC_OP_KAD_UPDATE_FROM_URL` replaces
+/// `nodes.dat` and remembers the URL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_and_node_lists_are_fetched_over_http() {
     let d = TempDir::new("fetch");
@@ -886,7 +887,9 @@ async fn server_and_node_lists_are_fetched_over_http() {
     )
     .unwrap();
     let alpha = free_port();
-    let delta = free_port();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let delta = l.local_addr().unwrap().port();
+    tokio::spawn(server(l));
     let met = |servers: Vec<ServerRecord>| {
         ServerMet {
             version: 0xE0,
@@ -948,6 +951,8 @@ async fn server_and_node_lists_are_fetched_over_http() {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert_eq!(got, ["Alpha Renamed", "Delta"]);
+        // Not connected before (Autoconnect off): now logged into Delta.
+        state_until(&mut c, |bits, p| bits == 1 && p == Some(delta));
 
         let r = c
             .request(

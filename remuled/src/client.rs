@@ -767,6 +767,10 @@ pub async fn run(
                 None
             }
         };
+    // Server lists and nodes.dat fetched for EC requests.
+    let (met_tx, mut met_rx) = mpsc::unbounded_channel::<MetFetch>();
+    let mut server_met_busy = false;
+    let (nodes_tx, mut nodes_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, String>>();
     // The servers' status pings.
     let mut server_stats = crate::server_stats::ServerStats::default();
     // Sources asked of the other servers over UDP, and the downloads seen
@@ -999,6 +1003,55 @@ pub async fn run(
             d = async { match &udp_port { Some(_) => udp_out_rx.recv().await, None => std::future::pending().await } } => {
                 if let (Some(d), Some(p)) = (d, &udp_port) {
                     p.send_ed2k(&d, public_ip).await;
+                }
+            }
+            // A server list fetched: merged, and the list saved.
+            f = met_rx.recv() => match f {
+                Some(MetFetch::Got { url, body }) => {
+                    let met = body.and_then(|b| ed2k_formats::server_met::ServerMet::read(&b).map_err(|e| format!("{e:?}")));
+                    match met {
+                        Ok(met) => {
+                            crate::ec_servers::merge_met(&mut server_list, &met, &mut connector, c.ip_filter.as_deref(), !c.allow_lan);
+                            server_list.mark_changed();
+                            server_list.save_if_changed(&c.config);
+                            info!("Finished downloading the server list from {url}");
+                        }
+                        Err(e) => warn!("Failed to download server.met from {url}: {e}"),
+                    }
+                }
+                Some(MetFetch::Done) | None => server_met_busy = false,
+            },
+            // nodes.dat fetched: Kad stopped (it saves its nodes, which
+            // would overwrite the new file), the file replaced, Kad started.
+            f = nodes_rx.recv() => {
+                match f {
+                    Some(Ok(body)) => {
+                        let t = start.elapsed();
+                        if let Some(k) = kad_node.take() {
+                            if let Err(e) = k.save().await {
+                                warn!("Kad: {e}");
+                            }
+                            kad_connected = None;
+                            kad_since = None;
+                            next_kad_ask = None;
+                            kad_searches.clear();
+                        }
+                        let file = c.config.join("nodes.dat");
+                        let tmp = c.config.join("nodes.dat.download");
+                        if let Err(e) = std::fs::write(&tmp, &body).and_then(|()| std::fs::rename(&tmp, &file)) {
+                            warn!("Failed to replace nodes.dat: {e}");
+                        }
+                        match restart_kad(&c, udp_port.as_ref(), listening, Vec::new()).await {
+                            Ok(n) => {
+                                info!("[{:>5}s] Kad started from the new nodes.dat", t.as_secs());
+                                let _ = cmd.send(Command::SetKadId(Some(n.prefs.kad_id)));
+                                kad_node = Some(n);
+                            }
+                            Err(e) => warn!("Kad: {e}"),
+                        }
+                    }
+                    Some(Err(e)) => warn!("Failed to download the nodes list: {e}"),
+                    None => {}
                 }
             }
             // A global search asks one more server, now and then.
@@ -1296,6 +1349,8 @@ pub async fn run(
                             ip_filter: c.ip_filter.as_deref(),
                             filter_lan: !c.allow_lan,
                             now: Instant::now(),
+                            config: &c.config,
+                            server_met_busy,
                         });
                         let _ = reply.send(packet);
                         for e in effects {
@@ -1327,37 +1382,37 @@ pub async fn run(
                                     reach.kad_open = false;
                                     log_reach(t, was, reach);
                                 }
-                                Effect::StartKad => {
-                                    let k = c.kad.clone().unwrap_or_else(|| KadSettings { dir: c.config.clone(), nodes: None, bootstrap: Vec::new(), warmup: KAD_WARMUP });
-                                    // The stopped node's socket may still be closing.
-                                    let mut started = Err(String::new());
-                                    for _ in 0..20 {
-                                        started = start_kad(udp_port.as_ref(), &KadStart {
-                                            dir: k.dir.clone(),
-                                            nodes: k.nodes.clone(),
-                                            bootstrap: Vec::new(),
-                                            udp_port: c.udp_port,
-                                            tcp_port: c.tcp_port,
-                                            user_hash: c.user_hash,
-                                            reachable: c.reachable,
-                                            listening,
-                                            allow_lan: c.allow_lan,
-                                            trace_wire: kad::trace_from_env(),
-                                            ip_filter: c.ip_filter.clone(),
-                                        }).await;
-                                        if started.is_ok() {
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                Effect::StartKad => match restart_kad(&c, udp_port.as_ref(), listening, Vec::new()).await {
+                                    Ok(n) => {
+                                        info!("[{:>5}s] Kad started", t.as_secs());
+                                        let _ = cmd.send(Command::SetKadId(Some(n.prefs.kad_id)));
+                                        kad_node = Some(n);
                                     }
-                                    match started {
+                                    Err(e) => warn!("Kad: {e}"),
+                                },
+                                // BootstrapKad: started first if it is not running.
+                                Effect::BootstrapKad(a) => match &kad_node {
+                                    Some(k) => k.handle.bootstrap(a).await,
+                                    None => match restart_kad(&c, udp_port.as_ref(), listening, vec![a]).await {
                                         Ok(n) => {
-                                            info!("[{:>5}s] Kad started", t.as_secs());
+                                            info!("[{:>5}s] Kad started, bootstrapping from {a}", t.as_secs());
                                             let _ = cmd.send(Command::SetKadId(Some(n.prefs.kad_id)));
                                             kad_node = Some(n);
                                         }
                                         Err(e) => warn!("Kad: {e}"),
-                                    }
+                                    },
+                                },
+                                Effect::UpdateServerMet(urls) => {
+                                    server_met_busy = true;
+                                    let tx = met_tx.clone();
+                                    tokio::spawn(async move {
+                                        for url in urls {
+                                            info!("Start downloading server list from {url}");
+                                            let body = crate::http::fetch(&url).await;
+                                            let _ = tx.send(MetFetch::Got { url, body });
+                                        }
+                                        let _ = tx.send(MetFetch::Done);
+                                    });
                                 }
                             }
                         }
@@ -1385,6 +1440,12 @@ pub async fn run(
                             let dir = c.config.clone();
                             tokio::task::spawn_blocking(move || crate::config::reload_ip_filter(&dir, &f));
                         }
+                    }
+                    Some(Control::NodesUpdate(url)) => {
+                        let tx = nodes_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(crate::http::fetch(&url).await);
+                        });
                     }
                     Some(Control::IpFilterUpdate(url)) => {
                         if let Some(f) = c.ip_filter.clone() {
@@ -1785,6 +1846,58 @@ async fn update_ip_filter(dir: PathBuf, url: String, filter: Arc<AddressFilter>)
 
 /// Kad on the client UDP port when there is one (shared, as in aMule),
 /// else on a socket of its own.
+/// Kad started (again) as the configuration says, bootstrapping from
+/// `bootstrap` as well; a stopped node's socket may still be closing, so it
+/// is tried a few times.
+async fn restart_kad(
+    c: &ClientConfig,
+    port: Option<&UdpPort>,
+    listening: bool,
+    bootstrap: Vec<SocketAddrV4>,
+) -> Result<kad::KadNode, String> {
+    let k = c.kad.clone().unwrap_or_else(|| KadSettings {
+        dir: c.config.clone(),
+        nodes: None,
+        bootstrap: Vec::new(),
+        warmup: KAD_WARMUP,
+    });
+    let mut started = Err(String::new());
+    for _ in 0..20 {
+        started = start_kad(
+            port,
+            &KadStart {
+                dir: k.dir.clone(),
+                nodes: k.nodes.clone(),
+                bootstrap: bootstrap.clone(),
+                udp_port: c.udp_port,
+                tcp_port: c.tcp_port,
+                user_hash: c.user_hash,
+                reachable: c.reachable,
+                listening,
+                allow_lan: c.allow_lan,
+                trace_wire: kad::trace_from_env(),
+                ip_filter: c.ip_filter.clone(),
+            },
+        )
+        .await;
+        if started.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    started
+}
+
+/// A server list fetched for `EC_OP_SERVER_UPDATE_FROM_URL`.
+enum MetFetch {
+    Got {
+        url: String,
+        body: Result<Vec<u8>, String>,
+    },
+    /// Every source tried.
+    Done,
+}
+
 async fn start_kad(port: Option<&UdpPort>, a: &KadStart) -> Result<kad::KadNode, String> {
     match port {
         Some(p) => kad::start_on(a, p).await,

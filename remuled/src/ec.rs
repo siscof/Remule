@@ -313,6 +313,9 @@ pub enum Control {
     /// `CIPFilter::Update`: `ipfilter.dat` fetched from this URL, then
     /// the filter read again.
     IpFilterUpdate(String),
+    /// `UpdateNotesDat`: `nodes.dat` fetched from this URL, then Kad
+    /// started again from it.
+    NodesUpdate(String),
 }
 
 fn detail(req: &Packet) -> u8 {
@@ -926,6 +929,13 @@ pub async fn answer(
             if !url.is_empty() {
                 let _ = control.send(Control::IpFilterUpdate(url));
             }
+            (Packet::new(EC_OP_NOOP), false)
+        }
+        EC_OP_KAD_UPDATE_FROM_URL => {
+            // The URL is remembered (`SetKadNodesUrl`), then fetched.
+            let url = req.tags.first().map(Tag::as_str).unwrap_or_default();
+            lock(conn.prefs).set_kad_nodes_url(&url);
+            let _ = control.send(Control::NodesUpdate(url));
             (Packet::new(EC_OP_NOOP), false)
         }
         EC_OP_SHUTDOWN if shutting_down => (failed("Already shutting down."), false),

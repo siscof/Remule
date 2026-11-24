@@ -1490,6 +1490,15 @@ impl PrefStore {
         self.text(EC_TAG_IPFILTER_UPDATE_URL)
     }
 
+    /// `SetKadNodesUrl`.
+    pub fn set_kad_nodes_url(&mut self, url: &str) {
+        if self.text(EC_TAG_KADEMLIA_UPDATE_URL) != url {
+            self.values
+                .insert(EC_TAG_KADEMLIA_UPDATE_URL, Val::S(url.to_owned()));
+            self.save(&[EC_TAG_KADEMLIA_UPDATE_URL]);
+        }
+    }
+
     /// `SetIPFilterURL`: an update's URL is remembered (`CIPFilter::Update`).
     pub fn set_ipfilter_url(&mut self, url: &str) {
         if self.text(EC_TAG_IPFILTER_UPDATE_URL) != url {

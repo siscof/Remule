@@ -362,4 +362,33 @@ mod tests {
         assert!(wild("ip?ilter.dat", "ipfilter.dat"));
         assert!(!wild("*.p2p", "guarding.dat"));
     }
+
+    /// A downloaded server list may come packed (`LoadServerMet` unpacks
+    /// it for `server.met`): gzip, or a zip holding it beside other files
+    /// (any case); what is not a `.met` after unpacking is refused.
+    #[test]
+    fn packed_server_lists_are_read() {
+        use crate::server_met::{ServerMet, ServerRecord};
+        let met = ServerMet {
+            version: 0xE0,
+            servers: vec![ServerRecord {
+                ip: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                port: 4661,
+                tags: Vec::new(),
+            }],
+            legacy_counts: false,
+        }
+        .write();
+        let n = |b: &[u8]| ServerMet::read_packed(b).map(|m| m.unwrap().servers.len());
+        assert_eq!(n(&met), Some(1));
+        assert_eq!(n(&gz(&met)), Some(1));
+        let z = zip(
+            &[("readme.txt", b"hello there"), ("lists/SERVER.MET", &met)],
+            true,
+            false,
+        );
+        assert_eq!(n(&z), Some(1));
+        assert!(ServerMet::read_packed(b"<html>not found</html>").is_none());
+        assert!(ServerMet::read_packed(&zip(&[("readme.txt", b"hi")], false, false)).is_none());
+    }
 }

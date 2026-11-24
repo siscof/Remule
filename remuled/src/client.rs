@@ -1022,7 +1022,10 @@ pub async fn run(
             // A server list fetched: merged, and the list saved.
             f = met_rx.recv() => match f {
                 Some(MetFetch::Got { url, body }) => {
-                    let met = body.and_then(|b| ed2k_formats::server_met::ServerMet::read(&b).map_err(|e| format!("{e:?}")));
+                    let met = body.and_then(|b| match ed2k_formats::server_met::ServerMet::read_packed(&b) {
+                        Some(m) => m.map_err(|e| format!("{e:?}")),
+                        None => Err("unknown format encountered".to_owned()),
+                    });
                     match met {
                         Ok(met) => {
                             crate::ec_servers::merge_met(&mut server_list, &met, &mut connector, c.ip_filter.as_deref(), !c.allow_lan);
